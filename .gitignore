@@ -1,0 +1,4 @@
+# Local-only working state and any accidentally-added bulk.
+.DS_Store
+node_modules/
+*.pre-pi-config-*

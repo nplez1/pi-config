@@ -1,0 +1,54 @@
+{
+  "deepseek": {
+    "type": "api_key",
+    "key": "REPLACE_ME"
+  },
+  "fireworks": {
+    "type": "api_key",
+    "key": "REPLACE_ME"
+  },
+  "github-copilot": {
+    "type": "oauth",
+    "refresh": "REPLACE_VIA_/login",
+    "access": "REPLACE_VIA_/login",
+    "expires": 0,
+    "availableModelIds": [
+      "claude-fable-5.1",
+      "claude-fable-5",
+      "claude-opus-4.7",
+      "claude-opus-4.8-fast",
+      "claude-opus-4.8",
+      "claude-opus-5.5",
+      "claude-opus-5",
+      "claude-sonnet-5.5",
+      "claude-sonnet-5",
+      "gemini-3.5-flash",
+      "gemini-3.6-flash",
+      "gemini-3.7-flash",
+      "gemini-3.8-flash",
+      "gpt-5.3-codex",
+      "gpt-5.4-mini",
+      "gpt-5.4",
+      "gpt-5.5",
+      "gpt-5.6-luna",
+      "gpt-5.6-sol",
+      "gpt-5.6-terra",
+      "gpt-6.1-sol",
+      "gpt-6-astra",
+      "gpt-6-luna",
+      "gpt-6-sol",
+      "grok-4.5",
+      "grok-4.6",
+      "grok-4.7",
+      "kimi-k2.7-code",
+      "kimi-k3",
+      "mai-code-1.1-flash",
+      "gpt-5-mini",
+      "claude-haiku-4.5"
+    ]
+  },
+  "xiaomi": {
+    "type": "api_key",
+    "key": "REPLACE_ME"
+  }
+}

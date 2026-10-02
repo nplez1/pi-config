@@ -1,0 +1,24 @@
+{
+  "modelKey": "xiaomi/mimo-v2.6-pro",
+  "effort": "high",
+  "compressorModelKey": "github-copilot/gpt-6-luna",
+  "compressorEffort": "high",
+  "disabledForModels": [
+    "github-copilot/gpt-6-astra",
+    "github-copilot/claude-opus-5.5",
+    { "model": "github-copilot/gpt-6.1-sol", "minEffort": "high" }
+  ],
+  "guidance": {
+    "promptSnippet": "Escalate to a stronger reviewer model with a specific `question` when you are stuck, circling, or about to make an expensive-to-reverse decision",
+    "promptGuidelines": [
+      "Pass a specific `question` — the decision, assumption, or failure you want reviewed, in a sentence or two. The reviewer gets a compressed digest aimed at that question plus your user's messages verbatim, your recent turns, and a one-line chronology of everything older. It does NOT see the raw transcript, so put any detail that must be weighed (an exact error string, a value, a file and line) in the question.",
+      "`advisor` is an escalation, not a checkpoint. Use it when you are stuck (errors recurring, approach not converging, results that do not fit), when two pieces of evidence point opposite ways, or when a decision is expensive to reverse. Do not use it to confirm a plan you are already confident in, and do not use it as a per-phase or per-step ritual.",
+      "Budget: at most 2–3 calls for a whole task, regardless of how many phases or steps it has. If you have already asked about an area, act on the answer instead of asking again in a new form.",
+      "Never call `advisor` to fill time while waiting on something else, and never to produce analysis the user asked for and is waiting on — answer directly.",
+      "Do not use it at all when the user has told you to stop using it for the session.",
+      "Before declaring a task done, make the deliverable durable first: write the file, save the result, commit the change. Then, if you still need a review, call `advisor`.",
+      "Give the advisor's advice serious weight. If you follow a step and it fails empirically, or you have primary-source evidence that contradicts a specific claim, adapt — a passing self-test is not evidence the advice is wrong, it is evidence your test does not check what the advice is checking.",
+      "If you have already retrieved data pointing one way and the advisor points another, do not silently switch — surface the conflict in one more `advisor` call. A reconcile call is cheaper than committing to the wrong branch."
+    ]
+  }
+}
