@@ -131,8 +131,7 @@ portable_targets() {
     "dot-pi/agent/AGENTS.md"               "$HOME/.pi/agent/AGENTS.md" \
     "dot-pi/agent/subagents.json"          "$HOME/.pi/agent/subagents.json" \
     "dot-pi/web-search.json"               "$HOME/.pi/web-search.json" \
-    "dot-config/rpiv-todo/config.json"     "$HOME/.config/rpiv-todo/config.json" \
-    "dot-agents/.skill-lock.json"          "$HOME/.agents/.skill-lock.json"
+    "dot-config/rpiv-todo/config.json"     "$HOME/.config/rpiv-todo/config.json"
   local f
   for f in "$REPO"/dot-pi/agent/agents/*; do
     [ -e "$f" ] || continue
@@ -142,6 +141,9 @@ portable_targets() {
     [ -e "$f" ] || continue
     printf '%s\t%s\n' "dot-pi/agent/extensions/$(basename "$f")" "$HOME/.pi/agent/extensions/$(basename "$f")"
   done
+  # Only skills this repo ships. Skills installed and managed locally (Orca's
+  # orca-cli / orchestration / computer-use) are deliberately not here, and
+  # neither is ~/.agents/.skill-lock.json, which is per-machine install state.
   for d in "$REPO"/dot-agents/skills/*/; do
     [ -e "$d/SKILL.md" ] || continue
     local name; name="$(basename "$d")"

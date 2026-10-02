@@ -57,8 +57,7 @@ dot-config/
   rpiv-advisor/advisor.json       SEEDED   guidance shared, models local
   rpiv-advisor/advisor.machine.example.json
 dot-agents/
-  .skill-lock.json                -> ~/.agents/.skill-lock.json
-  skills/<name>/SKILL.md          -> ~/.agents/skills/<name>/SKILL.md
+  skills/find-skills/             -> ~/.agents/skills/find-skills   (symlinked)
 plugins/                          -> ~/.pi/agent/plugins   (git submodules)
   pi-subagents/  pi-advisor-subagent/  pi-todo/
 ```
@@ -98,3 +97,5 @@ extensions not in this repo), and supports `--dry-run` and `uninstall`.
 | `~/.pi/agent/trust.json`, `run-history.jsonl` | machine-local state |
 | `~/.pi/agent/reports/` | generated analyses of my own sessions |
 | Orca-specific extensions (`orca-*.ts`) | deliberately not shared |
+| Orca-managed skills (`orca-cli`, `orchestration`, `computer-use`) | installed and updated locally by Orca, so transferring them would fight that |
+| `~/.agents/.skill-lock.json` | per-machine install state (it lists what *this* machine has installed) |
