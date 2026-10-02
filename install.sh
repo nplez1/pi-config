@@ -34,7 +34,7 @@ link() {
     echo "  skip     $rel (missing in repo)"
     return
   fi
-  mkdir -p "$(dirname "$dst")"
+  [ "$MODE" = "dry-run" ] || mkdir -p "$(dirname "$dst")"
   if [ -L "$dst" ]; then
     local cur; cur="$(readlink "$dst")"
     if [ "$cur" = "$src" ]; then
@@ -128,7 +128,7 @@ echo
 echo "Linking plugins directory (settings.json references plugins/<name>):"
 dst="$HOME/.pi/agent/plugins"
 src="$REPO/plugins"
-mkdir -p "$(dirname "$dst")"
+[ "$MODE" = "dry-run" ] || mkdir -p "$(dirname "$dst")"
 if [ -L "$dst" ] && [ "$(readlink "$dst")" = "$src" ]; then
   echo "  ok       $dst"
 elif [ -e "$dst" ] && [ ! -L "$dst" ]; then
@@ -148,7 +148,9 @@ else
   CHANGED=$((CHANGED + 1))
 fi
 
-if [ "$MODE" = "install" ]; then
+# Set PI_CONFIG_SKIP_PLUGINS=1 to link files without touching the network
+# (no submodule fetch, no npm install) — used by the repo's own install test.
+if [ "$MODE" = "install" ] && [ "${PI_CONFIG_SKIP_PLUGINS:-0}" != "1" ]; then
   echo
   echo "Fetching plugin submodules:"
   git -C "$REPO" submodule update --init --recursive
