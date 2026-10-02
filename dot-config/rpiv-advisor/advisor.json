@@ -1,12 +1,13 @@
 {
-  "modelKey": "xiaomi/mimo-v2.6-pro",
   "effort": "high",
-  "compressorModelKey": "github-copilot/gpt-6-luna",
   "compressorEffort": "high",
   "disabledForModels": [
     "github-copilot/gpt-6-astra",
     "github-copilot/claude-opus-5.5",
-    { "model": "github-copilot/gpt-6.1-sol", "minEffort": "high" }
+    {
+      "model": "github-copilot/gpt-6.1-sol",
+      "minEffort": "high"
+    }
   ],
   "guidance": {
     "promptSnippet": "Escalate to a stronger reviewer model with a specific `question` when you are stuck, circling, or about to make an expensive-to-reverse decision",

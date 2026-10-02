@@ -1,7 +1,7 @@
 # pi-config
 
 My [pi](https://pi.dev) agent configuration — model providers, custom subagents
-and extensions, skills, and package settings — so a second machine can be set up
+and extensions, skills, and package settings — so another machine can be set up
 with one clone.
 
 > **This repository is public.** It is sanitized, but treat it as public: never
@@ -9,86 +9,89 @@ with one clone.
 > [gitleaks](.github/workflows/secret-scan.yml) on every push, and every file
 > here was scanned before the first commit.
 
+## Machines with different accounts
+
+Accounts differ per machine (this one uses DeepSeek/Xiaomi/Fireworks; another
+uses GitHub Copilot Enterprise), and pi writes the chosen model back into
+`settings.json`. So account-specific values are **machine-owned**, not shared:
+
+| Machine-owned (seeded once, kept local) | Key | Why |
+| --- | --- | --- |
+| `~/.pi/agent/settings.json` | `defaultProvider`, `defaultModel`, `enabledModels` | which providers/models this machine actually has |
+| `~/.config/rpiv-advisor/advisor.json` | `modelKey`, `compressorModelKey` | the advisor model this machine can reach |
+
+Everything else — the plugin/package list, theme, tui mode, subagent
+definitions, extensions, skills, `models.json`, todo/advisor **guidance** — is
+shared and symlinked, so editing it edits this repo.
+
+`install.sh` **seeds** the two machine-owned files (copy only if absent) instead
+of symlinking them, so a `/model` change on one machine can never rewrite the
+other's config. When you change something *shared* inside those two files, run:
+
+```sh
+~/Code/pi-config/install.sh capture   # copies them back, stripping account keys
+git -C ~/Code/pi-config diff
+```
+
+`capture` always deletes the account keys listed above before writing the seed,
+so they cannot leak into the repo.
+
 ## Layout
 
-The tree mirrors `$HOME`; a `dot-X/` directory maps to `~/.X/`. `install.sh`
-symlinks each tracked file into place.
+The tree mirrors `$HOME`; a `dot-X/` directory maps to `~/.X/`.
 
 ```
 dot-pi/
   web-search.json                 -> ~/.pi/web-search.json
   agent/
-    settings.json                 -> ~/.pi/agent/settings.json      (packages, theme, models, tui)
-    models.json                   -> ~/.pi/agent/models.json        (custom providers; keys via $VAR)
-    AGENTS.md                     -> ~/.pi/agent/AGENTS.md          (personal directives)
+    settings.json                 SEEDED   packages, theme, tui, shared defaults
+    settings.machine.example.json example of the account keys (not installed)
+    models.json                   -> ~/.pi/agent/models.json   (keys via ${VAR})
+    AGENTS.md                     -> ~/.pi/agent/AGENTS.md
     subagents.json                -> ~/.pi/agent/subagents.json
-    auth.json.example             (template only — the real auth.json is NOT tracked)
-    agents/                       -> ~/.pi/agent/agents/             (custom subagent definitions)
-    extensions/                   -> ~/.pi/agent/extensions/         (per-file: model/footer/pricing helpers)
+    auth.json.example             template only — auth.json is NOT tracked
+    agents/                       -> ~/.pi/agent/agents/
+    extensions/                   -> ~/.pi/agent/extensions/    (per file)
 dot-config/
   rpiv-todo/config.json           -> ~/.config/rpiv-todo/config.json
-  rpiv-advisor/advisor.json       -> ~/.config/rpiv-advisor/advisor.json
+  rpiv-advisor/advisor.json       SEEDED   guidance shared, models local
+  rpiv-advisor/advisor.machine.example.json
 dot-agents/
   .skill-lock.json                -> ~/.agents/.skill-lock.json
   skills/<name>/SKILL.md          -> ~/.agents/skills/<name>/SKILL.md
-plugins/                          -> ~/.pi/agent/plugins  (git submodules)
-  pi-subagents/                   local fork (fleet view, viewer, workflows)
-  pi-advisor-subagent/            local fork (advisor runs as a visible agent)
-  pi-todo/                        local fork (cumulative Todos heading)
+plugins/                          -> ~/.pi/agent/plugins   (git submodules)
+  pi-subagents/  pi-advisor-subagent/  pi-todo/
 ```
 
-`settings.json` references the forks as `plugins/<name>`, which pi resolves
-relative to `~/.pi/agent`. The `~/.pi/agent/plugins` symlink makes that path
+`settings.json` refers to the forks as `plugins/<name>`, which pi resolves
+relative to `~/.pi/agent`; the `~/.pi/agent/plugins` symlink makes that path
 clone-location-independent.
 
-## Install on a second machine
+## Install on another machine
 
 ```sh
 git clone --recurse-submodules git@github.com:nplez1/pi-config.git ~/Code/pi-config
 ~/Code/pi-config/install.sh
 ```
 
-`install.sh` links each file, initializes the submodules, and runs `npm install`
-inside each plugin. It never deletes: an existing real file is moved to
-`<file>.pre-pi-config-<timestamp>`. `./install.sh --dry-run` previews, and
-`./install.sh uninstall` removes the symlinks and restores the newest backup.
+Then: `export` any env var `models.json` references (e.g. `OMLX_API_KEY`), run
+`pi` and `/login` for the providers that machine has, and pick a default model
+with `/model`. Restart pi; `pi list` should show the three plugins.
 
-Then bring credentials (none are in this repo):
-
-1. `export OMLX_API_KEY=…` for any provider `models.json` references as `${VAR}`
-   (the `omlx` provider reads it; its `baseUrl` also points at a home-LAN server,
-   so edit that if you are not on the same network).
-2. Run `pi` and use `/login` for `deepseek`, `fireworks`, `xiaomi`, and
-   `github-copilot`; or copy a private `auth.json` to `~/.pi/agent/auth.json`.
-3. Restart pi, then `pi list` — the three plugins should appear.
-
-## Making changes
-
-Because the files are **symlinked**, editing `~/.pi/agent/settings.json` (or
-letting pi rewrite it) edits this repo's working tree directly:
-
-```sh
-git -C ~/Code/pi-config status
-git -C ~/Code/pi-config commit -am "…"
-git -C ~/Code/pi-config push
-```
-
-One caveat: `pi install <path>` rewrites package entries relative to
-`~/.pi/agent`, which produces a machine-specific path. For the three plugins,
-keep the `plugins/<name>` form by hand.
-
-To add a new tracked file, drop it under the right `dot-X/` directory, add its
-mapping to `targets()` in `install.sh`, and re-run `./install.sh`.
+`install.sh` is idempotent, backs up any file it would replace
+(`<file>.pre-pi-config-<timestamp>`), never touches a whole directory that can
+hold untracked user files (e.g. `~/.pi/agent/extensions`, which also has Orca
+extensions not in this repo), and supports `--dry-run` and `uninstall`.
 
 ## Intentionally not tracked
 
 | Excluded | Why |
 | --- | --- |
 | `~/.pi/agent/auth.json` | live provider keys and OAuth tokens |
-| `~/.pi/agent/models.json` `apiKey` values | replaced with `${OMLX_API_KEY}` |
+| `models.json` `apiKey` values | replaced with `${OMLX_API_KEY}` |
 | `~/.pi/agent/sessions/` | private conversation transcripts (~1 GB) |
-| `~/.pi/agent/npm/`, `models-store.json`, `web-search-cache/` | caches and installed packages |
+| `~/.pi/agent/npm/`, `models-store.json`, `web-search-cache/` | caches |
 | `~/.pi/agent/bin/{fd,rg}` | platform-specific binaries |
 | `~/.pi/agent/trust.json`, `run-history.jsonl` | machine-local state |
 | `~/.pi/agent/reports/` | generated analyses of my own sessions |
-| Orca-specific extensions (`orca-*.ts`) | intentionally left out of this repo |
+| Orca-specific extensions (`orca-*.ts`) | deliberately not shared |
