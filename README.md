@@ -78,8 +78,11 @@ Then: `export` any env var `models.json` references (e.g. `OMLX_API_KEY`), run
 `pi` and `/login` for the providers that machine has, and pick a default model
 with `/model`. Restart pi; `pi list` should show the three plugins.
 
-`install.sh` is idempotent, backs up any file it would replace
-(`<file>.pre-pi-config-<timestamp>`), never touches a whole directory that can
+`install.sh` is idempotent, moves any file it would replace into
+`~/.pi-config-backups/<timestamp>/` (flattened, deliberately **not** next to the
+target — a `<name>.pre-pi-config-*` sibling inside `~/.agents/skills` or
+`~/.pi/agent/agents` gets re-discovered by the glob as a duplicate skill or
+agent), never touches a whole directory that can
 hold untracked user files (e.g. `~/.pi/agent/extensions`, which also has Orca
 extensions not in this repo), and supports `--dry-run` and `uninstall`.
 

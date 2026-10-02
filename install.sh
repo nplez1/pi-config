@@ -37,6 +37,17 @@ esac
 
 STAMP="$(date +%Y%m%d-%H%M%S)"
 CHANGED=0
+# Backups live in their own tree, NEVER next to the target: `~/.agents/skills`
+# and `~/.pi/agent/agents` are scanned for `*/SKILL.md` and `*.md`, so a
+# `<name>.pre-pi-config-*` sibling would be re-discovered as a duplicate skill
+# or agent. Flattened to `<path with / as __>` so nothing looks like a resource.
+BACKUP_ROOT="$HOME/.pi-config-backups"
+flatten() { local rel="${1#"$HOME"/}"; printf '%s' "${rel//\//__}"; }
+backup_slot() {
+  local dir="$BACKUP_ROOT/$STAMP"
+  [ "$MODE" = "dry-run" ] || mkdir -p "$dir"
+  printf '%s/%s' "$dir" "$(flatten "$1")"
+}
 
 # ---- portable files: symlink -------------------------------------------------
 
@@ -54,7 +65,7 @@ link() {
       echo "  SKIP     $dst (cannot remove existing symlink)"; return
     fi
   elif [ -e "$dst" ]; then
-    local bak="$dst.pre-pi-config-$STAMP"
+    local bak; bak="$(backup_slot "$dst")"
     # macOS refuses to rename a directory the user does not own even from a
     # writable parent (the root-owned Orca-installed skills), so treat a failed
     # move as "leave it alone", not a fatal error.
@@ -104,7 +115,8 @@ unlink_one() {
   case "$cur" in "$REPO"/*) ;; *) echo "  keep     $dst (points elsewhere: $cur)"; return ;; esac
   echo "  unlink   $dst"
   [ "$MODE" = "dry-run" ] || rm -f "$dst"
-  local bak; bak="$(ls -1dt "$dst".pre-pi-config-* 2>/dev/null | head -1 || true)"
+  local name; name="$(flatten "$dst")"
+  local bak; bak="$(ls -1dt "$BACKUP_ROOT"/*/"$name" 2>/dev/null | head -1 || true)"
   if [ -n "$bak" ]; then
     echo "  restore  $bak -> $dst"
     [ "$MODE" = "dry-run" ] || mv "$bak" "$dst"
@@ -221,7 +233,7 @@ if [ -L "$dst" ] && [ "$(readlink "$dst")" = "$src" ]; then
   echo "  ok       $dst"
 else
   if [ -e "$dst" ] && [ ! -L "$dst" ]; then
-    bak="$dst.pre-pi-config-$STAMP"
+    bak="$(backup_slot "$dst")"
     if [ "$MODE" != "dry-run" ] && ! mv "$dst" "$bak" 2>/dev/null; then echo "  SKIP     $dst (cannot move aside)"; else echo "  backup   $dst -> $bak"; fi
   elif [ -L "$dst" ]; then
     echo "  relink   $dst -> $src"; [ "$MODE" = "dry-run" ] || rm -f "$dst" 2>/dev/null || true
