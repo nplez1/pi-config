@@ -1,0 +1,9 @@
+[submodule "plugins/pi-subagents"]
+	path = plugins/pi-subagents
+	url = https://github.com/nplez1/pi-subagents.git
+[submodule "plugins/pi-advisor-subagent"]
+	path = plugins/pi-advisor-subagent
+	url = https://github.com/nplez1/pi-advisor-subagent.git
+[submodule "plugins/pi-todo"]
+	path = plugins/pi-todo
+	url = https://github.com/nplez1/pi-todo.git
