@@ -74,6 +74,7 @@
               },
               "preserve_thinking": true,
               "reasoning_effort": {
+                "$var": "thinking.effort",
                 "omitWhenOff": true
               }
             }

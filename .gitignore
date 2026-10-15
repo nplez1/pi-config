@@ -2,3 +2,7 @@
 .DS_Store
 node_modules/
 *.pre-pi-config-*
+# Hand-made pre-change copies. Git history is the backup; these stay local.
+*.bak-*
+# Records which pi bundle chunk the model-picker patch last touched.
+patches/.state.json
