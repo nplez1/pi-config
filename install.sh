@@ -264,6 +264,17 @@ if [ "$MODE" = "install" ] && [ "${PI_CONFIG_SKIP_PLUGINS:-0}" != "1" ]; then
   done
 fi
 
+# pi's own bundle is patched after install too: the /model picker gets friendly
+# model names and ←/→ reasoning levels. `pi update`/npm replaces the bundle, so
+# re-run this (or just start pi — the pi-picker-patch-guard extension heals it).
+echo
+echo "pi bundle patches (patches/README.md):"
+if [ "$MODE" = "dry-run" ]; then
+  node "$REPO/patches/model-picker.mjs" --check --no-write | sed 's/^/  /' || true
+else
+  node "$REPO/patches/model-picker.mjs" | sed 's/^/  /' || echo "  SKIP     could not patch the pi bundle (see patches/README.md)"
+fi
+
 echo
 echo "Done ($CHANGED change(s))."
 cat <<'EOF'
