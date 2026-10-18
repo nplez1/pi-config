@@ -422,10 +422,25 @@ else
 
     if ! command -v bun >/dev/null 2>&1; then
       echo "  SKIP     bundles need bun on PATH (pi-bolt loads the unbuilt forks)"
-    elif "$REPO/pi-bolt/rebuild.sh" --force >/dev/null; then
-      echo "  ok       bundles rebuilt"
     else
-      echo "  SKIP     bundle rebuild failed (pi-bolt loads the unbuilt forks)"
+      # Capture BOTH streams: rebuild.mjs reports on stderr even when it succeeds
+      # (the ~/.zshrc hook shows that verbatim before a launch), which would
+      # otherwise leak "rebuilding ... (no readable build-info.json (ENOENT))"
+      # into this transcript looking like a failure. It is not one — that reason
+      # is just how a first build on a fresh machine is described, since
+      # build-info.json is gitignored.
+      #
+      # The exit code is not proof either: rebuild.mjs deliberately exits 0 when a
+      # bundle fails, so pi-bolt still starts. --check is what actually knows, and
+      # a stale bundle is only ever visible here.
+      if rebuild_log="$("$REPO/pi-bolt/rebuild.sh" --force 2>&1)" \
+        && "$REPO/pi-bolt/rebuild.sh" --check >/dev/null 2>&1; then
+        echo "  ok       bundles rebuilt"
+      else
+        echo "  SKIP     bundle rebuild failed (pi-bolt loads the unbuilt forks)"
+        printf '%s\n' "$rebuild_log" | sed 's/^/  /'
+        echo "  retry    $REPO/pi-bolt/rebuild.sh --force --verbose"
+      fi
     fi
 
     compile_set="$(paste -sd, "$REPO/pi-bolt/compile-set.txt")"
