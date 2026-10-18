@@ -88,6 +88,13 @@ Every step prints a SKIP instead of failing the install; `PI_CONFIG_SKIP_PIBOLT=
 leaves Pi-Bolt out entirely. `pi-real` (or `PI_REAL=1 pi`) still reaches the stock
 launcher, and `pi-bolt/pi-swap.sh remove` reverts the swap.
 
+Re-running it is safe and additive, whether the machine already has pi or ran an
+older version of this script: files it would replace are backed up, machine-owned
+keys (`defaultProvider`, `defaultModel`, `enabledModels`) are never overwritten,
+missing shared keys (codemode, the `piBolt` overrides, the pinned packages) are
+added, and a Pi-Bolt with a different compile set keeps the extensions it already
+had compiled in.
+
 Then: `export` any env var `models.json` references (e.g. `OMLX_API_KEY`), run
 `pi` and `/login` for the providers that machine has, and pick a default model
 with `/model`. Restart pi; `pi list` should show the three plugins, and

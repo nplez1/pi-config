@@ -257,6 +257,61 @@ echo "Machine-owned files (seeded once, never overwritten):"
 while IFS=$'\t' read -r rel dst; do seed "$rel" "$dst"; done < <(seed_targets)
 
 echo
+echo "Shared keys in an existing settings.json (additive; machine-owned keys untouched):"
+node - "$REPO" "$HOME" "$MODE" <<'NODE' || echo "  SKIP     needs node on PATH"
+const fs = require("node:fs");
+const path = require("node:path");
+const [repo, home, mode] = process.argv.slice(2);
+const livePath = path.join(home, ".pi/agent/settings.json");
+const seedPath = path.join(repo, "dot-pi/agent/settings.json");
+if (!fs.existsSync(livePath) || !fs.existsSync(seedPath)) {
+  console.log("  skip     no settings to sync");
+  process.exit(0);
+}
+const live = JSON.parse(fs.readFileSync(livePath, "utf8"));
+const seed = JSON.parse(fs.readFileSync(seedPath, "utf8"));
+// What capture strips: this machine's account choices, never synced in.
+const machineOwned = new Set(["defaultProvider", "defaultModel", "enabledModels", "lastChangelogVersion"]);
+const changes = [];
+const pkgName = (entry) => entry.replace(/^-/, "").replace(/@[^/@]+$/, "");
+for (const key of Object.keys(seed)) {
+  if (machineOwned.has(key)) continue;
+  if (key === "packages") {
+    const have = new Set((live.packages ?? []).map(pkgName));
+    const add = (seed.packages ?? []).filter((e) => !have.has(pkgName(e)));
+    if (add.length) {
+      live.packages = [...(live.packages ?? []), ...add];
+      changes.push(`packages += ${add.join(", ")}`);
+    }
+    continue;
+  }
+  if (!(key in live)) {
+    live[key] = seed[key];
+    changes.push(`${key} (new)`);
+  }
+}
+// An older setup recorded absolute bundle paths; make them clone-independent.
+const prefix = path.join(repo, "pi-bolt") + path.sep;
+if (Array.isArray(live.piBolt?.packages)) {
+  let rewrote = 0;
+  live.piBolt.packages = live.piBolt.packages.map((e) => {
+    if (typeof e === "string" && e.startsWith(prefix)) {
+      rewrote += 1;
+      return "pi-bolt-bundles/" + e.slice(prefix.length);
+    }
+    return e;
+  });
+  if (rewrote) changes.push(`piBolt.packages: ${rewrote} path(s) made portable`);
+}
+if (!changes.length) {
+  console.log("  ok       already carries every shared key");
+  process.exit(0);
+}
+for (const c of changes) console.log(`  ${mode === "dry-run" ? "would add" : "added   "} ${c}`);
+if (mode !== "dry-run") fs.writeFileSync(livePath, JSON.stringify(live, null, 2) + "\n");
+NODE
+
+echo
 echo "Plugins directory (settings.json references plugins/<name>):"
 dst="$HOME/.pi/agent/plugins"; src="$REPO/plugins"
 [ "$MODE" = "dry-run" ] || mkdir -p "$(dirname "$dst")"
@@ -342,7 +397,7 @@ elif [ "$MODE" = "dry-run" ]; then
   echo "  would    install pi-bolt if missing (official installer, unattended)"
   echo "  would    pi-bolt update --extensions"
   echo "  would    $REPO/pi-bolt/rebuild.sh --force"
-  echo "  would    pi-bolt compile --only $(paste -sd, "$REPO/pi-bolt/compile-set.txt")"
+  echo "  would    pi-bolt compile --only $(paste -sd, "$REPO/pi-bolt/compile-set.txt") (+ anything already compiled in)"
   echo "  would    $REPO/pi-bolt/pi-swap.sh apply"
 else
   if command -v pi-bolt >/dev/null 2>&1; then
@@ -374,7 +429,19 @@ else
     fi
 
     compile_set="$(paste -sd, "$REPO/pi-bolt/compile-set.txt")"
-    if pi-bolt compile --only "$compile_set" >/dev/null 2>&1; then echo "  ok       compiled in: $compile_set"; else echo "  SKIP     compile failed (extensions still load from files)"; fi
+    # Keep whatever this machine already had compiled in rather than dropping it.
+    existing="$(pi-bolt compile --status 2>/dev/null | sed -n 's/^Extensions compiled in[^:]*: *//p')"
+    if [ -n "$existing" ]; then
+      compile_set="$( { printf '%s\n' "$existing" | tr ',' '\n'; cat "$REPO/pi-bolt/compile-set.txt"; } \
+        | sed 's/^ *//; s/ *$//; /^$/d' | awk '!seen[$0]++' | paste -sd, - )"
+    fi
+    if pi-bolt compile --only "$compile_set" >/dev/null 2>&1; then
+      echo "  ok       compiled in: $compile_set"
+    elif pi-bolt compile --only "$(paste -sd, "$REPO/pi-bolt/compile-set.txt")" >/dev/null 2>&1; then
+      echo "  ok       compiled in: $(paste -sd, "$REPO/pi-bolt/compile-set.txt") (an older entry is no longer installed)"
+    else
+      echo "  SKIP     compile failed (extensions still load from files)"
+    fi
 
     if "$REPO/pi-bolt/pi-swap.sh" apply >/dev/null 2>&1; then
       echo "  ok       pi now runs pi-bolt (revert: $REPO/pi-bolt/pi-swap.sh remove)"
