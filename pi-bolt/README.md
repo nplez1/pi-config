@@ -358,6 +358,41 @@ limit. Revert with `pi-bolt compile --off`; the replaced build is kept and
 re-running it needs `--only juicesharp-rpiv-ask-user-question,pi-codex-goal,pi-system-one`
 to keep all three.
 
+### Compiled extensions lose resources resolved from `import.meta.url`
+
+Build with the patched kit, or `pi-system-one` compiles in without its skill:
+
+```sh
+node patch-kit.mjs --run -- --only juicesharp-rpiv-ask-user-question,pi-codex-goal,pi-system-one
+```
+
+`pi-system-one` locates its bundled `skills/` and `prompts/` relative to its own
+module — `join(dirname(fileURLToPath(import.meta.url)), "..", "skills")`. Bundling
+resolves `import.meta.url` once, to the *output* file, so compiled in it names the
+executable's virtual entry `file:///$bunfs/root/pi-bin` and the path collapses to
+`/$bunfs/skills`, which no embedded file can satisfy. Startup prints
+
+```
+[Skill conflicts]
+  /$bunfs/skills
+    skill path does not exist
+```
+
+and the `system-one` skill and `/judge` prompt are silently missing while `/so`
+still answers — nothing else looks wrong, which is why it went unnoticed.
+
+`patch-kit.mjs` unpacks the cached kit, pins `import.meta.url` in every staged
+script to that script's real on-disk URL (what the compiled copy should mean: Pi
+only uses it while the installed extension is unchanged), proves the pin by staging
+`pi-system-one` and checking the result, then prints — or with `--run`, executes —
+`pi-bolt compile --kit … --runtime …`. The patch is anchored: a kit whose
+`gen-plugin-manifest.mjs` has moved fails loudly instead of rebuilding the bug.
+**Re-run it after every `pi-bolt update` and every plain `pi-bolt compile`**, which
+both take the unpatched release kit from `~/.pi-bolt/cache`.
+
+Upstream fix wanted: pin `import.meta.url` at staging time, or resolve resource
+paths against the installed package.
+
 ## Still on the table
 
 All three local checkouts and the one npm package that mattered are bundled. What
