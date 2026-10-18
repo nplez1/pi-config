@@ -297,7 +297,11 @@ fi
 if [ "$MODE" = "install" ] && [ "${PI_CONFIG_SKIP_PLUGINS:-0}" != "1" ]; then
   echo
   echo "Fetching plugin submodules:"
-  git -C "$REPO" submodule update --init --recursive
+  # Non-fatal: a fork commit that was never pushed, or a network hiccup, must not
+  # abort the rest of the install (pi config and Pi-Bolt still work without it).
+  if ! git -C "$REPO" submodule update --init --recursive; then
+    echo "  WARN     submodule update failed — a plugin source may be missing; continuing"
+  fi
   echo
   echo "Installing plugin dependencies:"
   for p in "$REPO"/plugins/*/; do
