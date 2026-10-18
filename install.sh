@@ -57,10 +57,13 @@ link() {
   local rel="$1" dst="$2" src="$REPO/$1"
   if [ ! -e "$src" ]; then echo "  skip     $rel (missing in repo)"; return; fi
   if [ -L "$dst" ] && [ "$(readlink "$dst")" = "$src" ]; then echo "  ok       $dst"; return; fi
-  if [ ! -w "$(dirname "$dst")" ]; then
+  # Create the parent first: on a machine where pi has never run, ~/.pi/agent
+  # does not exist yet, and testing it for writability would skip every link.
+  local parent; parent="$(dirname "$dst")"
+  [ "$MODE" = "dry-run" ] || mkdir -p "$parent" 2>/dev/null || true
+  if [ -e "$parent" ] && [ ! -w "$parent" ]; then
     echo "  SKIP     $dst (parent not writable)"; return
   fi
-  [ "$MODE" = "dry-run" ] || mkdir -p "$(dirname "$dst")"
   if [ -L "$dst" ]; then
     echo "  relink   $dst  (was -> $(readlink "$dst"))"
     if [ "$MODE" != "dry-run" ] && ! rm -f "$dst" 2>/dev/null; then
@@ -88,10 +91,11 @@ link() {
 seed() {
   local rel="$1" dst="$2" src="$REPO/$1"
   [ -e "$src" ] || { echo "  skip     $rel (missing in repo)"; return; }
-  if [ ! -e "$dst" ] && [ ! -L "$dst" ] && [ ! -w "$(dirname "$dst")" ]; then
+  local parent; parent="$(dirname "$dst")"
+  [ "$MODE" = "dry-run" ] || mkdir -p "$parent" 2>/dev/null || true
+  if [ ! -e "$dst" ] && [ ! -L "$dst" ] && [ -e "$parent" ] && [ ! -w "$parent" ]; then
     echo "  SKIP     $dst (parent not writable)"; return
   fi
-  [ "$MODE" = "dry-run" ] || mkdir -p "$(dirname "$dst")"
   if [ -L "$dst" ]; then
     # Left over from an earlier all-symlink layout: become machine-owned.
     echo "  convert  $dst (symlink -> local copy)"
@@ -351,6 +355,15 @@ else
 
   if command -v pi-bolt >/dev/null 2>&1; then
     if pi-bolt update --extensions >/dev/null 2>&1; then echo "  ok       packages materialized"; else echo "  SKIP     pi-bolt update --extensions failed"; fi
+
+    # The web-access bundle wraps the published pi-web-access dist as build
+    # input, and Pi-Bolt's package list excludes that package (the bundle
+    # replaces it), so nothing else installs it on a fresh machine.
+    if [ ! -f "$HOME/.pi/agent/npm/node_modules/pi-web-access/dist/index.js" ]; then
+      echo "  install  pi-web-access (build input for the web-access bundle)"
+      npm install --prefix "$HOME/.pi/agent/npm" --no-save --no-audit --no-fund pi-web-access >/dev/null 2>&1 \
+        || echo "  SKIP     could not install the web-access build input"
+    fi
 
     if ! command -v bun >/dev/null 2>&1; then
       echo "  SKIP     bundles need bun on PATH (pi-bolt loads the unbuilt forks)"
