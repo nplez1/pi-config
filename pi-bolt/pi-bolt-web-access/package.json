@@ -1,0 +1,12 @@
+{
+  "name": "@nplez1/pi-bolt-web-access",
+  "version": "0.40.0-pibolt.1",
+  "private": true,
+  "type": "module",
+  "description": "pi-web-access, re-wrapped for Pi-Bolt as a dist-bun bundle so its 1 MB esbuild output is not transpiled by jiti on every cold start.",
+  "pi": {
+    "extensions": [
+      "./dist-bun/index.js"
+    ]
+  }
+}

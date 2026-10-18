@@ -1,0 +1,12 @@
+{
+  "name": "@nplez1/pi-bolt-subagents",
+  "version": "0.19.0-pibolt.1",
+  "private": true,
+  "type": "module",
+  "description": "The pi-config subagents fork (@tintinweb/pi-subagents 0.19.0 + local changes), prebuilt for Pi-Bolt as a dist-bun bundle so it loads without jiti transpiling it.",
+  "pi": {
+    "extensions": [
+      "./dist-bun/index.js"
+    ]
+  }
+}

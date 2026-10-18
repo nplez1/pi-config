@@ -44,8 +44,9 @@ The tree mirrors `$HOME`; a `dot-X/` directory maps to `~/.X/`.
 dot-pi/
   web-search.json                 -> ~/.pi/web-search.json
   agent/
-    settings.json                 SEEDED   packages, theme, tui, shared defaults
+    settings.json                 SEEDED   packages, piBolt overrides, codemode, theme
     settings.machine.example.json example of the account keys (not installed)
+    pi-system-one.json            SEEDED   /so mode; seeded because /so config rewrites it
     models.json                   -> ~/.pi/agent/models.json   (keys via ${VAR})
     AGENTS.md                     -> ~/.pi/agent/AGENTS.md
     subagents.json                -> ~/.pi/agent/subagents.json
@@ -60,6 +61,12 @@ dot-agents/
   skills/find-skills/             -> ~/.agents/skills/find-skills   (symlinked)
 plugins/                          -> ~/.pi/agent/plugins   (git submodules)
   pi-subagents/  pi-advisor-subagent/  pi-todo/
+pi-bolt/                          -> ~/.pi/agent/pi-bolt-bundles
+  rebuild.sh / rebuild.mjs        the staleness check and bundle rebuild driver
+  lib/bundle-info.mjs             fingerprint + build-info writer + shim snippet
+  compile-set.txt                 extensions `pi-bolt compile --only` bakes in
+  pi-swap.sh                      the reversible `pi` -> pi-bolt switch
+  pi-bolt-subagents/  pi-bolt-web-access/  pi-bolt-advisor-subagent/
 ```
 
 `settings.json` refers to the forks as `plugins/<name>`, which pi resolves
@@ -73,9 +80,18 @@ git clone --recurse-submodules git@github.com:nplez1/pi-config.git ~/Code/pi-con
 ~/Code/pi-config/install.sh
 ```
 
+`install.sh` also provisions Pi-Bolt (see [pi-bolt/README.md](pi-bolt/README.md)):
+it installs it from the official installer if it is missing, materializes the
+`packages` list, rebuilds the three bundles from this clone, compiles
+`pi-bolt/compile-set.txt` into the executable, and swaps `pi` to run pi-bolt.
+Every step prints a SKIP instead of failing the install; `PI_CONFIG_SKIP_PIBOLT=1`
+leaves Pi-Bolt out entirely. `pi-real` (or `PI_REAL=1 pi`) still reaches the stock
+launcher, and `pi-bolt/pi-swap.sh remove` reverts the swap.
+
 Then: `export` any env var `models.json` references (e.g. `OMLX_API_KEY`), run
 `pi` and `/login` for the providers that machine has, and pick a default model
-with `/model`. Restart pi; `pi list` should show the three plugins.
+with `/model`. Restart pi; `pi list` should show the three plugins, and
+`pi-bolt compile --status` the compiled set.
 
 `install.sh` is idempotent, moves any file it would replace into
 `~/.pi-config-backups/<timestamp>/` (flattened, deliberately **not** next to the
@@ -98,4 +114,7 @@ extensions not in this repo), and supports `--dry-run` and `uninstall`.
 | `~/.pi/agent/reports/` | generated analyses of my own sessions |
 | Orca-specific extensions (`orca-*.ts`) | deliberately not shared |
 | Orca-managed skills (`orca-cli`, `orchestration`, `computer-use`) | installed and updated locally by Orca, so transferring them would fight that |
+| `pi-bolt/*/dist-bun/`, `pi-bolt/*/build-info.json` | bundle build output; each machine rebuilds it from this clone |
+| `pi-bolt/.pi-swap-state` | records what `~/.local/bin/pi` was before the swap |
+| `~/.pi-bolt/` | the Pi-Bolt executable and compile cache; installed per machine |
 | `~/.agents/.skill-lock.json` | per-machine install state (it lists what *this* machine has installed) |

@@ -1,5 +1,8 @@
 {
   "defaultThinkingLevel": "high",
+  "defaultTools": [
+    "+codemode"
+  ],
   "packages": [
     "npm:@juicesharp/rpiv-ask-user-question",
     "plugins/pi-subagents",
@@ -7,8 +10,23 @@
     "npm:pi-web-access",
     "npm:pi-codex-goal",
     "npm:pi-mimo-provider",
-    "plugins/pi-todo"
+    "plugins/pi-todo",
+    "npm:pi-system-one@1.3.4"
   ],
+  "piBolt": {
+    "packages": [
+      "npm:opensec-pi-todo@2.13.1",
+      "npm:opensec-pi-fff@0.11.0",
+      "-plugins/pi-todo",
+      "-plugins/pi-subagents",
+      "pi-bolt-bundles/pi-bolt-subagents",
+      "pi-bolt-bundles/pi-bolt-web-access",
+      "-npm:pi-web-access",
+      "-plugins/pi-advisor-subagent",
+      "pi-bolt-bundles/pi-bolt-advisor-subagent"
+    ],
+    "packagesOverlay": true
+  },
   "theme": "dark",
   "tuiMode": "fullscreen",
   "followUpMode": "all",
@@ -16,6 +34,5 @@
   "terminal": {
     "showTerminalProgress": true
   },
-  "hideThinkingBlock": true,
-  "lastChangelogVersion": "1.0.0"
+  "hideThinkingBlock": true
 }

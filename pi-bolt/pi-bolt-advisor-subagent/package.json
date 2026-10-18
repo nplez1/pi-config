@@ -1,0 +1,12 @@
+{
+  "name": "@nplez1/pi-bolt-advisor-subagent",
+  "version": "0.1.0-pibolt.1",
+  "private": true,
+  "type": "module",
+  "description": "plugins/pi-advisor-subagent (rpiv-advisor-subagent 0.1.0), prebuilt for Pi-Bolt as a dist-bun bundle so its 22 TypeScript modules are not transpiled by jiti at every cold start. Reads prompts/ live from the source checkout.",
+  "pi": {
+    "extensions": [
+      "./dist-bun/index.js"
+    ]
+  }
+}

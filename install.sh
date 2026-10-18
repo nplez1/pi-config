@@ -16,12 +16,14 @@
 # `<target>.pre-pi-config-<timestamp>`.
 #
 # Usage:
-#   ./install.sh              link + seed, fetch submodules, npm install plugins
+#   ./install.sh              link + seed, fetch submodules, npm install plugins,
+#                             then install/compile Pi-Bolt and swap `pi` to it
 #   ./install.sh --dry-run    print what would happen, change nothing
 #   ./install.sh capture      copy the live settings/advisor back, minus account keys
 #   ./install.sh uninstall    remove symlinks that point into this repo
 #
 # Env: PI_CONFIG_SKIP_PLUGINS=1  skip submodule fetch + npm install (offline test)
+#      PI_CONFIG_SKIP_PIBOLT=1   skip installing/compiling/swapping Pi-Bolt (offline test)
 #
 set -euo pipefail
 
@@ -157,6 +159,7 @@ portable_targets() {
 seed_targets() {
   printf '%s\t%s\n' \
     "dot-pi/agent/settings.json"            "$HOME/.pi/agent/settings.json" \
+    "dot-pi/agent/pi-system-one.json"       "$HOME/.pi/agent/pi-system-one.json" \
     "dot-config/rpiv-advisor/advisor.json"  "$HOME/.config/rpiv-advisor/advisor.json"
 }
 
@@ -176,14 +179,30 @@ const jobs = [
   {
     live: path.join(home, ".pi/agent/settings.json"),
     seed: path.join(repo, "dot-pi/agent/settings.json"),
-    strip: ["defaultProvider", "defaultModel", "enabledModels"],
+    strip: ["defaultProvider", "defaultModel", "enabledModels", "lastChangelogVersion"],
   },
   {
     live: path.join(home, ".config/rpiv-advisor/advisor.json"),
     seed: path.join(repo, "dot-config/rpiv-advisor/advisor.json"),
     strip: ["modelKey", "compressorModelKey"],
   },
+  {
+    // Seeded, not linked: /so config rewrites this file with an atomic rename,
+    // which would replace a symlink with a real file and silently drop the edit.
+    live: path.join(home, ".pi/agent/pi-system-one.json"),
+    seed: path.join(repo, "dot-pi/agent/pi-system-one.json"),
+    strip: [],
+  },
 ];
+// Absolute paths into this clone's pi-bolt/ become the clone-independent form the
+// ~/.pi/agent/pi-bolt-bundles symlink resolves (same trick as plugins/<name>).
+const bundlePrefix = path.join(repo, "pi-bolt") + path.sep;
+const toPortableBundles = (entries) =>
+  entries.map((e) =>
+    typeof e === "string" && e.startsWith(bundlePrefix)
+      ? "pi-bolt-bundles/" + e.slice(bundlePrefix.length)
+      : e,
+  );
 for (const job of jobs) {
   if (!fs.existsSync(job.live)) { console.log(`  skip     ${job.live} (missing)`); continue; }
   const live = JSON.parse(fs.readFileSync(job.live, "utf8"));
@@ -191,6 +210,9 @@ for (const job of jobs) {
   // Start from the live file so shared additions flow in, then drop account keys.
   for (const key of job.strip) delete live[key];
   const merged = { ...seed, ...live };
+  if (Array.isArray(merged.piBolt?.packages)) {
+    merged.piBolt.packages = toPortableBundles(merged.piBolt.packages);
+  }
   fs.writeFileSync(job.seed, JSON.stringify(merged, null, 2) + "\n");
   console.log(`  capture  ${job.live} -> ${path.relative(repo, job.seed)}  (stripped: ${job.strip.join(", ")})`);
 }
@@ -215,8 +237,11 @@ if [ "$MODE" = "uninstall" ]; then
   echo "Removing symlinks that point into this repo:"
   while IFS=$'\t' read -r _rel dst; do unlink_one "$dst"; done < <(portable_targets)
   unlink_one "$HOME/.pi/agent/plugins"
+  unlink_one "$HOME/.pi/agent/pi-bolt-bundles"
   echo
-  echo "Done ($CHANGED change(s)). Seeded files (settings.json, advisor.json) are left in place."
+  echo "Done ($CHANGED change(s)). Seeded files (settings.json, pi-system-one.json,"
+  echo "advisor.json) are left in place, and \`pi\` still runs Pi-Bolt — revert that"
+  echo "separately with $REPO/pi-bolt/pi-swap.sh remove."
   exit 0
 fi
 
@@ -230,6 +255,27 @@ while IFS=$'\t' read -r rel dst; do seed "$rel" "$dst"; done < <(seed_targets)
 echo
 echo "Plugins directory (settings.json references plugins/<name>):"
 dst="$HOME/.pi/agent/plugins"; src="$REPO/plugins"
+[ "$MODE" = "dry-run" ] || mkdir -p "$(dirname "$dst")"
+if [ -L "$dst" ] && [ "$(readlink "$dst")" = "$src" ]; then
+  echo "  ok       $dst"
+else
+  if [ -e "$dst" ] && [ ! -L "$dst" ]; then
+    bak="$(backup_slot "$dst")"
+    if [ "$MODE" != "dry-run" ] && ! mv "$dst" "$bak" 2>/dev/null; then echo "  SKIP     $dst (cannot move aside)"; else echo "  backup   $dst -> $bak"; fi
+  elif [ -L "$dst" ]; then
+    echo "  relink   $dst -> $src"; [ "$MODE" = "dry-run" ] || rm -f "$dst" 2>/dev/null || true
+  fi
+  echo "  link     $dst -> $src"
+  if [ "$MODE" != "dry-run" ] && ! ln -s "$src" "$dst" 2>/dev/null; then
+    echo "  SKIP     $dst (cannot create symlink)"
+  else
+    CHANGED=$((CHANGED + 1))
+  fi
+fi
+
+echo
+echo "Pi-Bolt bundles directory (piBolt.packages references pi-bolt-bundles/<name>):"
+dst="$HOME/.pi/agent/pi-bolt-bundles"; src="$REPO/pi-bolt"
 [ "$MODE" = "dry-run" ] || mkdir -p "$(dirname "$dst")"
 if [ -L "$dst" ] && [ "$(readlink "$dst")" = "$src" ]; then
   echo "  ok       $dst"
@@ -275,6 +321,52 @@ else
   node "$REPO/patches/model-picker.mjs" | sed 's/^/  /' || echo "  SKIP     could not patch the pi bundle (see patches/README.md)"
 fi
 
+# pi-bolt shares ~/.pi/agent with pi, so the seeded settings already declare its
+# packages. This makes the machine match them: binary present, packages
+# materialized, bundles rebuilt from this clone, the compile set compiled in, and
+# `pi` swapped to run pi-bolt. Every step degrades to a printed SKIP rather than
+# failing the install.
+echo
+echo "Pi-Bolt:"
+if [ "${PI_CONFIG_SKIP_PIBOLT:-0}" = "1" ]; then
+  echo "  skip     PI_CONFIG_SKIP_PIBOLT=1"
+elif [ "$MODE" = "dry-run" ]; then
+  echo "  would    install pi-bolt if missing (official installer, unattended)"
+  echo "  would    pi-bolt update --extensions"
+  echo "  would    $REPO/pi-bolt/rebuild.sh --force"
+  echo "  would    pi-bolt compile --only $(paste -sd, "$REPO/pi-bolt/compile-set.txt")"
+  echo "  would    $REPO/pi-bolt/pi-swap.sh apply"
+else
+  if command -v pi-bolt >/dev/null 2>&1; then
+    echo "  ok       pi-bolt $(pi-bolt --version 2>/dev/null | head -1)"
+  elif curl -fsSL https://pi-bolt.opensec.in/install.sh | PIBOLT_YES=1 PIBOLT_EXTENSIONS=no sh; then
+    echo "  install  pi-bolt (official installer)"
+  else
+    echo "  SKIP     pi-bolt install failed; leaving pi as it is"
+  fi
+
+  if command -v pi-bolt >/dev/null 2>&1; then
+    if pi-bolt update --extensions >/dev/null 2>&1; then echo "  ok       packages materialized"; else echo "  SKIP     pi-bolt update --extensions failed"; fi
+
+    if ! command -v bun >/dev/null 2>&1; then
+      echo "  SKIP     bundles need bun on PATH (pi-bolt loads the unbuilt forks)"
+    elif "$REPO/pi-bolt/rebuild.sh" --force >/dev/null; then
+      echo "  ok       bundles rebuilt"
+    else
+      echo "  SKIP     bundle rebuild failed (pi-bolt loads the unbuilt forks)"
+    fi
+
+    compile_set="$(paste -sd, "$REPO/pi-bolt/compile-set.txt")"
+    if pi-bolt compile --only "$compile_set" >/dev/null 2>&1; then echo "  ok       compiled in: $compile_set"; else echo "  SKIP     compile failed (extensions still load from files)"; fi
+
+    if "$REPO/pi-bolt/pi-swap.sh" apply >/dev/null 2>&1; then
+      echo "  ok       pi now runs pi-bolt (revert: $REPO/pi-bolt/pi-swap.sh remove)"
+    else
+      echo "  SKIP     could not swap pi (is pi installed?)"
+    fi
+  fi
+fi
+
 echo
 echo "Done ($CHANGED change(s))."
 cat <<'EOF'
@@ -286,4 +378,7 @@ Next steps:
   2. Pick a default model for this machine: `pi`, then /model.
      settings.json is machine-owned, so that choice stays local.
   3. Restart pi; `pi list` should show the plugins under ~/.pi/agent/plugins.
+  4. `pi` now runs Pi-Bolt (pi-config/pi-bolt/README.md). `pi-real` or
+     `PI_REAL=1 pi` reaches the stock launcher; revert with
+     pi-config/pi-bolt/pi-swap.sh remove. Credentials are shared.
 EOF
