@@ -18,7 +18,7 @@ seeded `~/.pi/agent/settings.json` under `piBolt`, which stock `pi` ignores.
 
 | What | Where |
 |---|---|
-| Pi-Bolt 0.9.4, `darwin-arm64` (no JIT), Pi 1.3.0 base | `~/.pi-bolt/pi-bolt-darwin-arm64`, linked as `~/.local/bin/pi-bolt` |
+| Pi-Bolt 0.9.5, `darwin-arm64-jit` (JIT on), Pi 1.3.0 base | `~/.pi-bolt/pi-bolt-darwin-arm64-jit`, linked as `~/.local/bin/pi-bolt` |
 | `opensec-pi-todo` 2.13.1 | pi-bolt only (`piBolt.packages`) |
 | `opensec-pi-fff` 0.11.0 | pi-bolt only |
 | `@nplez1/pi-bolt-subagents` (built here) | pi-bolt only |
@@ -32,6 +32,43 @@ the advisor/todo config are inherited as-is. `opensec-pi-todo` reads the same
 bundle reads the same `~/.pi/web-search.json`. The advisor bundle reads its prompts
 live from `plugins/pi-advisor-subagent/prompts/` and its config from the same
 `~/.config/rpiv-advisor/advisor.json` pi-config symlinks.
+
+## The build variant: JIT on
+
+`pi-bolt` ships two builds per platform and the installer defaults to the JIT-less
+one. This machine runs the `-jit` variant (`PIBOLT_VARIANT=arm64-jit`) as of
+2026-10-19, which also retires the `bun:ffi` warnings `doctor` printed for
+`opensec-pi-fff` and the web-access bundle (that hint only fires when the JIT is
+off — see [Pi-Bolt#62](https://github.com/opensec-git/Pi-Bolt/issues/62)).
+
+Measured on this machine before switching, both builds sharing `~/.pi/agent` and
+the same 14 extensions, alternating runs:
+
+| | JIT off | JIT on |
+|---|---|---|
+| idle TUI (one open session) | 184.2 / 183.3 MB | 188.7 / 188.5 MB |
+| short session (one `-p` turn) | 213.2 MB | 218.9 MB |
+| `doctor` (all extensions loaded) | 104.8 MB | 110.9 MB |
+| `--version`, nothing loaded | 27.9 MB | 25.6 MB |
+| `doctor` CPU time | 0.22 s | 0.22 s |
+| cold start, `TOTAL` (jiti cache cleared) | ~376 ms | 500–622 ms |
+| warm start, `TOTAL` | ~56 ms | 56–84 ms (median ~61) |
+
+So the JIT costs ~5 MB per session (2–3%), ~200 ms on the first start after the
+jiti cache is cleared, and bought no measurable CPU time on this workload mix:
+extension loading is bound by jiti's TypeScript transform and file IO, and tool
+work is bound by the model call. The reason to run it is not speed — it is that
+`bun:ffi`'s `dlopen` then works, which is `opensec-pi-fff`'s primary backend, and
+`doctor` stops advertising a requirement that isn't one.
+
+`pi-bolt update` preserves the variant (it passes `PIBOLT_VARIANT` from the
+running build); the raw installer does not, so `install.sh` passes it explicitly
+and migrates an existing non-JIT install.
+
+The old `pi-bolt-darwin-arm64` and `pi-bolt-darwin-arm64.previous` folders (~426 MB
+together) are inert leftovers of the JIT-less install. `pi-bolt update --rollback`
+only ever touches `pi-bolt-<platform>-<variant>.previous`, so deleting them is safe
+once the JIT build has been used for a while.
 
 ## What pi-bolt loads differently from pi
 
@@ -76,6 +113,14 @@ Cold used to be Pi-Bolt's worst case (2.5 s against `pi`'s 0.38 s, because jiti
 transpiles every TypeScript extension when its cache is empty and `pi` has Node's
 compile cache instead). It is now *faster* than `pi`.
 
+Every figure in this section was measured on the JIT-less build, which is what the
+bundles were built for. On the `-jit` build (see "The build variant") the warm
+number is unchanged — 56, 61, 84 ms for `TOTAL` warm, so ~61 ms median — but **cold
+start is slower: 622, 617, 500 ms** against the ~376 ms above, i.e. ~200 ms of JIT
+warmup that the AOT-compiled build does not pay. That is the one place the JIT-less
+build is genuinely faster, and it is a first-launch-per-cache cost, not a per-turn
+one.
+
 Cold cost per extension, original → now:
 
 | Extension | original | now |
@@ -106,7 +151,8 @@ It looked disproportionate, so it was measured rather than assumed. The cost is 
 
 A 62 KB *single* module is free; 114 KB across 22 modules is 41 ms — about 1.8 ms
 per module, the same model on Node (≈2 ms). Each module pays a jiti cache read, a
-wrapper eval in the bytecode interpreter (the JIT is off on this build), and an
+wrapper eval in the bytecode interpreter (these were measured on the JIT-less
+build, which is where the interpreter matters), and an
 async `jitiImport(...)` for every bare import — that plugin's graph has ~42 of them.
 jiti's raw transform of those 25 files measures 2.9 ms/file, so the transpile alone
 would be 72 ms with the cache cold; warm loads trade that for per-module overhead.
@@ -358,40 +404,30 @@ limit. Revert with `pi-bolt compile --off`; the replaced build is kept and
 re-running it needs `--only juicesharp-rpiv-ask-user-question,pi-codex-goal,pi-system-one`
 to keep all three.
 
-### Compiled extensions lose resources resolved from `import.meta.url`
+Compiling in works on the `-jit` build too, and keeps the JIT: verified 2026-10-19
+by building to a throwaway `--out` directory and probing `bun:ffi`'s `dlopen` from
+an extension — it succeeded (JIT on) for a build made from the `-jit` install, and
+threw `bun:ffi requires the JIT` for one made from the JIT-less install. Note that
+the release kit's `kit.json` sets `BUN_JSC_useJIT=0` in `env` for *both*, so that
+key is not what decides the result; do not "fix" a compile by editing it.
 
-Build with the patched kit, or `pi-system-one` compiles in without its skill:
+### `import.meta.url` in compiled extensions — fixed upstream in 0.9.5
 
-```sh
-node patch-kit.mjs --run -- --only juicesharp-rpiv-ask-user-question,pi-codex-goal,pi-system-one
-```
+Compiled-in extensions used to lose any resource they resolved from their own
+module URL. `pi-system-one` locates its bundled `skills/` and `prompts/` as
+`join(dirname(fileURLToPath(import.meta.url)), "..", "skills")`, and bundling
+resolves `import.meta.url` once, to the *output* file — so compiled in it named the
+executable's virtual entry `file:///$bunfs/root/pi-bin`, the path collapsed to
+`/$bunfs/skills`, and the `system-one` skill and `/judge` prompt were silently
+missing while `/so` still answered.
 
-`pi-system-one` locates its bundled `skills/` and `prompts/` relative to its own
-module — `join(dirname(fileURLToPath(import.meta.url)), "..", "skills")`. Bundling
-resolves `import.meta.url` once, to the *output* file, so compiled in it names the
-executable's virtual entry `file:///$bunfs/root/pi-bin` and the path collapses to
-`/$bunfs/skills`, which no embedded file can satisfy. Startup prints
-
-```
-[Skill conflicts]
-  /$bunfs/skills
-    skill path does not exist
-```
-
-and the `system-one` skill and `/judge` prompt are silently missing while `/so`
-still answers — nothing else looks wrong, which is why it went unnoticed.
-
-`patch-kit.mjs` unpacks the cached kit, pins `import.meta.url` in every staged
-script to that script's real on-disk URL (what the compiled copy should mean: Pi
-only uses it while the installed extension is unchanged), proves the pin by staging
-`pi-system-one` and checking the result, then prints — or with `--run`, executes —
-`pi-bolt compile --kit … --runtime …`. The patch is anchored: a kit whose
-`gen-plugin-manifest.mjs` has moved fails loudly instead of rebuilding the bug.
-**Re-run it after every `pi-bolt update` and every plain `pi-bolt compile`**, which
-both take the unpatched release kit from `~/.pi-bolt/cache`.
-
-Upstream fix wanted: pin `import.meta.url` at staging time, or resolve resource
-paths against the installed package.
+`patch-kit.mjs` worked around that by pinning `import.meta.url` in every staged
+script before bundling. **The workaround is gone: 0.9.5's kit does it itself**
+(`pinImportMetaInCopy`, applied to every staged extension and to staged
+dependencies), so the script was deleted on 2026-10-19 and nothing needs re-running
+after `pi-bolt update` or `pi-bolt compile` any more. Its own `--check` is what says
+so — against a 0.9.5 kit it reports "the kit's gen-plugin-manifest.mjs no longer
+matches this patch (url import anchor missing) … drop this script if it does".
 
 ## Still on the table
 

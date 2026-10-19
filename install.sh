@@ -390,11 +390,22 @@ fi
 # `pi` swapped to run pi-bolt. Every step degrades to a printed SKIP rather than
 # failing the install.
 echo
-echo "Pi-Bolt:"
+# Every machine here runs the JIT build: it is what `bun:ffi`'s dlopen needs (so
+# opensec-pi-fff uses its primary backend) and it silences doctor's JIT hints, at
+# ~5 MB more per session. The installer's own default is the JIT-less build, and
+# `pi-bolt update` never changes variants, so it has to be named here — and an
+# existing JIT-less install has to be replaced. See pi-bolt/README.md, "The build
+# variant".
+case "$(uname -m)" in
+  arm64 | aarch64) PIBOLT_VARIANT=arm64-jit ;;
+  *) PIBOLT_VARIANT=x64-jit ;;
+esac
+PIBOLT_INSTALL="curl -fsSL https://pi-bolt.opensec.in/install.sh"
+echo "Pi-Bolt (variant $PIBOLT_VARIANT):"
 if [ "${PI_CONFIG_SKIP_PIBOLT:-0}" = "1" ]; then
   echo "  skip     PI_CONFIG_SKIP_PIBOLT=1"
 elif [ "$MODE" = "dry-run" ]; then
-  echo "  would    install pi-bolt if missing (official installer, unattended)"
+  echo "  would    install pi-bolt $PIBOLT_VARIANT if missing or JIT-less (official installer, unattended)"
   echo "  would    pi-bolt update --extensions"
   echo "  would    $REPO/pi-bolt/rebuild.sh --force"
   echo "  would    pi-bolt compile --only $(paste -sd, "$REPO/pi-bolt/compile-set.txt") (+ anything already compiled in)"
@@ -402,8 +413,15 @@ elif [ "$MODE" = "dry-run" ]; then
 else
   if command -v pi-bolt >/dev/null 2>&1; then
     echo "  ok       pi-bolt $(pi-bolt --version 2>/dev/null | head -1)"
-  elif curl -fsSL https://pi-bolt.opensec.in/install.sh | PIBOLT_YES=1 PIBOLT_EXTENSIONS=no sh; then
-    echo "  install  pi-bolt (official installer)"
+    if ! pi-bolt --version 2>/dev/null | grep -q -- "-jit"; then
+      if $PIBOLT_INSTALL | PIBOLT_YES=1 PIBOLT_EXTENSIONS=no PIBOLT_VARIANT="$PIBOLT_VARIANT" sh >/dev/null 2>&1; then
+        echo "  install  pi-bolt $PIBOLT_VARIANT (it was on the JIT-less build)"
+      else
+        echo "  SKIP     pi-bolt $PIBOLT_VARIANT install failed; staying on the JIT-less build"
+      fi
+    fi
+  elif $PIBOLT_INSTALL | PIBOLT_YES=1 PIBOLT_EXTENSIONS=no PIBOLT_VARIANT="$PIBOLT_VARIANT" sh; then
+    echo "  install  pi-bolt $PIBOLT_VARIANT (official installer)"
   else
     echo "  SKIP     pi-bolt install failed; leaving pi as it is"
   fi
