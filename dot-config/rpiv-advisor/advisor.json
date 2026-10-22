@@ -1,9 +1,4 @@
 {
-  "effort": "high",
-  "compressorEffort": "high",
-  "disabledForModels": [
-    "claude/opus"
-  ],
   "guidance": {
     "promptSnippet": "Escalate to a stronger reviewer model with a specific `question` when you are stuck, circling, or about to make an expensive-to-reverse decision",
     "promptGuidelines": [

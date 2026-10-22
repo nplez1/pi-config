@@ -1,0 +1,13 @@
+{
+  "exploration": "xiaomi/mimo-v2.6-flash",
+  "heavy": "xiaomi/mimo-v2.6-pro",
+  "opus": "claude/opus",
+  "sonnet": "claude/sonnet",
+  "workhorse": [
+    "deepseek/deepseek-flash",
+    "xiaomi/mimo-v2.6-flash"
+  ],
+  "never": [
+    "deepseek/deepseek-v4-pro"
+  ]
+}

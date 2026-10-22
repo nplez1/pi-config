@@ -135,7 +135,6 @@ portable_targets() {
   printf '%s\t%s\n' \
     "dot-pi/agent/models.json"             "$HOME/.pi/agent/models.json" \
     "dot-pi/agent/AGENTS.md"               "$HOME/.pi/agent/AGENTS.md" \
-    "dot-pi/agent/subagents.json"          "$HOME/.pi/agent/subagents.json" \
     "dot-pi/web-search.json"               "$HOME/.pi/web-search.json" \
     "dot-config/rpiv-todo/config.json"     "$HOME/.config/rpiv-todo/config.json"
   local f
@@ -164,6 +163,8 @@ seed_targets() {
   printf '%s\t%s\n' \
     "dot-pi/agent/settings.json"            "$HOME/.pi/agent/settings.json" \
     "dot-pi/agent/pi-system-one.json"       "$HOME/.pi/agent/pi-system-one.json" \
+    "dot-pi/agent/subagents.json"           "$HOME/.pi/agent/subagents.json" \
+    "dot-config/pi-config/model-roles.json" "$HOME/.config/pi-config/model-roles.json" \
     "dot-config/rpiv-advisor/advisor.json"  "$HOME/.config/rpiv-advisor/advisor.json"
 }
 
@@ -186,9 +187,43 @@ const jobs = [
     strip: ["defaultProvider", "defaultModel", "enabledModels", "lastChangelogVersion"],
   },
   {
+    // Per-agent `model`/`thinking` are this machine's account choices — another
+    // machine may not have the provider at all — so they stay local and only the
+    // shared keys publish. `enabled` is shared: which agents exist is not an
+    // account property.
+    live: path.join(home, ".pi/agent/subagents.json"),
+    seed: path.join(repo, "dot-pi/agent/subagents.json"),
+    strip: [],
+    transform: (live) => {
+      const overrides = live.agentOverrides ?? {};
+      for (const [name, override] of Object.entries(overrides)) {
+        if (!override || typeof override !== "object") continue;
+        delete override.model;
+        delete override.thinking;
+        if (Object.keys(override).length === 0) delete overrides[name];
+      }
+      // Kept even when empty: the seed merge below is shallow, so an absent key
+      // would resurrect whatever overrides the seed still holds.
+      live.agentOverrides = overrides;
+    },
+    note: "agentOverrides.*.model/thinking",
+  },
+  {
+    // The role names are shared, the IDs are not: publish the shape, null the IDs.
+    live: path.join(home, ".config/pi-config/model-roles.json"),
+    seed: path.join(repo, "dot-config/pi-config/model-roles.json"),
+    strip: [],
+    transform: (live) => {
+      for (const key of Object.keys(live)) {
+        live[key] = Array.isArray(live[key]) ? [] : null;
+      }
+    },
+    note: "every model ID (roles kept null)",
+  },
+  {
     live: path.join(home, ".config/rpiv-advisor/advisor.json"),
     seed: path.join(repo, "dot-config/rpiv-advisor/advisor.json"),
-    strip: ["modelKey", "compressorModelKey"],
+    strip: ["modelKey", "compressorModelKey", "effort", "compressorEffort", "disabledForModels"],
   },
   {
     // Seeded, not linked: /so config rewrites this file with an atomic rename,
@@ -213,12 +248,17 @@ for (const job of jobs) {
   const seed = JSON.parse(fs.readFileSync(job.seed, "utf8"));
   // Start from the live file so shared additions flow in, then drop account keys.
   for (const key of job.strip) delete live[key];
+  if (typeof job.transform === "function") job.transform(live);
   const merged = { ...seed, ...live };
+  // Strip from the MERGED result, not just from live: a key the seed already
+  // carries would otherwise survive the merge and be republished forever.
+  for (const key of job.strip) delete merged[key];
   if (Array.isArray(merged.piBolt?.packages)) {
     merged.piBolt.packages = toPortableBundles(merged.piBolt.packages);
   }
   fs.writeFileSync(job.seed, JSON.stringify(merged, null, 2) + "\n");
-  console.log(`  capture  ${job.live} -> ${path.relative(repo, job.seed)}  (stripped: ${job.strip.join(", ")})`);
+  const strippedNote = [job.strip.join(", "), job.note].filter(Boolean).join(", ");
+  console.log(`  capture  ${job.live} -> ${path.relative(repo, job.seed)}  (stripped: ${strippedNote || "nothing"})`);
 }
 NODE
 }
@@ -244,7 +284,7 @@ if [ "$MODE" = "uninstall" ]; then
   unlink_one "$HOME/.pi/agent/pi-bolt-bundles"
   echo
   echo "Done ($CHANGED change(s)). Seeded files (settings.json, pi-system-one.json,"
-  echo "advisor.json) are left in place, and \`pi\` still runs Pi-Bolt — revert that"
+  echo "subagents.json, model-roles.json, advisor.json) are left in place, and \`pi\` still runs Pi-Bolt — revert that"
   echo "separately with $REPO/pi-bolt/pi-swap.sh remove."
   exit 0
 fi
@@ -302,6 +342,58 @@ if (Array.isArray(live.piBolt?.packages)) {
     return e;
   });
   if (rewrote) changes.push(`piBolt.packages: ${rewrote} path(s) made portable`);
+}
+if (!changes.length) {
+  console.log("  ok       already carries every shared key");
+  process.exit(0);
+}
+for (const c of changes) console.log(`  ${mode === "dry-run" ? "would add" : "added   "} ${c}`);
+if (mode !== "dry-run") fs.writeFileSync(livePath, JSON.stringify(live, null, 2) + "\n");
+NODE
+
+echo
+echo "Shared keys in an existing subagents.json (additive; per-agent models untouched):"
+node - "$REPO" "$HOME" "$MODE" <<'NODE' || echo "  SKIP     needs node on PATH"
+const fs = require("node:fs");
+const path = require("node:path");
+const [repo, home, mode] = process.argv.slice(2);
+const livePath = path.join(home, ".pi/agent/subagents.json");
+const seedPath = path.join(repo, "dot-pi/agent/subagents.json");
+if (!fs.existsSync(livePath) || !fs.existsSync(seedPath)) {
+  console.log("  skip     no subagents.json to sync");
+  process.exit(0);
+}
+const live = JSON.parse(fs.readFileSync(livePath, "utf8"));
+const seed = JSON.parse(fs.readFileSync(seedPath, "utf8"));
+const changes = [];
+// The file is seeded once and never overwritten, so without this the shared keys
+// `capture` publishes would only ever travel repo <- machine, never back.
+for (const key of ["showModel", "showCost", "widgetMode"]) {
+  if (key in seed && live[key] === undefined) {
+    live[key] = seed[key];
+    changes.push(`${key} (new)`);
+  }
+}
+// An agent's enable flag is shared; its model and thinking level are this
+// machine's account choice, so only `enabled` is ever filled in — never a model.
+// The file is hand-editable, so anything malformed is left exactly as it is
+// rather than crashing the install or being silently rewritten.
+const isPlain = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
+if (!isPlain(live.agentOverrides)) live.agentOverrides = {};
+const liveOverrides = live.agentOverrides;
+for (const [name, seedOverride] of Object.entries(
+  isPlain(seed.agentOverrides) ? seed.agentOverrides : {},
+)) {
+  const enabled = isPlain(seedOverride) ? seedOverride.enabled : undefined;
+  if (enabled === undefined) continue;
+  const existing = liveOverrides[name];
+  if (existing === undefined) {
+    liveOverrides[name] = { enabled };
+    changes.push(`agentOverrides.${name}.enabled = ${enabled} (new agent)`);
+  } else if (isPlain(existing) && existing.enabled === undefined) {
+    existing.enabled = enabled;
+    changes.push(`agentOverrides.${name}.enabled = ${enabled}`);
+  }
 }
 if (!changes.length) {
   console.log("  ok       already carries every shared key");

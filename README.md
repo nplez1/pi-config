@@ -18,23 +18,59 @@ uses GitHub Copilot Enterprise), and pi writes the chosen model back into
 | Machine-owned (seeded once, kept local) | Key | Why |
 | --- | --- | --- |
 | `~/.pi/agent/settings.json` | `defaultProvider`, `defaultModel`, `enabledModels` | which providers/models this machine actually has |
-| `~/.config/rpiv-advisor/advisor.json` | `modelKey`, `compressorModelKey` | the advisor model this machine can reach |
+| `~/.pi/agent/subagents.json` | `agentOverrides.*.model`, `agentOverrides.*.thinking` | the model each subagent type runs on is an account fact, not a shared one |
+| `~/.config/pi-config/model-roles.json` | every ID | the provider IDs `AGENTS.md`'s shorthand (Explore/Fast, Deep/Pro, Opus/Sonnet, workhorse) resolves to |
+| `~/.config/rpiv-advisor/advisor.json` | `modelKey`, `compressorModelKey`, `effort`, `compressorEffort`, `disabledForModels` | the advisor model this machine can reach, and the effort it can afford |
 
-Everything else — the plugin/package list, theme, tui mode, subagent
+Everything else — the plugin/package list, theme, tui mode, agent `.md`
 definitions, extensions, skills, `models.json`, todo/advisor **guidance** — is
-shared and symlinked, so editing it edits this repo.
+shared and symlinked, so editing it edits this repo. Which models those agents
+run on is deliberately *not* in that list: a work machine on a different account
+has to be able to retarget them without editing this repo, which is also why no
+plugin here pins a model in its source.
 
-`install.sh` **seeds** the two machine-owned files (copy only if absent) instead
-of symlinking them, so a `/model` change on one machine can never rewrite the
-other's config. When you change something *shared* inside those two files, run:
+`install.sh` **seeds** the four machine-owned files (copy only if absent) instead
+of symlinking them, so a `/subagents` or `/model` change on one machine can never
+rewrite the other's config. When you change something *shared* inside those
+files, run:
 
 ```sh
 ~/Code/pi-config/install.sh capture   # copies them back, stripping account keys
-git -C ~/Code/pi-config diff
 ```
 
 `capture` always deletes the account keys listed above before writing the seed,
-so they cannot leak into the repo.
+so they cannot leak into the repo. The shared keys travel back the other way
+too: `install.sh` additively syncs them into an existing machine-owned file
+(missing top-level keys, new `packages` entries, new `enabled` flags), so a seed
+edit reaches a machine that has already run the install — while never touching a
+model choice that machine made locally.
+
+### Upgrading a machine that seeded before models moved
+
+`subagents.json` used to be symlinked, so on an older machine its per-agent models
+lived in this repo and the live file *was* the seed. Pulling this change strips
+them from the seed, and the symlink shows the stripped version immediately —
+before `install.sh` ever runs. Nothing is migrated automatically, so copy the file
+out first if you want its values:
+
+```sh
+cp -L ~/.pi/agent/subagents.json /tmp/subagents.before.json   # before pulling
+# /subagents wrote through the symlink, so models chosen there are *uncommitted
+# edits in this repo* and will block the pull. They are saved above — discard:
+git -C ~/Code/pi-config checkout -- dot-pi/agent/subagents.json
+git -C ~/Code/pi-config pull
+~/Code/pi-config/install.sh        # converts the symlink to a machine-owned copy
+# then merge your models back, or set them through /subagents
+```
+
+Already pulled? The old content is still in history:
+`git -C ~/Code/pi-config log -p -- dot-pi/agent/subagents.json`.
+
+Models chosen through `/subagents` were stored in that same shared file, so they
+need the same re-apply, and the provider IDs belong in
+`~/.config/pi-config/model-roles.json` (see
+`dot-config/pi-config/model-roles.machine.example.json`). The advisor config was
+already seeded, so its `modelKey`/`effort` stay as that machine has them.
 
 ## Layout
 
@@ -49,11 +85,14 @@ dot-pi/
     pi-system-one.json            SEEDED   /so mode; seeded because /so config rewrites it
     models.json                   -> ~/.pi/agent/models.json   (keys via ${VAR})
     AGENTS.md                     -> ~/.pi/agent/AGENTS.md
-    subagents.json                -> ~/.pi/agent/subagents.json
+    subagents.json                SEEDED   agent enable flags; per-agent models local
+    subagents.machine.example.json example of the per-agent model overrides
     auth.json.example             template only — auth.json is NOT tracked
     agents/                       -> ~/.pi/agent/agents/
     extensions/                   -> ~/.pi/agent/extensions/    (per file)
 dot-config/
+  pi-config/model-roles.json      SEEDED   which ID each AGENTS.md role means
+  pi-config/model-roles.machine.example.json
   rpiv-todo/config.json           -> ~/.config/rpiv-todo/config.json
   rpiv-advisor/advisor.json       SEEDED   guidance shared, models local
   rpiv-advisor/advisor.machine.example.json

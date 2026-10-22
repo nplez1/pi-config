@@ -1,0 +1,23 @@
+{
+  "showModel": true,
+  "showCost": true,
+  "widgetMode": "all",
+  "agentOverrides": {
+    "Explore": {
+      "model": "xiaomi/mimo-v2.6-flash",
+      "thinking": "medium"
+    },
+    "rpiv-advisor": {
+      "model": "claude/opus",
+      "thinking": "high",
+      "enabled": true
+    },
+    "rpiv-compressor": {
+      "model": "xiaomi/mimo-v2.6-flash",
+      "thinking": "high"
+    },
+    "general-purpose": {
+      "enabled": true
+    }
+  }
+}
