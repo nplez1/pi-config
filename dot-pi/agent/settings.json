@@ -16,7 +16,6 @@
   "piBolt": {
     "packages": [
       "npm:opensec-pi-todo@2.13.1",
-      "npm:opensec-pi-fff@0.11.0",
       "-plugins/pi-todo",
       "-plugins/pi-subagents",
       "pi-bolt-bundles/pi-bolt-subagents",

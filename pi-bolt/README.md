@@ -20,10 +20,18 @@ seeded `~/.pi/agent/settings.json` under `piBolt`, which stock `pi` ignores.
 |---|---|
 | Pi-Bolt 0.9.5, `darwin-arm64-jit` (JIT on), Pi 1.3.0 base | `~/.pi-bolt/pi-bolt-darwin-arm64-jit`, linked as `~/.local/bin/pi-bolt` |
 | `opensec-pi-todo` 2.13.1 | pi-bolt only (`piBolt.packages`) |
-| `opensec-pi-fff` 0.11.0 | pi-bolt only |
 | `@nplez1/pi-bolt-subagents` (built here) | pi-bolt only |
 | `@nplez1/pi-bolt-web-access` (built here) | pi-bolt only |
 | `@nplez1/pi-bolt-advisor-subagent` (built here) | pi-bolt only |
+
+**Not installed: `opensec-pi-fff`.** It was dropped on 2026-10-22 because its
+extension hung on other machines; it is out of `piBolt.packages` until that is
+understood. Putting it back is one line in `piBolt.packages` in the seeded
+`settings.json` plus a `pi-bolt update --extensions`:
+
+```json
+"npm:opensec-pi-fff@0.11.0",
+```
 
 Pi-Bolt shares `~/.pi/agent` with `pi`, so providers, `auth.json`, `models.json`,
 `settings.json`, sessions, `AGENTS.md`, `subagents.json`, extensions, skills and
@@ -58,8 +66,10 @@ So the JIT costs ~5 MB per session (2–3%), ~200 ms on the first start after th
 jiti cache is cleared, and bought no measurable CPU time on this workload mix:
 extension loading is bound by jiti's TypeScript transform and file IO, and tool
 work is bound by the model call. The reason to run it is not speed — it is that
-`bun:ffi`'s `dlopen` then works, which is `opensec-pi-fff`'s primary backend, and
-`doctor` stops advertising a requirement that isn't one.
+`bun:ffi`'s `dlopen` then works, which was `opensec-pi-fff`'s primary backend
+(it also served the web-access bundle), and `doctor` stops advertising a
+requirement that isn't one. `opensec-pi-fff` was dropped from the package list on
+2026-10-22, so the web-access bundle is the remaining reason to keep the variant.
 
 `pi-bolt update` preserves the variant (it passes `PIBOLT_VARIANT` from the
 running build); the raw installer does not, so `install.sh` passes it explicitly
@@ -79,7 +89,6 @@ once the JIT build has been used for a while.
 {
   "packages": [
     "npm:opensec-pi-todo@2.13.1",
-    "npm:opensec-pi-fff@0.11.0",
     "-plugins/pi-todo",
     "-plugins/pi-subagents",
     "pi-bolt-bundles/pi-bolt-subagents",
@@ -131,7 +140,7 @@ Cold cost per extension, original → now:
 | `plugins/pi-advisor-subagent` | 145 ms | **2–6 ms** |
 | `@juicesharp/rpiv-ask-user-question` | 83 ms | 0–1 ms (compiled in) |
 | seven global extensions | ~115 ms | ~115 ms |
-| `opensec-pi-todo` + `opensec-pi-fff` | — | 0–3 ms each |
+| `opensec-pi-todo` | — | 0–3 ms |
 
 What is left is spread thin: `pi-web-access` 12 ms, `orca-prefill` 8 ms,
 `pi-codex-goal` 8 ms, `orca-agent-status` 0 ms, the rest 1–2 ms each.
