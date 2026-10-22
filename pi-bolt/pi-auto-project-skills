@@ -1,0 +1,45 @@
+#!/bin/sh
+# Load shared parent-project context for pi and pi-bolt.
+# The caller supplies the actual pi executable as the first argument.
+
+if [ "$#" -lt 1 ]; then
+  echo "usage: pi-auto-project-skills <pi-executable> [args...]" >&2
+  exit 2
+fi
+
+target=$1
+shift
+
+# Package-management commands must remain the first positional argument. Pi
+# dispatches update/install/etc. before its normal option parser; adding
+# automatic flags in front would turn the command into an initial prompt.
+case "${1:-}" in
+  install|remove|uninstall|update|list|config|auth|mcp)
+    exec "$target" "$@"
+    ;;
+esac
+
+project_dir=${PWD:-.}
+git_root=$(git -C "$project_dir" rev-parse --show-toplevel 2>/dev/null || true)
+if [ -n "$git_root" ]; then
+  project_dir=$git_root
+fi
+
+parent_dir=$(dirname "$project_dir")
+shared_skills="$parent_dir/.agents/skills"
+parent_agents="$parent_dir/AGENTS.md"
+
+if [ -d "$shared_skills" ] && [ -f "$parent_agents" ]; then
+  exec "$target" \
+    --skill "$shared_skills" \
+    --append-system-prompt "$parent_agents" \
+    "$@"
+fi
+if [ -d "$shared_skills" ]; then
+  exec "$target" --skill "$shared_skills" "$@"
+fi
+if [ -f "$parent_agents" ]; then
+  exec "$target" --append-system-prompt "$parent_agents" "$@"
+fi
+
+exec "$target" "$@"

@@ -48,6 +48,10 @@ bolt=\$(command -v pi-bolt 2>/dev/null) || {
   echo "pi-swap: pi-bolt is not on PATH. Revert with $BOLT_HOME/pi-swap.sh remove" >&2
   exit 127
 }
+helper="\$HOME/.local/bin/pi-auto-project-skills"
+if [ -x "\$helper" ]; then
+  exec "\$helper" "\$bolt" "\$@"
+fi
 exec "\$bolt" "\$@"
 EOF
 }

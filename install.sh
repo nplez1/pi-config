@@ -135,6 +135,7 @@ portable_targets() {
   printf '%s\t%s\n' \
     "dot-pi/agent/models.json"             "$HOME/.pi/agent/models.json" \
     "dot-pi/agent/AGENTS.md"               "$HOME/.pi/agent/AGENTS.md" \
+    "pi-bolt/pi-auto-project-skills"       "$HOME/.local/bin/pi-auto-project-skills" \
     "dot-pi/web-search.json"               "$HOME/.pi/web-search.json" \
     "dot-config/rpiv-todo/config.json"     "$HOME/.config/rpiv-todo/config.json"
   local f
