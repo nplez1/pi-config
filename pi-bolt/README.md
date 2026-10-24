@@ -19,7 +19,7 @@ seeded `~/.pi/agent/settings.json` under `piBolt`, which stock `pi` ignores.
 
 | What | Where |
 |---|---|
-| Pi-Bolt 1.0.2, `darwin-arm64-jit` (JIT on), Pi 1.4.0 base | `~/.pi-bolt/pi-bolt-darwin-arm64-jit`, linked as `~/.local/bin/pi-bolt` |
+| Pi-Bolt 1.0.2, `darwin-arm64` (JIT off), Pi 1.4.0 base | `~/.pi-bolt/pi-bolt-darwin-arm64`, linked as `~/.local/bin/pi-bolt` |
 | `opensec-pi-todo` 2.13.1 | pi-bolt only (`piBolt.packages`) |
 | `@nplez1/pi-bolt-subagents` (built here) | pi-bolt only |
 | `@nplez1/pi-bolt-web-access` (built here) | pi-bolt only |
@@ -42,16 +42,24 @@ bundle reads the same `~/.pi/web-search.json`. The advisor bundle reads its prom
 live from `plugins/pi-advisor-subagent/prompts/` and its config from the same
 `~/.config/rpiv-advisor/advisor.json` pi-config symlinks.
 
-## The build variant: JIT on
+## The build variant: JIT off (the installer's default)
 
-`pi-bolt` ships two builds per platform and the installer defaults to the JIT-less
-one. This machine runs the `-jit` variant (`PIBOLT_VARIANT=arm64-jit`) as of
-2026-10-19, which also retires the `bun:ffi` warnings `doctor` printed for
-`opensec-pi-fff` and the web-access bundle (that hint only fires when the JIT is
-off — see [Pi-Bolt#62](https://github.com/opensec-git/Pi-Bolt/issues/62)).
+`pi-bolt` ships two builds per platform. The installer defaults to the JIT-less
+one, and that is what this repo takes: `install.sh` passes no `PIBOLT_VARIANT` at
+all, so a machine gets the default. A `PIBOLT_VARIANT` set in the environment still
+wins, for a deliberate trial.
 
-Measured on this machine before switching, both builds sharing `~/.pi/agent` and
-the same 14 extensions, alternating runs:
+This repo forced `arm64-jit` from 2026-10-19 to 2026-10-24, for one reason:
+`bun:ffi`'s `dlopen` needs the JIT, and that was `opensec-pi-fff`'s primary
+backend (it also served the web-access bundle). **That reason is gone.**
+`opensec-pi-fff` was dropped from the package list on 2026-10-22, and on
+2026-10-24 a grep of everything this machine actually loads — all four
+`pi-bolt-bundles`, `pi-web-access/dist`, `opensec-pi-todo`, `pi-system-one`,
+`pi-codex-goal` — found **no `bun:ffi` reference at all**. Nothing installed needs
+the JIT to work.
+
+What the JIT costs, measured here on 2026-10-19 (0.9.5, both builds sharing
+`~/.pi/agent` and the same 14 extensions, alternating runs):
 
 | | JIT off | JIT on |
 |---|---|---|
@@ -63,23 +71,32 @@ the same 14 extensions, alternating runs:
 | cold start, `TOTAL` (jiti cache cleared) | ~376 ms | 500–622 ms |
 | warm start, `TOTAL` | ~56 ms | 56–84 ms (median ~61) |
 
-So the JIT costs ~5 MB per session (2–3%), ~200 ms on the first start after the
-jiti cache is cleared, and bought no measurable CPU time on this workload mix:
-extension loading is bound by jiti's TypeScript transform and file IO, and tool
-work is bound by the model call. The reason to run it is not speed — it is that
-`bun:ffi`'s `dlopen` then works, which was `opensec-pi-fff`'s primary backend
-(it also served the web-access bundle), and `doctor` stops advertising a
-requirement that isn't one. `opensec-pi-fff` was dropped from the package list on
-2026-10-22, so the web-access bundle is the remaining reason to keep the variant.
+~5 MB per session (2–3%), ~200 ms on the first start after the jiti cache is
+cleared, no measurable CPU gained: extension loading is bound by jiti's TypeScript
+transform and file IO, and tool work is bound by the model call. The JIT is for
+*sustained* JS work, which a one-shot extension load is not — and the two
+extensions that are actually heavy here are prebuilt bundles, not TypeScript.
 
-`pi-bolt update` preserves the variant (it passes `PIBOLT_VARIANT` from the
-running build); the raw installer does not, so `install.sh` passes it explicitly
-and migrates an existing non-JIT install.
+**`doctor` suggests otherwise, and it is worth knowing why.** In 1.0.2 it prints
+"takes 253 ms of CPU to load, interpreted: the JIT build runs heavy extensions
+faster" whenever an extension is slow. On 2026-10-24 that hint was pointing at a
+problem the JIT could not have fixed — the 250 ms was a shadowing `node_modules`,
+not interpretation ([below](#when-extension-loads-regress-a-node_modules-above-the-agent-dir)).
+Read the hint as "something is slow", not as a diagnosis.
 
-The old `pi-bolt-darwin-arm64` and `pi-bolt-darwin-arm64.previous` folders (~426 MB
-together) are inert leftovers of the JIT-less install. `pi-bolt update --rollback`
-only ever touches `pi-bolt-<platform>-<variant>.previous`, so deleting them is safe
-once the JIT build has been used for a while.
+If an extension ever does need the JIT it says so plainly — `bun:ffi requires the
+JIT` — and that is the moment to switch:
+`PIBOLT_VARIANT=arm64-jit ~/Code/pi-config/install.sh`. `pi-bolt update` preserves
+whichever variant is installed (it passes `PIBOLT_VARIANT` from the running build),
+so the choice survives updates either way; `install.sh` reinstalls when it finds a
+`-jit` build and no `PIBOLT_VARIANT` is set, which is how a machine comes back to
+the default.
+
+If a machine still carries `pi-bolt-darwin-arm64-jit` from the forced-JIT period
+(this one does not — the `-jit` install had already been replaced), it is inert.
+`pi-bolt update --rollback` only ever touches
+`pi-bolt-<platform>-<variant>.previous`, which is the live rollback slot, so
+deleting the `-jit` folder is safe.
 
 ## What pi-bolt loads differently from pi
 
@@ -205,7 +222,7 @@ pi-bolt-bundles/pi-bolt-subagents takes 253 ms of CPU to load, interpreted:
 the JIT build runs heavy extensions faster (… PIBOLT_VARIANT=arm64-jit …)
 ```
 
-which sends you to [the build variant](#the-build-variant-jit-on). The JIT is not
+which sends you to [the build variant](#the-build-variant-jit-off-the-installers-default). The JIT is not
 the problem, and switching builds would have left all 390 ms in place — this page
 recorded the JIT as *slower* on warm start, and it still is.
 

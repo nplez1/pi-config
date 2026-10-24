@@ -483,17 +483,24 @@ fi
 # in (minus pi-bolt/compile-exclude.txt), and `pi` swapped to run pi-bolt. Every
 # step degrades to a printed SKIP rather than failing the install.
 echo
-# Every machine here runs the JIT build: it is what `bun:ffi`'s dlopen needs (so
-# opensec-pi-fff uses its primary backend) and it silences doctor's JIT hints, at
-# ~5 MB more per session. The installer's own default is the JIT-less build, and
-# `pi-bolt update` never changes variants, so it has to be named here — and an
-# existing JIT-less install has to be replaced. See pi-bolt/README.md, "The build
-# variant".
-case "$(uname -m)" in
-  arm64 | aarch64) PIBOLT_VARIANT=arm64-jit ;;
-  *) PIBOLT_VARIANT=x64-jit ;;
-esac
+# Machines here run the JIT-less build, which is the installer's own default — so
+# no PIBOLT_VARIANT is passed, and one set in the environment still wins for a
+# deliberate trial. This repo used to force `arm64-jit` because `bun:ffi`'s dlopen
+# needed it; opensec-pi-fff was dropped on 2026-10-22 and nothing installed
+# references bun:ffi any more (checked 2026-10-24), while the JIT costs ~5 MB per
+# session and ~200 ms of cold start and bought no measurable CPU time.
+# `pi-bolt update` never changes variants, so an existing -jit install has to be
+# replaced. See pi-bolt/README.md, "The build variant".
 PIBOLT_INSTALL="curl -fsSL https://pi-bolt.opensec.in/install.sh"
+PIBOLT_VARIANT=${PIBOLT_VARIANT:-}
+pibolt_install() {
+  if [ -n "$PIBOLT_VARIANT" ]; then
+    $PIBOLT_INSTALL | PIBOLT_YES=1 PIBOLT_EXTENSIONS=no PIBOLT_VARIANT="$PIBOLT_VARIANT" sh
+  else
+    $PIBOLT_INSTALL | PIBOLT_YES=1 PIBOLT_EXTENSIONS=no sh
+  fi
+}
+variant_label=${PIBOLT_VARIANT:-the JIT-less default}
 
 # The one exclusion list, read by the dry-run line and by the compile step below.
 compile_exclude_list() {
@@ -502,11 +509,11 @@ compile_exclude_list() {
     | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' \
     | sed '/^$/d' | paste -sd, -
 }
-echo "Pi-Bolt (variant $PIBOLT_VARIANT):"
+echo "Pi-Bolt (variant: $variant_label):"
 if [ "${PI_CONFIG_SKIP_PIBOLT:-0}" = "1" ]; then
   echo "  skip     PI_CONFIG_SKIP_PIBOLT=1"
 elif [ "$MODE" = "dry-run" ]; then
-  echo "  would    install pi-bolt $PIBOLT_VARIANT if missing or JIT-less (official installer, unattended)"
+  echo "  would    install pi-bolt ($variant_label) if missing or on a different build (official installer, unattended)"
   echo "  would    pi-bolt update --extensions"
   echo "  would    $REPO/pi-bolt/rebuild.sh --force"
   echo "  would    pi-bolt compile --exclude $(compile_exclude_list)"
@@ -516,15 +523,15 @@ elif [ "$MODE" = "dry-run" ]; then
 else
   if command -v pi-bolt >/dev/null 2>&1; then
     echo "  ok       pi-bolt $(pi-bolt --version 2>/dev/null | head -1)"
-    if ! pi-bolt --version 2>/dev/null | grep -q -- "-jit"; then
-      if $PIBOLT_INSTALL | PIBOLT_YES=1 PIBOLT_EXTENSIONS=no PIBOLT_VARIANT="$PIBOLT_VARIANT" sh >/dev/null 2>&1; then
-        echo "  install  pi-bolt $PIBOLT_VARIANT (it was on the JIT-less build)"
+    if pi-bolt --version 2>/dev/null | grep -q -- "-jit"; then
+      if pibolt_install >/dev/null 2>&1; then
+        echo "  install  pi-bolt ($variant_label; it was on the -jit build)"
       else
-        echo "  SKIP     pi-bolt $PIBOLT_VARIANT install failed; staying on the JIT-less build"
+        echo "  SKIP     pi-bolt reinstall failed; staying on the -jit build"
       fi
     fi
-  elif $PIBOLT_INSTALL | PIBOLT_YES=1 PIBOLT_EXTENSIONS=no PIBOLT_VARIANT="$PIBOLT_VARIANT" sh; then
-    echo "  install  pi-bolt $PIBOLT_VARIANT (official installer)"
+  elif pibolt_install; then
+    echo "  install  pi-bolt ($variant_label; official installer)"
   else
     echo "  SKIP     pi-bolt install failed; leaving pi as it is"
   fi
