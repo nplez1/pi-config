@@ -34,83 +34,113 @@ STATE=$BOLT_HOME/.pi-swap-state
 MARKER=pi-swap-shim
 
 is_shim() { [ -f "$1" ] && grep -q "$MARKER" "$1" 2>/dev/null; }
+# The preserved launcher is the only way back to stock pi, so it is never
+# overwritten with something that is not a working script. On 2026-10-24 a failed
+# shim generation truncated ~/.pi/agent/bin/pi, and apply() copied that empty file
+# over pi.real — leaving `pi-real` broken with nothing to restore from.
+plausible_launcher() { [ -s "$1" ] && sh -n "$1" 2>/dev/null; }
 
 shim() {
-  cat <<EOF
+  # A QUOTED heredoc: nothing inside is expanded, so a backtick in a comment stays
+  # a comment. It did not, on 2026-10-24 — an unescaped `pi compile` in one of
+  # these lines was *executed* while the shim was being written, and its output
+  # landed in ~/.local/bin/pi. Values are substituted afterwards instead.
+  cat <<'SHIM'
 #!/bin/sh
-# $MARKER — installed by pi-swap.sh; \`pi\` runs Pi-Bolt.
-# Revert:  $BOLT_HOME/pi-swap.sh remove
+# __MARKER__ — installed by pi-swap.sh; `pi` runs Pi-Bolt.
+# Revert:  __BOLT_HOME__/pi-swap.sh remove
 # Bypass:  PI_REAL=1 pi ...          (or use: pi-real)
-if [ "\${PI_REAL:-0}" = 1 ]; then
-  exec "\$HOME/.pi/agent/bin/pi.real" "\$@"
+if [ "${PI_REAL:-0}" = 1 ]; then
+  exec "$HOME/.pi/agent/bin/pi.real" "$@"
 fi
-bolt=\$(command -v pi-bolt 2>/dev/null) || {
-  echo "pi-swap: pi-bolt is not on PATH. Revert with $BOLT_HOME/pi-swap.sh remove" >&2
+bolt=$(command -v pi-bolt 2>/dev/null) || {
+  echo "pi-swap: pi-bolt is not on PATH. Revert with __BOLT_HOME__/pi-swap.sh remove" >&2
   exit 127
 }
-# `pi-auto-project-skills` adds parent-project --skill/--append-system-prompt
-# before a *session* starts. It is dispatched at the bottom, never for the two
-# maintenance commands below: `compile` is not in the helper's pass-through list,
-# so routing it there would hand `pi compile` flags it does not accept.
-helper="\$HOME/.local/bin/pi-auto-project-skills"
 
-# \`update\` and \`compile\` are the two commands that move what is installed, so
+# This helper adds the parent project's --skill/--append-system-prompt before a
+# *session* starts. It is dispatched at the bottom, never for the maintenance
+# commands below: `compile` is not in the helper's pass-through list, so routing
+# it there would hand pi compile flags it does not accept.
+helper="$HOME/.local/bin/pi-auto-project-skills"
+
+# `update` and `compile` are the two commands that move what is installed, so
 # they are also the ones that leave things out of step: a vulnerable dependency, a
 # stale bundle over a freshly bumped pi-web-access, and — after a release bump or a
-# \`compile --off\` — no compile record, so the compile set silently falls back to
+# `compile --off` — no compile record, so the compile set silently falls back to
 # everything and dies on an extension Bun cannot compile. after-update.sh puts all
 # three back, silently when there is nothing to do, and never changes the exit code.
-sync="$BOLT_HOME/after-update.sh"
-case " \${1:-} " in
+sync="__BOLT_HOME__/after-update.sh"
+case " ${1:-} " in
   " update ")
-    case " \$* " in
-      *" --models "* | *" models "*) exec "\$bolt" "\$@" ;;
+    case " $* " in
+      *" --models "* | *" models "*) exec "$bolt" "$@" ;;
     esac
-    "\$bolt" "\$@"
-    rc=\$?
-    [ -x "\$sync" ] && "\$sync"
-    exit \$rc
+    "$bolt" "$@"
+    rc=$?
+    [ -x "$sync" ] && "$sync"
+    exit $rc
     ;;
   " compile ")
-    case " \$* " in
+    case " $* " in
       # A revert, a report, an explicit include set, or an explicit "no exclusions":
       # the caller has said what they want, so pass it straight through.
       *" --off "* | *" --status "* | *" --help "* | *" -h "* | *" --only "* | *" --no-exclude "*)
-        exec "\$bolt" "\$@" ;;
+        exec "$bolt" "$@" ;;
     esac
     # Otherwise add the exclusions this repo maintains — merged with any --exclude
     # the caller gave, because a repeated --exclude replaces rather than adds. A
-    # bare \`pi compile\` then cannot die on the extension Bun refuses to build,
+    # bare `pi compile` then cannot die on the extension Bun refuses to build,
     # whether or not ~/.pi-bolt/compile.json survived the last update.
-    if [ -x "\$sync" ]; then
-      want=\$(\$sync --print-exclude 2>/dev/null || true)
+    if [ -x "$sync" ]; then
+      want=$("$sync" --print-exclude 2>/dev/null || true)
       theirs=""
-      n=\$#
-      while [ "\$n" -gt 0 ]; do
-        a=\$1; shift; n=\$((n - 1))
-        case "\$a" in
-          --exclude) if [ "\$n" -gt 0 ]; then theirs=\${theirs:+\$theirs,}\$1; shift; n=\$((n - 1)); fi ;;
-          --exclude=*) theirs=\${theirs:+\$theirs,}\${a#--exclude=} ;;
-          *) set -- "\$@" "\$a" ;;
+      n=$#
+      while [ "$n" -gt 0 ]; do
+        a=$1; shift; n=$((n - 1))
+        case "$a" in
+          --exclude) if [ "$n" -gt 0 ]; then theirs=${theirs:+$theirs,}$1; shift; n=$((n - 1)); fi ;;
+          --exclude=*) theirs=${theirs:+$theirs,}${a#--exclude=} ;;
+          *) set -- "$@" "$a" ;;
         esac
       done
-      [ -n "\$theirs" ] && want=\$theirs,\$want
-      [ -n "\$want" ] && set -- "\$@" --exclude "\$want"
+      [ -n "$theirs" ] && want=$theirs,$want
+      [ -n "$want" ] && set -- "$@" --exclude "$want"
     fi
-    "\$bolt" "\$@"
-    rc=\$?
-    [ -x "\$sync" ] && "\$sync"
-    exit \$rc
+    "$bolt" "$@"
+    rc=$?
+    [ -x "$sync" ] && "$sync"
+    exit $rc
     ;;
 esac
 
-# Everything else may be a session: let the helper decorate the invocation, and
+# Everything else may be a session: let the helper decorate the invocation, then
 # exec, so `pi` stays one process deep.
-if [ -x "\$helper" ]; then
-  exec "\$helper" "\$bolt" "\$@"
+if [ -x "$helper" ]; then
+  exec "$helper" "$bolt" "$@"
 fi
-exec "\$bolt" "\$@"
-EOF
+exec "$bolt" "$@"
+SHIM
+}
+
+# Write the shim to a path, substituting the two placeholders. sh -n is a cheap
+# guard against a body that a future edit broke.
+write_shim() {
+  tmp="$1.tmp.$$"
+  shim | sed "s|__MARKER__|$MARKER|g; s|__BOLT_HOME__|$BOLT_HOME|g" >"$tmp" || {
+    rm -f "$tmp"
+    echo "pi-swap: could not generate a shim for $1" >&2
+    exit 1
+  }
+  # Empty means `shim` itself failed; invalid means an edit broke it. Either way,
+  # leave the existing file alone rather than truncating it.
+  if ! plausible_launcher "$tmp"; then
+    rm -f "$tmp"
+    echo "pi-swap: generated shim is empty or not valid sh — leaving $1 untouched" >&2
+    exit 1
+  fi
+  chmod 755 "$tmp"
+  mv "$tmp" "$1"
 }
 
 cmd_status() {
@@ -137,17 +167,24 @@ apply)
       echo "pi-swap: $PI_BIN does not exist — is pi installed?" >&2
       exit 1
     fi
+    if ! plausible_launcher "$PI_BIN"; then
+      echo "pi-swap: $PI_BIN is empty or not a script — refusing to make it $PI_REAL" >&2
+      exit 1
+    fi
     # Preserve the real launcher byte-for-byte, mode and all.
     cp -p "$PI_BIN" "$PI_REAL"
     echo "pi-swap: preserved the real launcher as $PI_REAL"
   elif ! is_shim "$PI_BIN"; then
     # pi was updated since we applied: keep the newest launcher as the real one.
-    cp -p "$PI_BIN" "$PI_REAL"
-    echo "pi-swap: refreshed $PI_REAL from the updated launcher"
+    if plausible_launcher "$PI_BIN"; then
+      cp -p "$PI_BIN" "$PI_REAL"
+      echo "pi-swap: refreshed $PI_REAL from the updated launcher"
+    else
+      echo "pi-swap: $PI_BIN is not a usable launcher — keeping the existing $PI_REAL" >&2
+    fi
   fi
 
-  shim >"$PI_BIN"
-  chmod 755 "$PI_BIN"
+  write_shim "$PI_BIN"
 
   # A second shim where a fresh login shell looks first. Remember what was there.
   # The symlink is removed rather than written through, so this path keeps working
@@ -158,8 +195,7 @@ apply)
   fi
   rm -f "$LOCAL_PI"
   mkdir -p "$LOCAL_BIN"
-  shim >"$LOCAL_PI"
-  chmod 755 "$LOCAL_PI"
+  write_shim "$LOCAL_PI"
 
   # `pi-real` so the real install stays reachable by name.
   ln -sfn "$PI_REAL" "$LOCAL_BIN/pi-real"
