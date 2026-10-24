@@ -13,8 +13,10 @@ shift
 # Package-management commands must remain the first positional argument. Pi
 # dispatches update/install/etc. before its normal option parser; adding
 # automatic flags in front would turn the command into an initial prompt.
+# `compile` is the same class — it takes --only/--exclude/--off/--status and
+# nothing else, so a --skill in front of it is an error, not a session.
 case "${1:-}" in
-  install|remove|uninstall|update|list|config|auth|mcp)
+  compile|install|remove|uninstall|update|list|config|auth|mcp)
     exec "$target" "$@"
     ;;
 esac
