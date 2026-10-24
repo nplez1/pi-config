@@ -304,8 +304,8 @@ checks, and **nothing runs per launch**.
 | `lib/bundle-info.mjs` | the fingerprint, the `build-info.json` writer, and the snippet the builders inline into their shims |
 | `<bundle>/build-info.json` | what this build was made from: inputs, source version, fingerprint, rebuild command |
 | `rebuild.sh` / `rebuild.mjs` | the driver: `--if-stale` (default), `--check`, `--force`, `--verbose` |
-| `~/.zshrc` | `pi` runs the driver after `pi update` — the one command that changes a bundle's source in normal use |
-| the generated shim | checks itself in-process on load (~0 ms, no process spawn) and warns when something got past the hook |
+| the `pi` shim (`pi-swap.sh`) | runs the driver after `pi update` — the one command that changes a bundle's source in normal use. Every shell, not just an interactive one |
+| the generated bundle shim | checks itself in-process on load (~0 ms, no process spawn) and warns when something got past the hook |
 
 ```sh
 rebuild.sh              # rebuild whatever is stale
@@ -333,13 +333,11 @@ source changes in normal use, and an agent that edits a plugin or adds one is
 expected to rebuild as part of that work. Both caveats are real, and they are why
 the shim's in-process check stays:
 
-- **The hook needs an interactive zsh.** Agents run commands through pi's bash
-tool, which never sources `~/.zshrc`, so `pi update --extensions` run by an agent
-  skips it entirely.
 - **`pi update` does not cover the subagents fork.** That comes from a git
   submodule, so `git submodule update` or re-running
   `~/Code/pi-config/install.sh` moves it with no hook involved.
-- **`pi-bolt update` is not hooked either**, though the shim catches it next start.
+- **`pi-bolt update` and `pi-real update` are not hooked**, though the bundle
+  shim catches the first next start, and `after-update.sh` exists for both.
 
 The shim check costs nothing measurable — both bundles still load in 5–9 ms, the
 same as before it was added — so it is the cheap half of the earlier design, kept
@@ -361,25 +359,21 @@ mid-edit, and refusing to start pi-bolt exactly when you want it to help you fix
 that would be its own bug. The failure is printed and the previous (working) bundle
 is used. `--check` is the mode with an exit code, if you ever want to gate on it.
 
-### The shell hook
+### The hook: the `pi` shim, not `~/.zshrc`
 
-Appended to `~/.zshrc` (backup: `~/.zshrc.pre-pibolt-bundles.bak`):
+This used to be a `pi()` function appended to `~/.zshrc`. It is not any more, and
+that file now says so explicitly. Two reasons: it only ran in an interactive zsh,
+so an update run by an agent through pi's bash tool skipped it entirely, and a
+`.zshrc` that gets rewritten takes the hook with it (which is what happened —
+`.zshrc` here has been hook-free since 2026-10-11).
 
-```sh
-_pibolt_bundles="$HOME/Code/pi-config/pi-bolt/rebuild.sh"
+The hook lives in the `pi` shim instead, which is the one place every route goes
+through: `pi-swap.sh` writes it, `pi` is it in every shell, and a process tree
+started by pi or Orca gets the same file on `PATH`. After `pi update` and
+`pi compile` it runs `after-update.sh` — see [Keeping up to date](#keeping-up-to-date) —
+and it still preserves the command's exit code, so a failed update stays failed.
 
-pi() {
-  command pi "$@"
-  local rc=$?
-  if [ "$1" = "update" ] && [ -x "$_pibolt_bundles" ]; then
-    "$_pibolt_bundles" --if-stale
-  fi
-  return $rc
-}
-```
-
-It preserves `pi`'s exit code (checked against the bare binary), and a stale
-rebuild reports two lines rather than the builder's whole log:
+A stale rebuild reports two lines rather than the builder's whole log:
 
 ```
 pi-bolt bundles: rebuilding pi-bolt-web-access (source version 0.40.0 -> 0.41.0)…
@@ -389,6 +383,49 @@ pi-bolt bundles: rebuilt pi-bolt-web-access — built @nplez1/pi-bolt-web-access
 That pair is the real output of the first genuine `pi update --extensions` after
 this was installed: it bumped pi-web-access 0.40.0 → 0.41.0, the hook noticed the
 version change, and the bundle was rebuilt before the next launch.
+
+## Keeping up to date
+
+Three commands are supposed to be all a machine needs: `pi update`,
+`pi update --extensions` and `pi compile`. Each moves something that nothing else
+notices, and none of the three says a word about it, so `after-update.sh` (run by
+the `pi` shim afterwards) reconciles them:
+
+| What drifts | Why it drifts | Reconciled by |
+|---|---|---|
+| A vulnerable dependency | `pi update --extensions` re-resolves the extension tree; a release bump regenerates the managed release's `package.json`, dropping the `undici` override | `deps-audit.sh` — pins, then `npm audit fix` |
+| A stale bundle | `pi update --extensions` can bump `pi-web-access`, and the prebuilt bundle wrapping it is a snapshot — pi-bolt then silently runs the old code | `rebuild.sh --if-stale` |
+| The compile record | `pi compile --off` deletes `~/.pi-bolt/compile.json`, and a release bump can too; the compile set then silently falls back to *everything installed*, which dies on the one extension Bun refuses (top-level `await`) | re-runs `pi-bolt compile --exclude <compile-exclude.txt>` |
+
+The third one is also fixed *before* it can fail: the shim adds
+`--exclude $(compile-exclude.txt)` to a bare `pi compile`, merging it with any
+`--exclude` the caller gave (a repeated `--exclude` replaces rather than adds), so
+the build cannot hit the top-level `await` whether or not the record survived.
+The first compile after `pi compile --off` therefore works instead of erroring.
+
+```sh
+$ pi update --extensions          # the two lines below are the automation talking
+Updated packages
+pi deps: .pi/agent/npm: pinned undici ^8.12.3
+pi sync: recompiling (the compile record is missing)…
+pi sync: compiled in: orca-prefill, orca-agent-status, …, pi-system-one
+```
+
+Everything is silent when there is nothing to do, so a healthy update prints
+nothing beyond what `pi` itself says. Passed through untouched, because the caller
+has said what they want: `pi update --models` (moves no packages),
+`pi compile --off`, `--status`, `--only …` and `--no-exclude`.
+
+`pi-bolt update` and `pi-real update` bypass the shim by definition. Run
+`pi-bolt/after-update.sh` afterwards, or `install.sh`, which does the same work
+plus the bundle rebuild.
+
+```sh
+pi-bolt/after-update.sh            # do what is needed, print what changed
+pi-bolt/after-update.sh --check    # report and exit 1; change nothing
+pi-bolt/after-update.sh --verbose  # print every verdict
+pi-bolt/deps-audit.sh --check      # just the dependency half
+```
 
 ## Dependencies: `npm audit`
 
@@ -416,8 +453,13 @@ project's `package.json`:
 A patch bump inside the same major, then `npm install --legacy-peer-deps` in
 `~/.pi/agent/npm` (which also collapsed the nested copy into the hoisted one).
 It sticks: `pi update --extensions` runs `npm install --prefix … --legacy-peer-deps`,
-which preserves the field, and `install.sh` re-applies it on every run and prints
-the audit result. **`npm audit` → 0 vulnerabilities** as of 2026-10-24.
+which preserves the field. **`npm audit` → 0 vulnerabilities** as of 2026-10-24.
+
+None of that is a step anyone has to remember: `deps-audit.sh` owns it, and
+[the `pi` shim runs it after every update](#keeping-up-to-date). `install.sh` runs
+it too, and it re-asserts both trees — the managed release's `package.json` is
+regenerated on every `pi update`, so the override has to be reapplied, not applied
+once.
 
 The **managed pi release** (`~/.pi/agent/install/releases/<version>`, what
 `pi-real` runs) has the same pin and the same one real finding. Its lockfile root
@@ -462,8 +504,12 @@ survive a bare `pi compile` or a `pi-bolt update`, both of which rebuilt the who
 set and died on the first extension the compiler refuses (loudly, at
 `.pibolt-plugins/src/plugins.ts`). `--exclude` **is** recorded in
 `~/.pi-bolt/compile.json`, and both of those read it, so the durable half is the
-exclusion list: **`pi-bolt/compile-exclude.txt`**, which `install.sh` passes on
-every run. Forgetting a flag can no longer break the build.
+exclusion list: **`pi-bolt/compile-exclude.txt`**. Two callers apply it so that no
+one has to remember a flag: `install.sh`, and the `pi` shim, which adds
+`--exclude $(compile-exclude.txt)` to a bare `pi compile` (merging it with any
+`--exclude` the caller passed, because a repeated `--exclude` replaces rather than
+adds). That second one is what makes a bare `pi compile` work even when
+`~/.pi-bolt/compile.json` has been deleted — which `pi compile --off` does.
 
 That makes the compiled-in set "everything installed, minus that file", which as
 of 2026-10-24 is ten: `orca-prefill`, `orca-agent-status`,

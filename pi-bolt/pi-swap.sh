@@ -48,7 +48,64 @@ bolt=\$(command -v pi-bolt 2>/dev/null) || {
   echo "pi-swap: pi-bolt is not on PATH. Revert with $BOLT_HOME/pi-swap.sh remove" >&2
   exit 127
 }
+# `pi-auto-project-skills` adds parent-project --skill/--append-system-prompt
+# before a *session* starts. It is dispatched at the bottom, never for the two
+# maintenance commands below: `compile` is not in the helper's pass-through list,
+# so routing it there would hand `pi compile` flags it does not accept.
 helper="\$HOME/.local/bin/pi-auto-project-skills"
+
+# \`update\` and \`compile\` are the two commands that move what is installed, so
+# they are also the ones that leave things out of step: a vulnerable dependency, a
+# stale bundle over a freshly bumped pi-web-access, and — after a release bump or a
+# \`compile --off\` — no compile record, so the compile set silently falls back to
+# everything and dies on an extension Bun cannot compile. after-update.sh puts all
+# three back, silently when there is nothing to do, and never changes the exit code.
+sync="$BOLT_HOME/after-update.sh"
+case " \${1:-} " in
+  " update ")
+    case " \$* " in
+      *" --models "* | *" models "*) exec "\$bolt" "\$@" ;;
+    esac
+    "\$bolt" "\$@"
+    rc=\$?
+    [ -x "\$sync" ] && "\$sync"
+    exit \$rc
+    ;;
+  " compile ")
+    case " \$* " in
+      # A revert, a report, an explicit include set, or an explicit "no exclusions":
+      # the caller has said what they want, so pass it straight through.
+      *" --off "* | *" --status "* | *" --help "* | *" -h "* | *" --only "* | *" --no-exclude "*)
+        exec "\$bolt" "\$@" ;;
+    esac
+    # Otherwise add the exclusions this repo maintains — merged with any --exclude
+    # the caller gave, because a repeated --exclude replaces rather than adds. A
+    # bare \`pi compile\` then cannot die on the extension Bun refuses to build,
+    # whether or not ~/.pi-bolt/compile.json survived the last update.
+    if [ -x "\$sync" ]; then
+      want=\$(\$sync --print-exclude 2>/dev/null || true)
+      theirs=""
+      n=\$#
+      while [ "\$n" -gt 0 ]; do
+        a=\$1; shift; n=\$((n - 1))
+        case "\$a" in
+          --exclude) if [ "\$n" -gt 0 ]; then theirs=\${theirs:+\$theirs,}\$1; shift; n=\$((n - 1)); fi ;;
+          --exclude=*) theirs=\${theirs:+\$theirs,}\${a#--exclude=} ;;
+          *) set -- "\$@" "\$a" ;;
+        esac
+      done
+      [ -n "\$theirs" ] && want=\$theirs,\$want
+      [ -n "\$want" ] && set -- "\$@" --exclude "\$want"
+    fi
+    "\$bolt" "\$@"
+    rc=\$?
+    [ -x "\$sync" ] && "\$sync"
+    exit \$rc
+    ;;
+esac
+
+# Everything else may be a session: let the helper decorate the invocation, and
+# exec, so `pi` stays one process deep.
 if [ -x "\$helper" ]; then
   exec "\$helper" "\$bolt" "\$@"
 fi
