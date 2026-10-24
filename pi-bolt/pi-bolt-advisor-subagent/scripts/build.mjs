@@ -47,7 +47,21 @@ const KEY = `${NAME}@${pkg.version}:host-modules`;
 const VERSION_FILE = join(SOURCE, "package.json");
 /** The whole plugin, minus the directories that only feed the live-read paths. */
 const INPUTS = [SOURCE];
-const SKIP = ["node_modules", ".git", "dist", "dist-bun", "test", "docs", "prompts", "agents"];
+// package-lock.json is not skipped for size: `npm install --omit=dev` in the
+// plugin rewrites it to drop the peer trees it no longer installs, and this
+// fingerprint is an mtime+size walk, so that churn alone marked the bundle stale
+// and bought a rebuild (2026-10-24). Nothing here reads the lockfile.
+const SKIP = [
+  "node_modules",
+  ".git",
+  "dist",
+  "dist-bun",
+  "test",
+  "docs",
+  "prompts",
+  "agents",
+  "package-lock.json",
+];
 const REBUILD_COMMAND = join(dirname(HERE), "rebuild.sh");
 
 const sourceText = readFileSync(ENTRY, "utf8");

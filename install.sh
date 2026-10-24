@@ -462,7 +462,10 @@ if [ "$MODE" = "install" ] && [ "${PI_CONFIG_SKIP_PLUGINS:-0}" != "1" ]; then
     # Only real dependencies: --omit=dev skips test/build tooling, and
     # --legacy-peer-deps stops npm from installing its own copies of the
     # host-provided pi packages (which the loader aliases anyway).
-    (cd "$p" && npm install --omit=dev --legacy-peer-deps --no-audit --no-fund)
+    # --no-package-lock keeps the committed lockfile untouched: without it, npm
+    # rewrites it to drop the peer trees it no longer installs, leaving every
+    # submodule permanently dirty for no runtime gain (2026-10-24).
+    (cd "$p" && npm install --omit=dev --legacy-peer-deps --no-audit --no-fund --no-package-lock)
   done
 fi
 
