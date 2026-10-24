@@ -113,11 +113,29 @@ if command -v pi-bolt >/dev/null 2>&1 && [ -f "$exclude_file" ]; then
       trouble=1
     else
       printf 'pi sync: recompiling (%s)…\n' "$drift"
-      if pi-bolt compile --exclude "$want" >/dev/null 2>&1; then
+      log=$HOME/.pi-bolt/compile.log
+      log_before=$(cksum "$log" 2>/dev/null || true)
+      if compile_out=$(pi-bolt compile --exclude "$want" 2>&1); then
         printf 'pi sync: compiled in: %s\n' "$(pi-bolt compile --status 2>/dev/null | sed -n 's/^Extensions compiled in[^:]*: *//p')"
       else
         printf 'pi sync: compile failed — extensions still load from their files\n' >&2
-        printf 'pi sync: retry pi-bolt compile --exclude %s\n' "$want" >&2
+        # Name the culprit when the compiler did: an extension with a top-level
+        # await cannot be compiled in at all, and the fix is one line in
+        # compile-exclude.txt, not another attempt at the same build. pi-bolt
+        # prints the full error to its log and a summary to the terminal, so read
+        # the log — but only if this build wrote it.
+        culprit=""
+        if [ "$(cksum "$log" 2>/dev/null || true)" != "$log_before" ]; then
+          culprit=$(sed -n 's|.*transitive dependency ".*/package-\([^/"]*\)/index\.ts".*|\1|p' "$log" | head -1)
+        fi
+        [ -z "$culprit" ] && culprit=$(printf '%s\n' "$compile_out" \
+          | sed -n 's|.*transitive dependency ".*/package-\([^/"]*\)/index\.ts".*|\1|p' | head -1)
+        if [ -n "$culprit" ]; then
+          printf 'pi sync: %s has a top-level await, which Bun cannot compile in — add it to %s\n' \
+            "$culprit" "$exclude_file" >&2
+        else
+          printf 'pi sync: see %s, or retry pi-bolt compile --exclude %s\n' "$log" "$want" >&2
+        fi
         trouble=1
       fi
     fi

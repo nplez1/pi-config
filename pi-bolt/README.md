@@ -411,6 +411,15 @@ pi sync: recompiling (the compile record is missing)…
 pi sync: compiled in: orca-prefill, orca-agent-status, …, pi-system-one
 ```
 
+If the recompile fails because a *newly installed* extension has a top-level
+`await`, the sync cannot fix that one by itself — it names the extension and the
+file to add it to, which is the whole fix:
+
+```
+pi sync: compile failed — extensions still load from their files
+pi sync: something-new has a top-level await, which Bun cannot compile in — add it to …/compile-exclude.txt
+```
+
 Everything is silent when there is nothing to do, so a healthy update prints
 nothing beyond what `pi` itself says. Passed through untouched, because the caller
 has said what they want: `pi update --models` (moves no packages),
