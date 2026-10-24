@@ -5,6 +5,7 @@
 #   after-update.sh --check        report what is out of step; change nothing; exit 1
 #   after-update.sh --verbose      print every verdict
 #   after-update.sh --print-exclude  the compile-exclude list, comma separated
+#   after-update.sh --shadow-check   only the module-shadowing check below
 #
 # `pi update` and `pi update --extensions` move three things that nothing else
 # notices, and none of them shows up as an error at update time:
@@ -40,6 +41,7 @@ exclude_list() {
 
 check_only=0
 quiet=1
+shadow_only=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -48,6 +50,7 @@ while [ $# -gt 0 ]; do
     # Read by the `pi` shim: it passes this to `pi compile`, so the exclusions
     # hold even when ~/.pi-bolt/compile.json is gone (`compile --off` deletes it).
     --print-exclude) exclude_list; exit 0 ;;
+    --shadow-check) shadow_only=1 ;;
     --help | -h)
       awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "$0"
       exit 0
@@ -61,6 +64,57 @@ while [ $# -gt 0 ]; do
 done
 
 trouble=0
+
+# ---- 0. a node_modules above the agent dir shadows the host's own modules ----
+# Pi hands @earendil-works/pi-coding-agent, pi-tui, pi-ai and typebox to extensions
+# as *fallbacks*, so a copy on disk wins. A stray `npm install` in $HOME creates
+# $HOME/node_modules, which sits above ~/.pi/agent and hijacks all four: every
+# extension that imports one then loads a second Pi. Measured here on 2026-10-24 —
+# pi-bolt-subagents 239 ms instead of 8 ms, opensec-pi-todo 108 ms instead of 0,
+# ~390 ms of extension load against ~42 ms. `doctor` reports that as "the JIT build
+# would run heavy extensions faster", which is the wrong lead. This costs four
+# stat() calls, so it looks every time.
+#
+# ~/.pi/agent/npm/node_modules is deliberately NOT flagged: that one is where the
+# extensions themselves are installed, and `typebox` living there is normal.
+host_modules="@earendil-works/pi-coding-agent @earendil-works/pi-tui @earendil-works/pi-ai typebox"
+
+shadowed() {
+  d=$HOME/.pi/agent
+  while [ -n "$d" ] && [ "$d" != "/" ]; do
+    if [ -d "$d/node_modules" ]; then
+      for m in $host_modules; do
+        if [ -e "$d/node_modules/$m" ]; then
+          printf '%s/node_modules/%s\n' "$d" "$m"
+          break
+        fi
+      done
+    fi
+    d=$(dirname "$d")
+  done
+}
+
+shadow_report=$(shadowed)
+if [ "$shadow_only" = 1 ]; then
+  if [ -n "$shadow_report" ]; then
+    printf '%s\n' "$shadow_report" >&2
+    exit 1
+  fi
+  exit 0
+fi
+if [ -n "$shadow_report" ]; then
+  printf 'pi sync: WARNING — a node_modules above the agent dir carries host modules:\n' >&2
+  printf '%s\n' "$shadow_report" | sed 's|^|  |' >&2
+  printf 'pi sync: pi supplies those itself; a copy on disk wins, so extensions load a\n' >&2
+  printf 'pi sync: second copy (here: ~390 ms of extension load instead of ~40 ms).\n' >&2
+  printf 'pi sync: move it out of the way — nothing in pi needs it:\n' >&2
+  printf 'pi sync:   mv %s %s\n' \
+    "$(printf '%s' "$shadow_report" | head -1 | sed 's|/node_modules/.*||')/node_modules" \
+    "$HOME/node_modules.shadowed" >&2
+  trouble=1
+elif [ "$quiet" = 0 ]; then
+  echo "pi sync: no stray node_modules shadows the host's modules"
+fi
 
 # ---- 1. dependencies --------------------------------------------------------
 if [ -x "$here/deps-audit.sh" ]; then

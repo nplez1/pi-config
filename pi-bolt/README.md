@@ -174,6 +174,54 @@ Two other things fall out of this and were worth knowing:
   jiti is the whole fix, which is also why the 1048 KB subagents source loads in
   7 ms as a bundle and 189 ms as TypeScript.
 
+## When extension loads regress: a `node_modules` above the agent dir
+
+The load times above are single-digit milliseconds for pi-bolt's own bundles. If
+`doctor` or `PI_TIMING=1` shows one taking *hundreds*, the plugin has not got
+slower — something is shadowing the modules pi supplies.
+
+Pi hands extensions `@earendil-works/pi-coding-agent`, `pi-tui`, `pi-ai` and
+`typebox` as **fallbacks**, so a copy on disk wins. Module resolution walks up
+from the importing file, which puts `$HOME/node_modules` — above `~/.pi/agent` —
+on the path for every extension and every bundle. One `npm install` run with
+`$HOME` as the working directory creates it, and then:
+
+| | as it should be | with `$HOME/node_modules` present |
+|---|---:|---:|
+| `pi-bolt-subagents` bundle | 8 ms | **239 ms** |
+| `opensec-pi-todo` | 0 ms | **108 ms** |
+| `pi-bolt-web-access` bundle | 14 ms | 15 ms |
+| extension load, total | ~42 ms | **~390 ms** |
+| warm `-p` start, `TOTAL` | 39–49 ms | 401–419 ms |
+
+Each import of a host module resolved to a second, 2.6 MB `pi-tui` and 5.8 MB
+`typebox` on disk instead of the host's compiled-in ones. The two bundles that
+went slow are exactly the two that `import * as host…` a lot at load.
+
+**`doctor` misattributes this.** On 1.0.2 it prints
+
+```
+pi-bolt-bundles/pi-bolt-subagents takes 253 ms of CPU to load, interpreted:
+the JIT build runs heavy extensions faster (… PIBOLT_VARIANT=arm64-jit …)
+```
+
+which sends you to [the build variant](#the-build-variant-jit-on). The JIT is not
+the problem, and switching builds would have left all 390 ms in place — this page
+recorded the JIT as *slower* on warm start, and it still is.
+
+Found here on 2026-10-24: a `~/package.json` from 2026-08-13 asking for
+`pi-goal-list-loop-audit`, 323 MB of `node_modules` beside it, and nothing in pi
+loading any of it. Moving the three files aside restored the numbers above on the
+next launch. `pi-goal-list-loop-audit` is not installed as an extension — the only
+mention of it in this repo is in `agents/Designer.md` — so the install that created
+it was incidental.
+
+`after-update.sh` checks for this after every `pi update` and `pi compile` (four
+`stat()` calls; `--shadow-check` runs that check alone), and `install.sh` reports it
+too. It **warns rather than fixing** — moving a directory out of someone's home is
+theirs to approve — and it does not flag `~/.pi/agent/npm/node_modules`, where the
+extensions themselves are installed and `typebox` legitimately lives.
+
 ## The three bundles
 
 Both are the same trick, which is what OpenSec's own `dist-bun/` packages do: Pi
@@ -424,6 +472,11 @@ Everything is silent when there is nothing to do, so a healthy update prints
 nothing beyond what `pi` itself says. Passed through untouched, because the caller
 has said what they want: `pi update --models` (moves no packages),
 `pi compile --off`, `--status`, `--only …` and `--no-exclude`.
+
+The sync also looks for a `node_modules` above `~/.pi/agent` that shadows the
+modules pi supplies — the one failure that makes *every* extension slow, and the
+one `doctor` blames on the build variant. See
+[below](#when-extension-loads-regress-a-node_modules-above-the-agent-dir).
 
 `pi-bolt update` and `pi-real update` bypass the shim by definition. Run
 `pi-bolt/after-update.sh` afterwards, or `install.sh`, which does the same work
