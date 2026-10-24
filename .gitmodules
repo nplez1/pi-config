@@ -7,3 +7,6 @@
 [submodule "plugins/pi-todo"]
 	path = plugins/pi-todo
 	url = https://github.com/nplez1/pi-todo.git
+[submodule "plugins/pi-smart-compaction"]
+	path = plugins/pi-smart-compaction
+	url = https://github.com/nplez1/pi-smart-compaction.git

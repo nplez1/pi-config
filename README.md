@@ -99,7 +99,7 @@ dot-config/
 dot-agents/
   skills/find-skills/             -> ~/.agents/skills/find-skills   (symlinked)
 plugins/                          -> ~/.pi/agent/plugins   (git submodules)
-  pi-subagents/  pi-advisor-subagent/  pi-todo/
+  pi-subagents/  pi-advisor-subagent/  pi-todo/  pi-smart-compaction/
 pi-bolt/                          -> ~/.pi/agent/pi-bolt-bundles
   rebuild.sh / rebuild.mjs        the staleness check and bundle rebuild driver
   lib/bundle-info.mjs             fingerprint + build-info writer + shim snippet

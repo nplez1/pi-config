@@ -11,6 +11,7 @@
     "npm:pi-codex-goal",
     "npm:pi-mimo-provider",
     "plugins/pi-todo",
+    "plugins/pi-smart-compaction",
     "npm:pi-system-one@1.3.4"
   ],
   "piBolt": {

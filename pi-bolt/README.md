@@ -561,7 +561,10 @@ Three limits bite here (see
 - **Only `npm:` packages compile in.** Local checkouts are passed over with
   "only npm: packages can be compiled in (a git: checkout is resolved by Pi)", so
   `plugins/pi-subagents`, `plugins/pi-advisor-subagent` and `plugins/pi-todo`
-  never can be. The three `pi-bolt-bundles/` are passed over for a different
+  never can be. (`plugins/pi-smart-compaction` is the exception that proves the
+  rule: the seeded `packages` list names it as a plain path, not a `git:` spec, so
+  pi loads it as a local package and it compiles in like any `npm:` one.) The
+  three `pi-bolt-bundles/` are passed over for a different
   reason: they are Bun builds that load their real code from a `core.cjs`
   sibling, which a compiled executable has no file for.
 - **A module with a top-level `await` is refused**, and it fails the whole build,
