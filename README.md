@@ -103,7 +103,7 @@ plugins/                          -> ~/.pi/agent/plugins   (git submodules)
 pi-bolt/                          -> ~/.pi/agent/pi-bolt-bundles
   rebuild.sh / rebuild.mjs        the staleness check and bundle rebuild driver
   lib/bundle-info.mjs             fingerprint + build-info writer + shim snippet
-  compile-set.txt                 extensions `pi-bolt compile --only` bakes in
+  compile-exclude.txt             extensions `pi-bolt compile` must leave out
   pi-swap.sh                      the reversible `pi` -> pi-bolt switch
   pi-bolt-subagents/  pi-bolt-web-access/  pi-bolt-advisor-subagent/
 ```
@@ -121,8 +121,10 @@ git clone --recurse-submodules git@github.com:nplez1/pi-config.git ~/Code/pi-con
 
 `install.sh` also provisions Pi-Bolt (see [pi-bolt/README.md](pi-bolt/README.md)):
 it installs it from the official installer if it is missing, materializes the
-`packages` list, rebuilds the three bundles from this clone, compiles
-`pi-bolt/compile-set.txt` into the executable, and swaps `pi` to run pi-bolt.
+`packages` list, rebuilds the three bundles from this clone, compiles every
+installed extension into the executable except those named in
+`pi-bolt/compile-exclude.txt`, pins a patched `undici` in the extensions project,
+and swaps `pi` to run pi-bolt.
 Every step prints a SKIP instead of failing the install; `PI_CONFIG_SKIP_PIBOLT=1`
 leaves Pi-Bolt out entirely. `pi-real` (or `PI_REAL=1 pi`) still reaches the stock
 launcher, and `pi-bolt/pi-swap.sh remove` reverts the swap.

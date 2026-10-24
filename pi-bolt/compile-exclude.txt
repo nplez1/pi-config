@@ -1,0 +1,22 @@
+# Extensions that must NOT be compiled into the Pi-Bolt executable, one name per
+# line, named as `pi-bolt compile --status` prints them. Comments and blank lines
+# are ignored.
+#
+# `install.sh` passes this file as `pi-bolt compile --exclude`, and that flag is
+# what gets RECORDED (~/.pi-bolt/compile.json, read by a later bare `pi compile`
+# and by `pi-bolt update`). So this file, not an `--only` list, is the durable
+# half: forgetting to pass `--only` again just rebuilds everything and dies on
+# the first extension the compiler refuses.
+#
+# An entry that is no longer installed is harmless, and so is an entry that is no
+# longer needed — `pi-bolt compile --no-exclude` puts everything back.
+
+# 2.15.0 registers its i18n strings at module top level with
+# `await import("@juicesharp/rpiv-i18n/loader")`. Bun's compiler refuses to
+# require a module containing a top-level await, and that fails the whole build,
+# not just this extension:
+#   error: This require call is not allowed because the transitive dependency
+#   ".../package-juicesharp-rpiv-ask-user-question/index.ts" contains a top-level await
+# The await is deliberate upstream (the i18n SDK is an optional peer), so there is
+# nothing to wait for. Loading it from its files instead costs ~11 ms.
+juicesharp-rpiv-ask-user-question
