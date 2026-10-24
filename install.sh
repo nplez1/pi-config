@@ -405,6 +405,75 @@ if (mode !== "dry-run") fs.writeFileSync(livePath, JSON.stringify(live, null, 2)
 NODE
 
 echo
+echo "Legacy advisor model keys (advisor.json -> /subagents agentOverrides):"
+node - "$HOME" "$MODE" <<'NODE'
+const fs = require("node:fs");
+const path = require("node:path");
+const home = process.argv[2];
+const mode = process.argv[3];
+const advisorPath = path.join(home, ".config/rpiv-advisor/advisor.json");
+const subagentsPath = path.join(home, ".pi/agent/subagents.json");
+
+const read = (p) => {
+  try {
+    return JSON.parse(fs.readFileSync(p, "utf-8"));
+  } catch {
+    return undefined;
+  }
+};
+const advisor = read(advisorPath);
+const subagents = read(subagentsPath);
+if (!advisor || !subagents) {
+  console.log("  ok       nothing to migrate");
+  process.exit(0);
+}
+
+// The four keys /advisor used to own. The plugin ignores them now — models live
+// in agentOverrides — so without this a machine that seeded before the move
+// would silently lose the selection it had. Copy each one in only where
+// /subagents has not already spoken: a value set in the menu is newer than the
+// file it inherited, so it wins.
+const moves = [
+  { agent: "rpiv-advisor", model: "modelKey", thinking: "effort" },
+  { agent: "rpiv-compressor", model: "compressorModelKey", thinking: "compressorEffort" },
+];
+const isPlain = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
+if (!isPlain(subagents.agentOverrides)) subagents.agentOverrides = {};
+const overrides = subagents.agentOverrides;
+const notes = [];
+for (const m of moves) {
+  const model = advisor[m.model];
+  const thinking = advisor[m.thinking];
+  if (model === undefined && thinking === undefined) continue;
+  const entry = isPlain(overrides[m.agent]) ? overrides[m.agent] : {};
+  if (model !== undefined && entry.model === undefined) {
+    entry.model = model;
+    notes.push(`agentOverrides.${m.agent}.model = ${model}`);
+  }
+  if (thinking !== undefined && entry.thinking === undefined) {
+    entry.thinking = thinking;
+    notes.push(`agentOverrides.${m.agent}.thinking = ${thinking}`);
+  }
+  overrides[m.agent] = entry;
+}
+
+const legacyKeys = ["modelKey", "effort", "compressorModelKey", "compressorEffort"];
+const present = legacyKeys.filter((k) => k in advisor);
+if (!present.length && !notes.length) {
+  console.log("  ok       nothing to migrate");
+  process.exit(0);
+}
+const wrote = notes.length > 0 || present.length > 0;
+for (const n of notes) console.log(`  ${mode === "dry-run" ? "would migrate" : "migrated    "} ${n}`);
+for (const k of present) console.log(`  ${mode === "dry-run" ? "would drop " : "dropped   "} advisor.json ${k}`);
+if (mode !== "dry-run" && wrote) {
+  if (notes.length) fs.writeFileSync(subagentsPath, JSON.stringify(subagents, null, 2) + "\n");
+  for (const k of present) delete advisor[k];
+  fs.writeFileSync(advisorPath, JSON.stringify(advisor, null, 2) + "\n");
+}
+NODE
+
+echo
 echo "Plugins directory (settings.json references plugins/<name>):"
 dst="$HOME/.pi/agent/plugins"; src="$REPO/plugins"
 [ "$MODE" = "dry-run" ] || mkdir -p "$(dirname "$dst")"

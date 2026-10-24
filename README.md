@@ -20,7 +20,7 @@ uses GitHub Copilot Enterprise), and pi writes the chosen model back into
 | `~/.pi/agent/settings.json` | `defaultProvider`, `defaultModel`, `enabledModels` | which providers/models this machine actually has |
 | `~/.pi/agent/subagents.json` | `agentOverrides.*.model`, `agentOverrides.*.thinking` | the model each subagent type runs on is an account fact, not a shared one |
 | `~/.config/pi-config/model-roles.json` | every ID | the provider IDs `AGENTS.md`'s shorthand (Explore/Fast, Deep/Pro, Opus/Sonnet, workhorse) resolves to |
-| `~/.config/rpiv-advisor/advisor.json` | `modelKey`, `compressorModelKey`, `effort`, `compressorEffort`, `disabledForModels` | the advisor model this machine can reach, and the effort it can afford |
+| `~/.config/rpiv-advisor/advisor.json` | `disabledForModels` | which executor models the advisor refuses to escalate from |
 
 Everything else — the plugin/package list, theme, tui mode, agent `.md`
 definitions, extensions, skills, `models.json`, todo/advisor **guidance** — is
@@ -33,6 +33,16 @@ plugin here pins a model in its source.
 of symlinking them, so a `/subagents` or `/model` change on one machine can never
 rewrite the other's config. When you change something *shared* inside those
 files, run:
+
+The advisor and compressor models are **not** in `advisor.json`. They are the
+`rpiv-advisor` / `rpiv-compressor` entries in `subagents.json`'s
+`agentOverrides`, so `/subagents` is the only writer and `/advisor` only reports
+what resolved — one store cannot disagree with itself, which two files plus a
+precedence rule or a sync step eventually do. `install.sh` migrates any legacy
+`modelKey` / `compressorModelKey` / `effort` / `compressorEffort` from
+`advisor.json` into those entries once (never overwriting a value `/subagents`
+already set), then deletes them; what remains in `advisor.json` is `guidance`
+(shared) and `disabledForModels` (machine-owned).
 
 ```sh
 ~/Code/pi-config/install.sh capture   # copies them back, stripping account keys
