@@ -1,0 +1,9 @@
+{
+	"enabled": true,
+	"contextFloorPercent": 15,
+	"contextFloorTokens": 60000,
+	"idleThresholdMs": null,
+	"idleThresholdByModel": null,
+	"notify": true,
+	"status": true
+}

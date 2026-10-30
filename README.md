@@ -104,6 +104,7 @@ dot-config/
   pi-config/model-roles.json      SEEDED   which ID each AGENTS.md role means
   pi-config/model-roles.machine.example.json
   rpiv-todo/config.json           -> ~/.config/rpiv-todo/config.json
+  pi-smart-compaction/config.json -> ~/.config/pi-smart-compaction/config.json  (15% floor)
   rpiv-advisor/advisor.json       SEEDED   guidance shared, models local
   rpiv-advisor/advisor.machine.example.json
 dot-agents/

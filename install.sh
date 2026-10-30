@@ -137,7 +137,8 @@ portable_targets() {
     "dot-pi/agent/AGENTS.md"               "$HOME/.pi/agent/AGENTS.md" \
     "pi-bolt/pi-auto-project-skills"       "$HOME/.local/bin/pi-auto-project-skills" \
     "dot-pi/web-search.json"               "$HOME/.pi/web-search.json" \
-    "dot-config/rpiv-todo/config.json"     "$HOME/.config/rpiv-todo/config.json"
+    "dot-config/rpiv-todo/config.json"     "$HOME/.config/rpiv-todo/config.json" \
+    "dot-config/pi-smart-compaction/config.json" "$HOME/.config/pi-smart-compaction/config.json"
   local f
   for f in "$REPO"/dot-pi/agent/agents/*; do
     [ -e "$f" ] || continue
