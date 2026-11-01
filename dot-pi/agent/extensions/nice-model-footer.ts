@@ -37,7 +37,9 @@ function formatCwdForFooter(cwd: string, home?: string): string {
  */
 const MODEL_ABBREVIATIONS: Record<string, string> = {
 	"deepseek/deepseek-flash": "DSv4.1Flash",
+	"deepseek/deepseek-flash-auto": "DSv4.1FlashAuto",
 	"deepseek/deepseek-v4-pro": "DSv4Pro",
+	"deepinfra/deepseek-ai/DeepSeek-V4.1-Flash-1017": "DSv4.1Flash1017",
 	"xiaomi/mimo-v2.6-flash": "MiMoV2.6Flash",
 	"xiaomi/mimo-v2.6-pro": "MiMoV2.6Pro",
 	"xiaomi/mimo-v2.6-pro-ultraspeed": "MiMoV2.6ProUltra",

@@ -164,6 +164,63 @@ agent), never touches a whole directory that can
 hold untracked user files (e.g. `~/.pi/agent/extensions`, which also has Orca
 extensions not in this repo), and supports `--dry-run` and `uninstall`.
 
+## DeepSeek peak/off-peak routing
+
+DeepSeek bills two tiers by wall clock (peak = 2x off-peak: 01:00-04:00 and
+06:00-10:00 UTC, Mon-Fri). `extensions/deepseek-routing.ts` registers a virtual
+model, **`deepseek/deepseek-flash-auto`**, that sends each request to whichever
+provider for DeepSeek-V4.1-Flash-1017 is cheaper at that moment:
+
+| | DeepSeek direct | DeepInfra |
+| --- | --- | --- |
+| off-peak | $0.15 / $0.60 / $0.003 (in/out/cache-read) | same model, flat rate |
+| peak | $0.30 / $1.20 / $0.006 | flat rate |
+
+- **Peak** always goes to DeepInfra. **Off-peak** stays on DeepSeek, *unless*
+  DeepInfra's current discount beats DeepSeek's off-peak card on all three axes,
+  in which case DeepInfra wins at every hour (it is 51% off as of 2026-11-01:
+  $0.098 / $0.294 / $0.00294).
+- DeepInfra publishes its rates publicly at `/v1/openai/models`, so the extension
+  refetches them each session and re-registers the model's cost — the footer's
+  dollar figure tracks the real billed rate, promos included. `models.json`
+  deliberately has no `deepinfra` entry: an override there would freeze the
+  price at whatever was true when the file was written.
+- Provider choice is per turn, not per request: tool follow-ups stay where the
+  turn started, so only crossing a peak boundary costs a prompt-cache miss. A
+  retry after a provider-side error (5xx, 429, overload, network) crosses to the
+  other side once, then the next user message returns to the clock/price choice.
+- Both sides are in `enabledModels`, `defaultModel` is the router, and
+  `model-roles.json` `workhorse` points at it, so sessions, subagents and
+  workflows all route.
+
+**Where it shows up.** The router is a model, not a proxy: nothing else is
+redirected, and selecting `deepseek/deepseek-flash` or the `deepinfra` model
+directly pins that provider. It is registered under the `deepseek` provider, so
+it exists only on a machine logged into DeepSeek — without that credential it
+never appears in `/model` and no routing code runs, so a work machine that has
+neither provider stays untouched. It routes to DeepInfra only when DeepInfra
+also has a credential; a DeepSeek-only machine stays on DeepSeek instead of
+failing (`modelRegistry.find()` returns credential-less models, so the router
+checks `getAvailable()` first). Without a DeepInfra key pi hides that provider
+entirely.
+
+The schedule and rate card live in
+`extensions/shared/deepseek-schedule.ts`, shared with `deepseek-pricing.ts` so
+the footer tier and the provider choice cannot disagree. `PI_DEEPSEEK_TIER=peak`
+(or `off-peak`) forces a tier without editing code, for testing outside the UTC
+windows.
+
+Setup per machine: the **DeepInfra key must go in `~/.pi/agent/auth.json`** as
+provider `deepinfra` (it is not tracked, and `models.json` holds no key):
+
+```json
+"deepinfra": { "type": "api_key", "key": "sk-di-REPLACE_ME" }
+```
+
+Known gap: DeepSeek's docs also make Chinese public holidays off-peak all day;
+`DEEPSEEK_HOLIDAYS` in the shared module is empty, so a holiday is treated as a
+normal weekday (it over-routes to DeepInfra for that day rather than mis-pricing).
+
 ## Intentionally not tracked
 
 | Excluded | Why |

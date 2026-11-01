@@ -3,6 +3,10 @@
     "type": "api_key",
     "key": "REPLACE_ME"
   },
+  "deepinfra": {
+    "type": "api_key",
+    "key": "REPLACE_ME"
+  },
   "fireworks": {
     "type": "api_key",
     "key": "REPLACE_ME"
