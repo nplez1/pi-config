@@ -58,10 +58,10 @@ bolt=$(command -v pi-bolt 2>/dev/null) || {
   exit 127
 }
 
-# This helper adds the parent project's --skill/--append-system-prompt before a
-# *session* starts. It is dispatched at the bottom, never for the maintenance
-# commands below: `compile` is not in the helper's pass-through list, so routing
-# it there would hand pi compile flags it does not accept.
+# This helper adds the parent project's --skill before a *session* starts. It is
+# dispatched at the bottom, never for the maintenance commands below: `compile`
+# is not in the helper's pass-through list, so routing it there would hand pi
+# compile flags it does not accept.
 helper="$HOME/.local/bin/pi-auto-project-skills"
 
 # `update` and `compile` are the two commands that move what is installed, so
