@@ -43,8 +43,9 @@
 
 - **`timeout` is in seconds.** The harness computes `timeout * 1000` internally, so `timeout: 120000` is ~33 hours, not two minutes. Never pass a millisecond-scale number: values up to ~24.8 days are accepted silently, so a wrong unit produces no error — it just means the command has no real deadline and can hang the session.
 - **There is no default timeout.** Omitting `timeout` means the command runs until it finishes; an explicit value is how you get a deadline at all.
-- **Size it to the command, not to a habit.** ~30 for a grep or a file read, 60 for git or package work, 120–300 for one test file or a typecheck, 600 for a full suite or a cold build. A timeout that fires is a cheap, informative failure; an effectively unbounded one hides the problem and wastes wall-clock.
-- **Above ~600, background it instead of raising the ceiling.** `nohup <cmd> > /tmp/<name>.log 2>&1 &` then poll the log with short commands. A long run is not a reason for a large literal.
+- **Size it to the command, not to a habit.** ~30 for a grep or a file read, 60 for git or package work, 120–300 for one test file or a typecheck, 900–1800 for a full suite or a cold build. A timeout that fires is a cheap, informative failure; an effectively unbounded one hides the problem and wastes wall-clock.
+- **A long run blocks once; it is never polled.** Run it in the foreground with the literal sized to it — `orca-queue pnpm test > "$log" 2>&1; tail -n 120 "$log"` at `timeout: 1800`. If it genuinely must detach, wait in **one** call: `while kill -0 "$pid" 2>/dev/null; do sleep 20; done; tail -n 120 "$log"`. Never issue `sleep N; tail log` as separate turns — each poll re-processes the whole conversation to learn nothing, and a 300 s quantum overshoots the run's real end. Never call `get_subagent_result` to wait; background agents notify on completion.
+- **Above ~1800, background it deliberately** and hand back the log path, rather than raising the literal to an unbounded number. A long run is not a reason for a missing deadline.
 - **Other Pi tools use other units** (`mcp` timeouts are seconds; some RPC-extension dialog timeouts are milliseconds). Read the tool's own schema rather than generalising from this one.
 
 Working in an Orca worktree (`/Users/nathanp/orca/workspaces/orca/**`)? That repository's `AGENTS.md`
