@@ -8,17 +8,23 @@
 // sides plus a virtual model, `deepseek/deepseek-flash-auto`, that picks a
 // physical provider per request:
 //
-//   peak      -> DeepInfra  ($0.20/$0.60 vs DeepSeek's $0.30/$1.20 per 1M)
-//   off-peak  -> DeepSeek   ($0.15/$0.60, and cheaper cache reads)
+//   peak      -> DeepInfra
+//   off-peak  -> DeepSeek, unless a DeepInfra promo beats it
 //
-// with two refinements:
+// "Cheaper" is measured, not asserted axis by axis. `TOKEN_MIX` in
+// shared/deepseek-schedule.ts records how this machine actually spends tokens
+// (99.4% of every prompt is a cache read), and `cheaperOnMyMix` compares the
+// two cards at that mix. The old every-axis test treated the three prices as
+// equally important, which is wrong by a factor of ~290 — it demanded a 50%
+// DeepInfra discount where the mix-weighted break-even is 42%.
 //
 //  - Promos. DeepInfra discounts its list price from time to time (51% off on
-//    2026-11-01, so $0.098/$0.294/$0.00294 — cheaper than DeepSeek off-peak on
-//    every axis). When the discounted card beats DeepSeek's *off-peak* card on
-//    all three axes, the router takes DeepInfra at off-peak too. DeepInfra
-//    publishes its rates publicly at /v1/openai/models, so the extension
-//    refetches them each session instead of trusting a hardcoded number.
+//    2026-11-01, so $0.098/$0.294/$0.00294). Its list card already wins at peak
+//    (13% cheaper on this machine's mix, cache-miss penalty included) and loses
+//    badly off-peak (74% dearer), so a promo is what makes it the better side
+//    at every hour. DeepInfra publishes its rates publicly at
+//    /v1/openai/models, so the extension refetches them each session instead of
+//    trusting a hardcoded number.
 //
 //  - Failover. A retry after a provider-side error (5xx, 429, overload,
 //    network) crosses to the other side for that one request, so a DeepSeek
@@ -55,16 +61,16 @@ import {
   CACHE_WRITE_RATE,
   DEEPINFRA_BASELINE_COST,
   DEEPINFRA_FLASH,
+  DEEPINFRA_INPUT_MULTIPLIER,
   DEEPSEEK_FLASH,
   PROVIDER_LABEL,
   RATES,
   ROUTER,
-  cheaperOnEveryAxis,
+  cheaperOnMyMix,
   currentTier,
   deepseekCost,
   effectiveCost,
   otherSide,
-  preferredAt,
   type ModelRef,
   type RateSet,
   type Tier,
@@ -236,8 +242,9 @@ export default function (pi: ExtensionAPI) {
 
   /** Which side to use for `tier`, given the current DeepInfra price. */
   function chooseSide(tier: Tier): ModelRef {
-    if (cheaperOnEveryAxis(deepInfraCost, deepseekCost(tier))) return DEEPINFRA_FLASH;
-    return preferredAt(tier);
+    return cheaperOnMyMix(deepInfraCost, deepseekCost(tier), DEEPINFRA_INPUT_MULTIPLIER)
+      ? DEEPINFRA_FLASH
+      : DEEPSEEK_FLASH;
   }
 
   // ---- footer indicator ---------------------------------------------------

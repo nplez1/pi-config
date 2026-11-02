@@ -18,6 +18,11 @@
 //   1M INPUT (CACHE MISS)  off-peak $0.15    peak $0.30
 //   1M OUTPUT              off-peak $0.60    peak $1.20
 //   (deepseek-v4-pro is 2x-4x these; disabled by policy in model-roles.json)
+//
+// Comparing providers needs a third input the rate card does not carry: how
+// this machine spends tokens. `TOKEN_MIX` below is that measurement, and
+// `blendedPrice` is the one number to compare two cards by. Never compare
+// providers axis-by-axis — the axes differ in weight by ~200x.
 
 export interface RateSet {
   input: number;
@@ -95,7 +100,9 @@ export const DEEPSEEK_FLASH: ModelRef = { provider: "deepseek", id: "deepseek-fl
 /**
  * Same checkpoint (DeepSeek-V4.1-Flash-1017) resold by DeepInfra. Flat pricing,
  * so it is the better deal whenever DeepSeek is at peak: $0.20/$0.60 vs
- * $0.30/$1.20 per 1M input/output.
+ * $0.30/$1.20 per 1M input/output — 13% cheaper than DeepSeek's peak card on
+ * this machine's mix even at list price, and 57% cheaper with the 2026-11-01
+ * promo. Off-peak is the other way round: list price costs 74% more.
  */
 export const DEEPINFRA_FLASH: ModelRef = {
   provider: "deepinfra",
@@ -134,13 +141,76 @@ export function deepseekCost(tier: Tier): RateSet {
 }
 
 /**
- * Whether `a` is at least as cheap as `b` on every axis, and strictly cheaper
- * on one. Used to harvest DeepInfra promos: while its discounted rate beats
- * DeepSeek's off-peak card outright, there is no reason to wait for peak.
+ * How this machine actually spends tokens, as shares of one turn's total token
+ * count — the weighting every provider comparison below uses.
+ *
+ * Measured over 38,563 assistant messages on deepseek-flash, 2026-10-14..10-31
+ * (DeepSeek-only, so DeepInfra's cache behaviour cannot contaminate the
+ * baseline): 29,453,562 input misses, 8,485,451,768 cache reads, 22,644,177
+ * output. Cache reads are 99.4% of every prompt, because a long agent session
+ * replays its whole history each turn.
+ *
+ * Token shares and SPEND shares are wildly different, and only the token
+ * shares belong in a price comparison. On DeepSeek's off-peak card these
+ * tokens spend 10.2% on input, 58.6% on cache reads, 31.2% on output — so
+ * cache reads are ~73% of the cost *difference* between two providers, output
+ * ~19% and input ~9%. Weighting the axes equally (the old `cheaperOnEveryAxis`
+ * rule) therefore over-weights the two axes that barely matter, and demands a
+ * 50% DeepInfra discount where the mix-weighted break-even is ~41%.
  */
-export function cheaperOnEveryAxis(a: RateSet, b: RateSet): boolean {
-  const axes: (keyof RateSet)[] = ["input", "output", "cacheRead"];
-  return axes.every((axis) => a[axis] <= b[axis]) && axes.some((axis) => a[axis] < b[axis]);
+export const TOKEN_MIX: RateSet = {
+  input: 0.00345,
+  cacheRead: 0.9939,
+  output: 0.00265,
+};
+
+/**
+ * DeepInfra re-reads more of the prompt as cache misses than DeepSeek does:
+ * median 1 miss per 136 cache reads over 23 sessions of >=60 assistant
+ * messages, against 1 per 254 over 135 DeepSeek sessions (re-derive both with
+ * `measure-token-mix.mjs`). Scales the input axis of a DeepInfra card in
+ * `blendedPrice` so the comparison prices the tokens DeepInfra would actually
+ * bill, not the ones DeepSeek bills.
+ *
+ * A narrower filter — sessions served entirely by one provider — gives 1.61,
+ * so treat this as 1.6-1.9. It moves the off-peak break-even from 38% to 42%,
+ * i.e. it only decides the 38-42% band, and it is small next to the 2x that
+ * separates the two cards on cache reads.
+ */
+export const DEEPINFRA_INPUT_MULTIPLIER = 1.87;
+
+/**
+ * Price of 1M tokens of *this* usage at `rates`, in USD — the single number to
+ * compare two cards by. `inputMultiplier` scales the input axis for a provider
+ * that re-reads more of the prompt as cache misses (see
+ * `DEEPINFRA_INPUT_MULTIPLIER`); pass 1 for the baseline side.
+ *
+ * The absolute values look small because 1M tokens of this usage is mostly
+ * cache reads; read them as the ratio. Per *billion* tokens (x1e3):
+ *
+ *   DeepSeek off-peak  $5.09      DeepInfra list      $8.84
+ *   DeepSeek peak      $10.18     DeepInfra @51% off  $4.33
+ */
+export function blendedPrice(rates: RateSet, inputMultiplier = 1): number {
+  return (
+    TOKEN_MIX.input * inputMultiplier * rates.input +
+    TOKEN_MIX.cacheRead * rates.cacheRead +
+    TOKEN_MIX.output * rates.output
+  );
+}
+
+/**
+ * Whether `candidate` costs less than `baseline` for this machine's token mix,
+ * with `candidate`'s extra cache misses accounted for. Replaces the old
+ * every-axis test, which is 8 points of discount too conservative: 50% against
+ * this mix's 42% break-even.
+ */
+export function cheaperOnMyMix(
+  candidate: RateSet,
+  baseline: RateSet,
+  candidateInputMultiplier = 1,
+): boolean {
+  return blendedPrice(candidate, candidateInputMultiplier) < blendedPrice(baseline);
 }
 
 /** The virtual model that routes between the two. */
@@ -159,11 +229,6 @@ export function isRouted(ref: ModelRef | undefined): boolean {
     (ref.provider === DEEPSEEK_FLASH.provider && ref.id === DEEPSEEK_FLASH.id) ||
     (ref.provider === DEEPINFRA_FLASH.provider && ref.id === DEEPINFRA_FLASH.id)
   );
-}
-
-/** The side `tier` prefers. */
-export function preferredAt(tier: Tier): ModelRef {
-  return tier === "peak" ? DEEPINFRA_FLASH : DEEPSEEK_FLASH;
 }
 
 /** The other side from `ref` (undefined if `ref` is neither side). */

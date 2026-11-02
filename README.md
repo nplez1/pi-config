@@ -176,15 +176,45 @@ provider for DeepSeek-V4.1-Flash-1017 is cheaper at that moment:
 | off-peak | $0.15 / $0.60 / $0.003 (in/out/cache-read) | same model, flat rate |
 | peak | $0.30 / $1.20 / $0.006 | flat rate |
 
-- **Peak** always goes to DeepInfra. **Off-peak** stays on DeepSeek, *unless*
-  DeepInfra's current discount beats DeepSeek's off-peak card on all three axes,
-  in which case DeepInfra wins at every hour (it is 51% off as of 2026-11-01:
-  $0.098 / $0.294 / $0.00294).
+**How "cheaper" is decided.** Not axis by axis — the three prices are not
+remotely equally important. A long agent session replays its whole history every
+turn, so on this machine **99.4% of every prompt token is a cache read**, and
+the measured split of a turn's tokens is:
+
+| axis | share of tokens | share of spend, DeepSeek off-peak |
+| --- | --- | --- |
+| input (cache miss) | 0.35% | 10% |
+| cache read (cache hit) | 99.4% | 59% |
+| output | 0.27% | 31% |
+
+So cache reads are ~73% of the cost *difference* between two providers, output
+~19% and input ~9%. `TOKEN_MIX` in the shared module holds that measurement and
+`cheaperOnMyMix` compares the two cards at it, after scaling DeepInfra's input
+axis by `DEEPINFRA_INPUT_MULTIPLIER` (1.87) for the cache misses it re-reads
+that DeepSeek does not. Blended over a billion tokens of this usage:
+
+| | DeepSeek | DeepInfra list | DeepInfra @51% |
+| --- | --- | --- | --- |
+| off-peak | $5.09 | $8.84 | $4.33 |
+| peak | $10.18 | $8.84 | $4.33 |
+
+The old rule required DeepInfra to beat DeepSeek on *all three* axes, which is
+the same as ignoring the weighting and demanding a 50% discount. The real
+off-peak break-even is **42%** (38% without the cache-miss penalty). At 51% the
+promo wins at every hour; at 30% — what DeepInfra's un-suffixed
+`DeepSeek-V4.1-Flash` lists — it loses off-peak and wins at peak.
+
 - DeepInfra publishes its rates publicly at `/v1/openai/models`, so the extension
   refetches them each session and re-registers the model's cost — the footer's
   dollar figure tracks the real billed rate, promos included. `models.json`
   deliberately has no `deepinfra` entry: an override there would freeze the
   price at whatever was true when the file was written.
+- `TOKEN_MIX` is a measurement, not a guess. Re-derive it with
+  `node dot-pi/agent/extensions/shared/measure-token-mix.mjs` (add
+  `--provider deepinfra` for the cache-efficiency figure behind the multiplier),
+  and `bun test dot-pi/agent/extensions/shared/` pins the arithmetic — including
+  the break-even discount — so a drifted constant fails instead of quietly
+  flipping the router.
 - Provider choice is per turn, not per request: tool follow-ups stay where the
   turn started, so only crossing a peak boundary costs a prompt-cache miss. A
   retry after a provider-side error (5xx, 429, overload, network) crosses to the
