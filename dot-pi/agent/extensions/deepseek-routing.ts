@@ -46,8 +46,9 @@
 // it exists only where DeepSeek has credentials — a machine without them never
 // lists it and never runs this code. The DeepInfra side is gated per request:
 // pi's find() returns catalog entries whose provider has no credentials and
-// aborts a request routed to one, so resolve() filters by getAvailable() and a
-// DeepSeek-only machine falls back to DeepSeek instead of erroring.
+// aborts a request routed to one, so resolve() prefers getAvailable() and falls
+// back to hasConfiguredAuth() — the check pi itself applies — so a DeepSeek-only
+// machine stays on DeepSeek instead of erroring.
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
@@ -113,6 +114,8 @@ interface RouteContext {
     find(provider: string, id: string): CatalogModel | undefined;
     /** Credential-backed models; present in pi 1.4.0 (the subagents plugin uses it too). */
     getAvailable?(): CatalogModel[];
+    /** pi's own pre-flight check; present in pi 1.4.0. */
+    hasConfiguredAuth?(model: CatalogModel): boolean;
   };
 }
 
@@ -165,12 +168,13 @@ async function fetchDeepInfraCost(): Promise<RateSet | undefined> {
 /**
  * Lowercased "provider/id" of every model whose provider has credentials, or
  * undefined when the registry cannot answer (then callers fall back to trust
- * `find()`, which is what pi would do).
+ * `find()`, which is what pi would do). An empty snapshot is "cannot answer":
+ * it is a cache, and an unpopulated one must not read as "nothing is usable".
  */
 function availableIds(ctx: RouteContext): Set<string> | undefined {
   try {
     const available = ctx.modelRegistry.getAvailable?.();
-    if (!Array.isArray(available)) return undefined;
+    if (!Array.isArray(available) || available.length === 0) return undefined;
     return new Set(available.map((model) => `${model.provider}/${model.id}`.toLowerCase()));
   } catch {
     return undefined;
@@ -226,6 +230,9 @@ export default function (pi: ExtensionAPI) {
 
   // Baseline first, so the model is selectable before any network call.
   registerDeepInfra(deepInfraCost);
+
+  /** One stderr note per streak of requests routed without the snapshot. */
+  let warnedStaleSnapshot = false;
 
   /** Which side to use for `tier`, given the current DeepInfra price. */
   function chooseSide(tier: Tier): ModelRef {
@@ -305,17 +312,12 @@ export default function (pi: ExtensionAPI) {
     activeCtx = undefined;
     activeModel = undefined;
     appliedText = undefined;
+    warnedStaleSnapshot = false;
   });
 
-  /** Resolve a side in the catalog; undefined when it is not usable. */
-  function resolve(ctx: RouteContext, ref: ModelRef | undefined): CatalogModel | undefined {
+  /** The catalog entry for `ref`, whatever the availability snapshot says. */
+  function findInCatalog(ctx: RouteContext, ref: ModelRef | undefined): CatalogModel | undefined {
     if (!ref) return undefined;
-    // `find()` returns catalog entries even for providers with no credentials,
-    // and pi aborts a request routed to one. Check availability first, so a
-    // machine logged into only one side falls back instead of failing every
-    // request (e.g. DeepSeek-only: never route to DeepInfra).
-    const available = availableIds(ctx);
-    if (available && !available.has(`${ref.provider}/${ref.id}`.toLowerCase())) return undefined;
     try {
       return ctx.modelRegistry.find(ref.provider, ref.id);
     } catch {
@@ -323,19 +325,88 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  /** Whether pi would accept a request for `model` (unknown counts as yes). */
+  function hasCredentials(ctx: RouteContext, model: CatalogModel): boolean {
+    try {
+      return ctx.modelRegistry.hasConfiguredAuth?.(model) !== false;
+    } catch {
+      return true;
+    }
+  }
+
+  /** Resolve a side in the catalog; undefined when it is not usable. */
+  function resolve(
+    ctx: RouteContext,
+    ref: ModelRef | undefined,
+    available: Set<string> | undefined,
+  ): CatalogModel | undefined {
+    if (!ref) return undefined;
+    // `find()` returns catalog entries even for providers with no credentials,
+    // and pi aborts a request routed to one. So the snapshot gates the choice
+    // while it has an answer, and `hasConfiguredAuth()` — the check pi itself
+    // applies, which reads the same snapshot — takes over when it does not.
+    // Trusting that one can never pick a side pi would refuse.
+    const found = findInCatalog(ctx, ref);
+    if (!found) return undefined;
+    if (available) return available.has(`${ref.provider}/${ref.id}`.toLowerCase()) ? found : undefined;
+    return hasCredentials(ctx, found) ? found : undefined;
+  }
+
   /**
    * The side to use for this request, preferring `ref` and falling back to the
    * other side when that one is not in the catalog.
+   *
+   * The availability snapshot decides only the preference, never the verdict.
+   * pi serves `getAvailable()` from a cache it refreshes asynchronously, so a
+   * provider registration or a session start can leave it stale; `route()`
+   * throwing ends the request with an error pi does not retry, and every
+   * request — user, continuation and retry — comes through here, so a snapshot
+   * that has not caught up must not be able to end the turn. Confirm against
+   * the catalog before failing a request.
+   *
+   * This cannot rescue the case where pi's own credential snapshot is the thing
+   * that is stale: `hasConfiguredAuth()` reads the same snapshot, so pi refuses
+   * every route and only `/reload` (which rebuilds the registry) helps. The
+   * error says that, instead of blaming a credential that is probably fine.
    */
   function resolveEither(ctx: RouteContext, ref: ModelRef): CatalogModel {
-    const wanted = resolve(ctx, ref) ?? resolve(ctx, otherSide(ref));
-    if (!wanted) {
-      throw new Error(
-        `deepseek-routing: neither ${ref.provider}/${ref.id} nor its counterpart is available; ` +
-          `check the deepinfra credential in ~/.pi/agent/auth.json`,
-      );
+    const available = availableIds(ctx);
+    const wanted = resolve(ctx, ref, available) ?? resolve(ctx, otherSide(ref), available);
+    if (wanted) {
+      if (available === undefined) {
+        note(`availability snapshot is empty; routed to ${wanted.provider}/${wanted.id} without it`);
+      } else {
+        warnedStaleSnapshot = false;
+      }
+      return wanted;
     }
-    return wanted;
+    const fallback = pickConfigured(ctx, [ref, otherSide(ref)]);
+    if (fallback) {
+      note(`availability snapshot omitted ${fallback.provider}/${fallback.id}; using the catalog entry`);
+      return fallback;
+    }
+    const other = otherSide(ref);
+    throw new Error(
+      `deepseek-routing: neither ${ref.provider}/${ref.id} nor ${other?.provider}/${other?.id} is usable ` +
+        `— no credentials, or missing from the catalog. The model registry looks stale: run /reload, or ` +
+        `restart, to rebuild it. If that persists, check the deepinfra credential in ~/.pi/agent/auth.json`,
+    );
+  }
+
+  /** One stderr note per streak of requests the snapshot could not place. */
+  function note(message: string): void {
+    if (warnedStaleSnapshot) return;
+    warnedStaleSnapshot = true;
+    console.error(`deepseek-routing: ${message}`);
+  }
+
+  /** The first of `refs` that is in the catalog and has credentials. */
+  function pickConfigured(ctx: RouteContext, refs: (ModelRef | undefined)[]): CatalogModel | undefined {
+    for (const ref of refs) {
+      const found = findInCatalog(ctx, ref);
+      if (found && hasCredentials(ctx, found)) return found;
+    }
+    return undefined;
   }
 
   pi.registerVirtualModel<RouterState>({

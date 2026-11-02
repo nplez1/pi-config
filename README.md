@@ -202,7 +202,14 @@ neither provider stays untouched. It routes to DeepInfra only when DeepInfra
 also has a credential; a DeepSeek-only machine stays on DeepSeek instead of
 failing (`modelRegistry.find()` returns credential-less models, so the router
 checks `getAvailable()` first). Without a DeepInfra key pi hides that provider
-entirely.
+entirely. `getAvailable()` is a *cache* pi refreshes asynchronously, so it
+decides the preferred side and nothing more: when it omits both sides — or comes
+back empty — the router confirms against the catalog and notes it once on stderr,
+because `route()` throwing ends the request with an error pi does not retry and —
+every request going through the router — would keep ending it until pi was
+restarted. It cannot rescue the case where pi's own credential snapshot is what
+went stale: `hasConfiguredAuth()` reads the same snapshot, pi refuses every
+route, and the router says so instead of blaming a key that is probably fine.
 
 The schedule and rate card live in
 `extensions/shared/deepseek-schedule.ts`, shared with `deepseek-pricing.ts` so
