@@ -246,6 +246,9 @@ export default function (pi: ExtensionAPI) {
   /** One stderr note per streak of requests routed without the snapshot. */
   let warnedStaleSnapshot = false;
 
+  /** One stderr note per session for `resolveEither`'s last-resort path. */
+  let warnedLastResort = false;
+
   /** Which side to use for `tier`, given the current DeepInfra price. */
   function chooseSide(tier: Tier): ModelRef {
     return cheaperOnMyMix(deepInfraCost, deepseekCost(tier), DEEPINFRA_INPUT_MULTIPLIER)
@@ -326,6 +329,7 @@ export default function (pi: ExtensionAPI) {
     activeModel = undefined;
     appliedText = undefined;
     warnedStaleSnapshot = false;
+    warnedLastResort = false;
   });
 
   /** The catalog entry for `ref`, whatever the availability snapshot says. */
@@ -377,10 +381,17 @@ export default function (pi: ExtensionAPI) {
    * that has not caught up must not be able to end the turn. Confirm against
    * the catalog before failing a request.
    *
-   * This cannot rescue the case where pi's own credential snapshot is the thing
-   * that is stale: `hasConfiguredAuth()` reads the same snapshot, so pi refuses
-   * every route and only `/reload` (which rebuilds the registry) helps. The
-   * error says that, instead of blaming a credential that is probably fine.
+   * Neither can a stale *credential* snapshot end the turn. `hasConfiguredAuth()`
+   * reads the same cache, so when it goes stale it refuses both sides at once
+   * and nothing below the catalog is left to consult; the old code threw here,
+   * which ended the turn with an error pi does not retry and stalled a release
+   * for 3.6 h on 2026-11-01. So the last resort hands pi the catalog entry
+   * anyway. A stale snapshot then costs one failed request, which pi reports in
+   * its own words, instead of a dead turn the router cannot recover from; a
+   * correct one costs nothing, because pi would have refused the request either
+   * way. This can only reach that point on a machine whose router exists at all,
+   * and the router is registered under `deepseek`, so a DeepSeek entry is in the
+   * catalog whenever this code runs.
    */
   function resolveEither(ctx: RouteContext, ref: ModelRef): CatalogModel {
     const available = availableIds(ctx);
@@ -398,11 +409,26 @@ export default function (pi: ExtensionAPI) {
       note(`availability snapshot omitted ${fallback.provider}/${fallback.id}; using the catalog entry`);
       return fallback;
     }
+    const lastResort = findInCatalog(ctx, ref) ?? findInCatalog(ctx, otherSide(ref));
+    if (lastResort) {
+      // Not `note()`: this one is the difference between a recovered turn and a
+      // dead one, so it gets its own once-per-session line rather than being
+      // suppressed by whichever stale-snapshot warning came first.
+      if (!warnedLastResort) {
+        warnedLastResort = true;
+        console.error(
+          `deepseek-routing: no provider reports credentials; trying ${lastResort.provider}/${lastResort.id} ` +
+            `anyway, because a stale credential snapshot must not end the turn. Run /reload or restart to ` +
+            `rebuild the registry; if the request then fails, check the deepinfra credential in auth.json`,
+        );
+      }
+      return lastResort;
+    }
     const other = otherSide(ref);
     throw new Error(
-      `deepseek-routing: neither ${ref.provider}/${ref.id} nor ${other?.provider}/${other?.id} is usable ` +
-        `— no credentials, or missing from the catalog. The model registry looks stale: run /reload, or ` +
-        `restart, to rebuild it. If that persists, check the deepinfra credential in ~/.pi/agent/auth.json`,
+      `deepseek-routing: neither ${ref.provider}/${ref.id} nor ${other?.provider}/${other?.id} is in the ` +
+        `model catalog. This is not a credential problem — the catalog itself has lost both entries, so the ` +
+        `router cannot name a model to retry with. Run /reload, or restart, to rebuild it`,
     );
   }
 
@@ -412,7 +438,6 @@ export default function (pi: ExtensionAPI) {
     warnedStaleSnapshot = true;
     console.error(`deepseek-routing: ${message}`);
   }
-
   /** The first of `refs` that is in the catalog and has credentials. */
   function pickConfigured(ctx: RouteContext, refs: (ModelRef | undefined)[]): CatalogModel | undefined {
     for (const ref of refs) {
