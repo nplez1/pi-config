@@ -459,8 +459,25 @@ the `pi` shim afterwards) reconciles them:
 | What drifts | Why it drifts | Reconciled by |
 |---|---|---|
 | A vulnerable dependency | `pi update --extensions` re-resolves the extension tree; a release bump regenerates the managed release's `package.json`, dropping the `undici` override | `deps-audit.sh` — pins, then `npm audit fix` |
+| The web-access build input | `pi update --extensions` runs `npm install <specs>` in `~/.pi/agent/npm`, and npm prunes packages that are not saved dependencies — `pi-web-access` is installed there only as build input for the bundle | saved with `--save`, and reinstalled by `after-update.sh` if it is ever missing or unsaved |
 | A stale bundle | `pi update --extensions` can bump `pi-web-access`, and the prebuilt bundle wrapping it is a snapshot — pi-bolt then silently runs the old code | `rebuild.sh --if-stale` |
 | The compile record | `pi compile --off` deletes `~/.pi-bolt/compile.json`, and a release bump can too; the compile set then silently falls back to *everything installed*, which dies on the one extension Bun refuses (top-level `await`) | re-runs `pi-bolt compile --exclude <compile-exclude.txt>` |
+
+**The build input is a dependency, not a side install.** `pi-web-access` lives in
+`~/.pi/agent/npm` only because the web-access bundle wraps it — Pi-Bolt's package
+list excludes it, so nothing else would install it. Installed `--no-save` it was
+*extraneous* to npm, and on 2026-10-31 an `npm install pi-codex-goal@latest
+--prefix ~/.pi/agent/npm` pruned it along with its dependencies. The rebuild then
+died on a missing `dist/index.js`, and because the bundle `require`s those same
+dependencies at run time, the previous bundle no longer loaded either:
+
+```
+Error: Failed to load extension "…/pi-bolt-web-access/dist-bun/index.js": Cannot find module 'p-limit'
+```
+
+`--save` puts it in the part of the tree npm is asked to keep, and
+`after-update.sh` reinstalls it if a later prune removes it anyway. Restoring the
+input restores its dependencies with it, which is what the bundle needs.
 
 The third one is also fixed *before* it can fail: the shim adds
 `--exclude $(compile-exclude.txt)` to a bare `pi compile`, merging it with any
@@ -533,6 +550,17 @@ A patch bump inside the same major, then `npm install --legacy-peer-deps` in
 `~/.pi/agent/npm` (which also collapsed the nested copy into the hoisted one).
 It sticks: `pi update --extensions` runs `npm install --prefix … --legacy-peer-deps`,
 which preserves the field. **`npm audit` → 0 vulnerabilities** as of 2026-10-24.
+
+Re-checked 2026-10-31: the extension tree is still clean, and the managed release
+reports **2 moderate** — `minimatch <11.0.1` (GHSA-g3hv-75wg-m249, ReDoS via
+globparts amplification), reached through `@earendil-works/pi-coding-agent`, which
+pins `minimatch` 10.2.6 exactly. npm says "No fix available": 11.0.1 exists but is
+a major bump inside Pi itself, so it is upstream's to move, and an override here
+would be guessing at compatibility. `deps-audit.sh --check` therefore exits 1 and
+`install.sh` prints it as a WARN — that is the intended report, not a broken audit.
+The same check also fixed a parser bug: npm 11 prints its tally as `2 moderate
+severity vulnerabilities`, which the old `^<n> vulnerabilities` pattern did not
+match, so a real finding was reported as "npm audit did not run".
 
 None of that is a step anyone has to remember: `deps-audit.sh` owns it, and
 [the `pi` shim runs it after every update](#keeping-up-to-date). `install.sh` runs

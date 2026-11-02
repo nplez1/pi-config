@@ -39,8 +39,29 @@ const SOURCE =
 const ENTRY = join(SOURCE, "dist/index.js");
 const OUT = join(HERE, "dist-bun");
 
-/** Read once: the host scan below needs it before the bundle is built. */
-const sourceText = readFileSync(ENTRY, "utf8");
+/**
+ * Read once: the host scan below needs it before the bundle is built.
+ *
+ * A missing input is worth naming here rather than let readFileSync's ENOENT
+ * escape: this runs in front of a pi-bolt launch (rebuild.sh), and the cause is
+ * usually an `npm install` in the extension tree pruning anything that is not a
+ * saved dependency — which is how pi-web-access and the dependencies the
+ * prebuilt bundle requires disappeared on 2026-10-31.
+ */
+let sourceText;
+try {
+  sourceText = readFileSync(ENTRY, "utf8");
+} catch (err) {
+  if (err?.code !== "ENOENT") throw err;
+  console.error(
+    `pi-web-access is not installed where this bundle expects it:\n` +
+      `  ${ENTRY}\n` +
+      `Reinstall the build input, saved so the next npm install keeps it:\n` +
+      `  npm install --prefix ${dirname(dirname(SOURCE))} --save --legacy-peer-deps pi-web-access\n` +
+      `The previous bundle is untouched. See pi-config/pi-bolt/README.md, Dependencies.`,
+  );
+  process.exit(1);
+}
 
 const pkg = JSON.parse(readFileSync(join(SOURCE, "package.json"), "utf8"));
 const NAME = "@nplez1/pi-bolt-web-access";

@@ -645,10 +645,20 @@ else
 
     # The web-access bundle wraps the published pi-web-access dist as build
     # input, and Pi-Bolt's package list excludes that package (the bundle
-    # replaces it), so nothing else installs it on a fresh machine.
-    if [ ! -f "$HOME/.pi/agent/npm/node_modules/pi-web-access/dist/index.js" ]; then
+    # replaces it), so nothing else installs it on a fresh machine. It is saved
+    # as a dependency rather than installed with --no-save: npm prunes packages
+    # that are not in package.json, and an update runs `npm install <specs>` in
+    # this tree. On 2026-10-31 that removed pi-web-access *and its dependencies*,
+    # which the prebuilt bundle requires at run time, so pi-bolt then refused to
+    # start ("Cannot find module p-limit"). "Saved" is what keeps it.
+    web_access_saved=$(cd "$HOME/.pi/agent/npm" 2>/dev/null \
+      && npm pkg get dependencies.pi-web-access 2>/dev/null | tr -d '"' || true)
+    case "$web_access_saved" in "" | "{}" | "undefined") web_access_saved="" ;; esac
+    if [ ! -f "$HOME/.pi/agent/npm/node_modules/pi-web-access/dist/index.js" ] \
+      || [ -z "$web_access_saved" ]; then
       echo "  install  pi-web-access (build input for the web-access bundle)"
-      npm install --prefix "$HOME/.pi/agent/npm" --no-save --no-audit --no-fund pi-web-access >/dev/null 2>&1 \
+      npm install --prefix "$HOME/.pi/agent/npm" --save --legacy-peer-deps \
+        --no-audit --no-fund pi-web-access >/dev/null 2>&1 \
         || echo "  SKIP     could not install the web-access build input"
     fi
 

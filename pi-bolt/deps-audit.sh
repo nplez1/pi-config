@@ -57,9 +57,14 @@ command -v npm >/dev/null 2>&1 || {
 trouble=0
 
 summary_of() {
-  # npm's own tally line, wherever it sits; the last line otherwise (an error).
-  printf '%s\n' "$1" | grep -m1 -E '^[0-9]+ vulnerabilit(y|ies)' \
-    || printf '%s\n' "$1" | tail -1
+  # npm's own tally, wherever it sits; the last line otherwise (an error).
+  # npm 11 prints "found 0 vulnerabilities" when clean and one
+  # "<n> <severity> severity vulnerabilities" line per severity otherwise, so an
+  # anchored "^<n> vulnerabilities" missed every real tally and reported a
+  # finding as "npm audit did not run". Join the severity lines so the count is
+  # the whole finding, not whichever severity npm listed first.
+  tally=$(printf '%s\n' "$1" | grep -E '^([0-9]+ .*severity vulnerabilit(y|ies)|[0-9]+ vulnerabilit(y|ies)|found [0-9]+ vulnerabilit(y|ies))' | paste -sd';' -)
+  if [ -n "$tally" ]; then printf '%s\n' "$tally"; else printf '%s\n' "$1" | tail -1; fi
 }
 clean_word() { case "$1" in *"0 vulnerabilities"*) return 0 ;; esac; return 1; }
 # An audit that errored is not an audit that found nothing: say the difference.
@@ -97,34 +102,42 @@ audit_tree() {
   # 3. Audit. Anything left after `npm audit fix` needs a human: an exact pin that
   #    `--force` would move by downgrading something else, or an advisory with no
   #    fixed version at all.
+  audit_clean=0
   before=$(cd "$dir" && npm audit 2>&1 || true)
   was=$(summary_of "$before")
   if clean_word "$was"; then
-    : # nothing to do
+    audit_clean=1
   elif ! vuln_word "$was"; then
     printf 'deps-audit: %s: npm audit did not run (%s)\n' "$label" "$was" >&2
   elif [ "$check_only" = 1 ]; then
     printf 'deps-audit: %s: %s\n' "$label" "$was" >&2
     trouble=1
-  elif (cd "$dir" && npm audit fix >/dev/null 2>&1); then
+  else
+    # `npm audit fix` exits non-zero whenever anything is left — no fix available,
+    # an exact pin it will not move, a major bump it will not take — so its status
+    # proves nothing. It is the re-audit that says what remains.
+    (cd "$dir" && npm audit fix >/dev/null 2>&1) || true
     after=$(cd "$dir" && npm audit 2>&1 || true)
-    if clean_word "$(summary_of "$after")"; then
+    after_summary=$(summary_of "$after")
+    if clean_word "$after_summary"; then
       changed="${changed:+$changed; }npm audit fix cleared it (was: $was)"
-    else
+    elif vuln_word "$after_summary"; then
       printf 'deps-audit: %s: %s after `npm audit fix` — see pi-bolt/README.md, Dependencies\n' \
-        "$label" "$(summary_of "$after")" >&2
+        "$label" "$after_summary" >&2
+      trouble=1
+    else
+      printf 'deps-audit: %s: npm audit did not run after `npm audit fix` (%s)\n' "$label" "$after_summary" >&2
       trouble=1
     fi
-  else
-    printf 'deps-audit: %s: `npm audit fix` failed (was: %s)\n' "$label" "$was" >&2
-    trouble=1
   fi
 
   if [ -n "$changed" ]; then
     printf 'pi deps: %s: %s\n' "$label" "$changed"
-  elif [ "$quiet" = 0 ]; then
+  elif [ "$quiet" = 0 ] && [ "$audit_clean" = 1 ]; then
     printf 'pi deps: %s: clean\n' "$label"
   fi
+  # An audit that did not run said so above; calling it clean here is how a
+  # parse failure reads as a pass.
 }
 
 audit_tree "$AGENT/npm"
