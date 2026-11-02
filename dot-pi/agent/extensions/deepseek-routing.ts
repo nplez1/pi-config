@@ -212,11 +212,33 @@ export default function (pi: ExtensionAPI) {
    * `route()` so a cold session does not have to choose on list price. pi
    * awaits `route()`, so awaiting here costs latency only when the fetch has
    * not finished, and it is bounded by `PRICING_TIMEOUT_MS` either way.
+   *
+   * It owns applying the result as well as fetching it. Assigning
+   * `deepInfraCost` from a separate `.then()` would work only by promise
+   * callback order — the prefetch's handler registered first, the awaited one
+   * second — and a route that reached here with no prefetch pending would then
+   * wait for the fetch and decide on list price anyway.
    */
   let pricing: Promise<RateSet | undefined> | undefined;
 
   function refreshPricing(): Promise<RateSet | undefined> {
-    pricing ??= fetchDeepInfraCost().catch(() => undefined);
+    pricing ??= fetchDeepInfraCost()
+      .catch(() => undefined)
+      .then((cost) => {
+        // Offline, or DeepInfra is having a bad day: list price and DeepSeek
+        // direct keep working.
+        if (!cost) return undefined;
+        const changed =
+          cost.input !== deepInfraCost.input ||
+          cost.output !== deepInfraCost.output ||
+          cost.cacheRead !== deepInfraCost.cacheRead;
+        if (!changed) return cost;
+        deepInfraCost = cost;
+        registerDeepInfra(cost);
+        // The footer label is computed at session start, before this lands.
+        if (activeCtx && activeModel) updateLabel(activeCtx, activeModel, true);
+        return cost;
+      });
     return pricing;
   }
 
@@ -350,6 +372,9 @@ export default function (pi: ExtensionAPI) {
     appliedText = undefined;
     warnedStaleSnapshot = false;
     pricing = undefined;
+    // Back to list price, so a later session whose fetch fails does not inherit
+    // this one's discount.
+    deepInfraCost = DEEPINFRA_LIST;
   });
 
   /** The catalog entry for `ref`, whatever the availability snapshot says. */
@@ -462,8 +487,6 @@ export default function (pi: ExtensionAPI) {
     maxTokens: MAX_TOKENS,
     input: ["text", "image"],
     async route(request: RouteRequest, ctx: RouteContext) {
-      const tier = currentTier();
-
       // Tool follow-ups and steering mid-turn: stay where the turn started, so
       // the prompt cache survives. Crossing a peak boundary mid-turn would cost
       // more than the per-token difference it saves.
@@ -511,18 +534,8 @@ export default function (pi: ExtensionAPI) {
 
   // Pick up DeepInfra's current discount once a session exists (never in the
   // factory, which also runs for --list-models and other one-shot invocations).
+  // `refreshPricing` applies the result itself; this only starts it early.
   pi.on("session_start", () => {
-    void refreshPricing().then((cost) => {
-      // Offline, or DeepInfra is having a bad day: list price and DeepSeek
-      // direct keep working.
-      if (!cost) return;
-      const changed =
-        cost.input !== deepInfraCost.input ||
-        cost.output !== deepInfraCost.output ||
-        cost.cacheRead !== deepInfraCost.cacheRead;
-      if (!changed) return;
-      deepInfraCost = cost;
-      registerDeepInfra(cost);
-    });
+    void refreshPricing();
   });
 }

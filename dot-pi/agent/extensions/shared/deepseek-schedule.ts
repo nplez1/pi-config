@@ -139,7 +139,7 @@ export function deepseekCost(tier: Tier): RateSet {
  * Measured over 38,556 assistant messages on deepseek-flash, 2026-10-14 until
  * 2026-11-01 09:00 UTC — the DeepSeek-only period, before the router took over,
  * so DeepInfra's cache behaviour cannot contaminate the baseline. Reproduce with
- *   measure-token-mix.mjs --since 2026-10-14 --until 2026-11-01T09:00
+ *   measure-token-mix.mjs --since 2026-10-14 --until 2026-11-01T09:00Z
  * which prints 29,452,209 input misses, 8,485,449,080 cache reads and
  * 22,644,163 output. Cache reads are 99.4% of every prompt, because a long
  * agent session replays its whole history each turn.
@@ -175,7 +175,7 @@ export const TOKEN_MIX: RateSet = {
  * 1.6-1.9; that is a choice of sampling, not a confidence range, and the ratio
  * of two per-session medians is not exactly the ratio to apply to an aggregate
  * mix (taken literally, the implied per-session figure is ~2.1). It moves the
- * off-peak break-even from 38% to 42-44%, so it only decides that band, and it
+ * off-peak break-even from 38% to 42.5%, so it only decides that band, and it
  * is small next to the 2x that separates the two cards on cache reads.
  */
 export const DEEPINFRA_INPUT_MULTIPLIER = 1.87;
@@ -204,7 +204,8 @@ export function blendedPrice(rates: RateSet, inputMultiplier = 1): number {
  * Whether `candidate` costs less than `baseline` for this machine's token mix,
  * with `candidate`'s extra cache misses accounted for. Replaces the old
  * every-axis test, which is 8 points of discount too conservative: 50% against
- * this mix's 42% break-even.*/
+ * this mix's 42.5% break-even.
+ */
 export function cheaperOnMyMix(
   candidate: RateSet,
   baseline: RateSet,

@@ -25,7 +25,7 @@ const SIDES = ["deepseek", "deepinfra"];
 interface FakeRegistry {
   find(provider: string, id: string): unknown;
   getAvailable?(): unknown[];
-  hasConfiguredAuth?(provider: string): boolean;
+  hasConfiguredAuth?(model: unknown): boolean;
 }
 
 function registry(opts: {
@@ -166,6 +166,15 @@ describe("router recovery", () => {
 describe("router follows the price, not the clock", () => {
   test("takes DeepInfra at peak when its live card is cheap", async () => {
     process.env.PI_DEEPSEEK_TIER = "peak";
+    stubPricing(async () => pricingResponse(0.098, 0.294, 0.00294, 0));
+    expect((await (await harness(healthy)).routeAsPi()).model.provider).toBe("deepinfra");
+  });
+
+  test("applies the live price off-peak, where list price would lose", async () => {
+    // The discriminating case: list price stays on DeepSeek off-peak, so only a
+    // fetched promo can produce DeepInfra here. A peak case cannot tell the two
+    // apart, because list price also wins at peak.
+    process.env.PI_DEEPSEEK_TIER = "off-peak";
     stubPricing(async () => pricingResponse(0.098, 0.294, 0.00294, 0));
     expect((await (await harness(healthy)).routeAsPi()).model.provider).toBe("deepinfra");
   });

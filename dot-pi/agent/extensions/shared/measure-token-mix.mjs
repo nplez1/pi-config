@@ -5,8 +5,12 @@
 // measurement, to be compared by hand with the constants in the source.
 //
 //   node dot-pi/agent/extensions/shared/measure-token-mix.mjs
-//   node dot-pi/agent/extensions/shared/measure-token-mix.mjs --since 2026-10-14 --until 2026-10-31
+//   node dot-pi/agent/extensions/shared/measure-token-mix.mjs --since 2026-10-14 --until 2026-11-01T09:00Z
 //   node dot-pi/agent/extensions/shared/measure-token-mix.mjs --provider deepinfra
+//
+// `--since` / `--until` are parsed by `Date.parse`, so a date-time without a
+// trailing `Z` is read as LOCAL time. Pass the `Z` when the window is a UTC
+// boundary, as the TOKEN_MIX provenance is.
 //
 // Session transcripts live at `sessions/<mangled-cwd>/<session>.jsonl`, so the
 // scan is one level of directories deep — the layout, not a limit.
@@ -136,7 +140,7 @@ for await (const path of sessionFiles(SESSIONS)) {
 }
 
 if (totals.messages === 0) {
-  console.error(`no assistant messages for provider "${PROVIDER}" since ${SINCE}`);
+  console.error(`no assistant messages for provider "${PROVIDER}" between ${SINCE} and ${UNTIL}`);
   process.exit(1);
 }
 
@@ -165,7 +169,7 @@ const median = ratios.length ? ratios[Math.floor(ratios.length / 2)] : Number.Na
 const pct = (n) => `${(n * 100).toFixed(2)}%`;
 const fixed = (n) => n.toFixed(5);
 
-console.log(`provider ${PROVIDER}${MODEL ? ` model ${MODEL}` : ""}, since ${SINCE}`);
+console.log(`provider ${PROVIDER}${MODEL ? ` model ${MODEL}` : ""}, ${SINCE} .. ${UNTIL}`);
 console.log(`  ${totals.messages.toLocaleString()} assistant messages, ${total.toLocaleString()} tokens`);
 console.log(`  input misses ${totals.input.toLocaleString()}  cache reads ${totals.cacheRead.toLocaleString()}  output ${totals.output.toLocaleString()}`);
 console.log(`  ${droppedSwitchMisses.toLocaleString()} post-switch turns dropped`);
