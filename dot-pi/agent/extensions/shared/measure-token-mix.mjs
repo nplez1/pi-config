@@ -2,12 +2,14 @@
 // Re-derives `TOKEN_MIX` in deepseek-schedule.ts from this machine's own
 // transcripts. The provider comparison is only as good as that weighting, and
 // the weighting drifts with how the machine is used — so this prints the
-// measurement next to the constants currently in the source, so a maintainer
-// can see whether they still agree.
+// measurement, to be compared by hand with the constants in the source.
 //
 //   node dot-pi/agent/extensions/shared/measure-token-mix.mjs
-//   node dot-pi/agent/extensions/shared/measure-token-mix.mjs --since 2026-10-01
+//   node dot-pi/agent/extensions/shared/measure-token-mix.mjs --since 2026-10-14 --until 2026-10-31
 //   node dot-pi/agent/extensions/shared/measure-token-mix.mjs --provider deepinfra
+//
+// Session transcripts live at `sessions/<mangled-cwd>/<session>.jsonl`, so the
+// scan is one level of directories deep — the layout, not a limit.
 //
 // DeepSeek-only sessions are the baseline on purpose: DeepInfra re-reads more
 // of the prompt as cache misses, so its transcripts would inflate the input
@@ -32,6 +34,19 @@ const flag = (name, fallback) => {
 const SESSIONS = join(homedir(), ".pi", "agent", "sessions");
 const PROVIDER = flag("provider", "deepseek");
 const SINCE = flag("since", "1970-01-01");
+const UNTIL = flag("until", "9999-12-31");
+
+/** `message.timestamp` is epoch ms here; tolerate an ISO string if it ever is not. */
+function timestampOf(message) {
+  const raw = message.timestamp;
+  if (typeof raw === "number") return raw;
+  const parsed = Date.parse(String(raw ?? ""));
+  if (Number.isNaN(parsed)) {
+    console.error(`unreadable message timestamp: ${String(raw)}`);
+    process.exit(1);
+  }
+  return parsed;
+}
 // The router swaps between these two checkpoints, so those are the defaults.
 const MODEL = flag(
   "model",
@@ -102,7 +117,8 @@ for await (const path of sessionFiles(SESSIONS)) {
     previousProvider = message.provider;
     if (message.provider !== PROVIDER) continue;
     if (MODEL && message.model !== MODEL) continue;
-    if ((message.timestamp ?? 0) < Date.parse(SINCE)) continue;
+    const at = timestampOf(message);
+    if (at < Date.parse(SINCE) || at > Date.parse(UNTIL)) continue;
     if (switched) {
       droppedSwitchMisses += 1;
       continue;

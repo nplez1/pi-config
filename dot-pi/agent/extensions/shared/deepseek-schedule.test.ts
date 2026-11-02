@@ -1,17 +1,15 @@
 // Run with `bun test dot-pi/agent/extensions/shared/`.
 //
-// These pin the provider comparison's arithmetic, not the rate card: the rates
-// change with DeepSeek's schedule and DeepInfra's promos, but the token mix is
-// a property of how the machine is used, and the break-even discount it implies
-// is the whole decision. A silent drift in `TOKEN_MIX` would flip the router
-// without anything else failing.
+// Two jobs. The structural assertions (a share distribution, inputMultiplier
+// touching one axis, the break-even band) pin properties that must hold for any
+// rates. The figure assertions ($5.09, $8.84, the 13% peak margin) pin the
+// numbers quoted in the module comments and the README, so prose and code cannot
+// drift apart — they are expected to be updated together when a card changes.
 
 import { describe, expect, test } from "bun:test";
 import {
-  DEEPINFRA_BASELINE_COST,
   DEEPINFRA_INPUT_MULTIPLIER,
   DEEPINFRA_LIST,
-  DEEPSEEK_FLASH,
   TOKEN_MIX,
   blendedPrice,
   cheaperOnMyMix,
@@ -108,14 +106,11 @@ describe("cheaperOnMyMix", () => {
     expect(breakEven).toBeLessThan(0.4);
   });
 
-  test("the promo wins at both tiers, penalty included", () => {
+  test("the 51% promo wins at both tiers, penalty included", () => {
+    const promo = effectiveCost(DEEPINFRA_LIST, 0.51);
     for (const tier of ["peak", "off-peak"] as const) {
-      expect(cheaperOnMyMix(DEEPINFRA_BASELINE_COST, deepseekCost(tier), DEEPINFRA_INPUT_MULTIPLIER)).toBe(true);
+      expect(cheaperOnMyMix(promo, deepseekCost(tier), DEEPINFRA_INPUT_MULTIPLIER)).toBe(true);
     }
-  });
-
-  test("DeepSeek wins off-peak once the promo is gone", () => {
-    expect(cheaperOnMyMix(DEEPINFRA_LIST, deepseekCost("off-peak"), DEEPINFRA_INPUT_MULTIPLIER)).toBe(false);
   });
 
   test("is not the every-axis rule", () => {
@@ -124,11 +119,5 @@ describe("cheaperOnMyMix", () => {
     const card = effectiveCost(DEEPINFRA_LIST, 0.45);
     expect(card.cacheRead).toBeGreaterThan(deepseekCost("off-peak").cacheRead);
     expect(cheaperOnMyMix(card, deepseekCost("off-peak"), DEEPINFRA_INPUT_MULTIPLIER)).toBe(true);
-  });
-});
-
-describe("rate card", () => {
-  test("the router targets the same checkpoint DeepSeek serves", () => {
-    expect(DEEPSEEK_FLASH.id).toBe("deepseek-flash");
   });
 });

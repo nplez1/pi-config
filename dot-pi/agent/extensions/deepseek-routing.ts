@@ -65,9 +65,9 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   CACHE_WRITE_RATE,
-  DEEPINFRA_BASELINE_COST,
   DEEPINFRA_FLASH,
   DEEPINFRA_INPUT_MULTIPLIER,
+  DEEPINFRA_LIST,
   DEEPSEEK_FLASH,
   PROVIDER_LABEL,
   RATES,
@@ -171,8 +171,12 @@ async function fetchDeepInfraCost(): Promise<RateSet | undefined> {
   const pricing = entry?.metadata?.pricing;
   const input = pricing?.input_tokens;
   const output = pricing?.output_tokens;
-  if (typeof input !== "number" || typeof output !== "number") return undefined;
-  const cacheRead = typeof pricing?.cache_read_tokens === "number" ? pricing.cache_read_tokens : 0;
+  const cacheRead = pricing?.cache_read_tokens;
+  // Cache reads are 99.4% of the weight, so a missing figure must not be read as
+  // "free": that would make DeepInfra win every hour regardless of its price.
+  if (typeof input !== "number" || typeof output !== "number" || typeof cacheRead !== "number") {
+    return undefined;
+  }
   const discount = typeof entry?.metadata?.discount === "number" ? entry.metadata.discount : 0;
   return effectiveCost({ input, output, cacheRead }, discount);
 }
@@ -194,8 +198,27 @@ function availableIds(ctx: RouteContext): Set<string> | undefined {
 }
 
 export default function (pi: ExtensionAPI) {
-  // Live cost for the DeepInfra side; replaced by the fetch when it succeeds.
-  let deepInfraCost: RateSet = DEEPINFRA_BASELINE_COST;
+  // DeepInfra's rate, replaced by the live figure once the fetch lands. Seeded
+  // with LIST price, not with the current promo: seeding with a discount would
+  // route the first requests of every session on an assumption, and a session
+  // whose fetch fails would route on it for its whole life — exactly the
+  // assume-it-is-cheaper failure this router exists to avoid. At list price the
+  // arithmetic is conservative: peak still goes to DeepInfra, off-peak stays on
+  // DeepSeek.
+  let deepInfraCost: RateSet = DEEPINFRA_LIST;
+
+  /**
+   * The live pricing fetch, shared by the session-start prefetch and by
+   * `route()` so a cold session does not have to choose on list price. pi
+   * awaits `route()`, so awaiting here costs latency only when the fetch has
+   * not finished, and it is bounded by `PRICING_TIMEOUT_MS` either way.
+   */
+  let pricing: Promise<RateSet | undefined> | undefined;
+
+  function refreshPricing(): Promise<RateSet | undefined> {
+    pricing ??= fetchDeepInfraCost().catch(() => undefined);
+    return pricing;
+  }
 
   /**
    * Register (or re-register) the DeepInfra side with `cost`. Re-registration
@@ -245,9 +268,6 @@ export default function (pi: ExtensionAPI) {
 
   /** One stderr note per streak of requests routed without the snapshot. */
   let warnedStaleSnapshot = false;
-
-  /** One stderr note per session for `resolveEither`'s last-resort path. */
-  let warnedLastResort = false;
 
   /** Which side to use for `tier`, given the current DeepInfra price. */
   function chooseSide(tier: Tier): ModelRef {
@@ -329,7 +349,7 @@ export default function (pi: ExtensionAPI) {
     activeModel = undefined;
     appliedText = undefined;
     warnedStaleSnapshot = false;
-    warnedLastResort = false;
+    pricing = undefined;
   });
 
   /** The catalog entry for `ref`, whatever the availability snapshot says. */
@@ -381,17 +401,17 @@ export default function (pi: ExtensionAPI) {
    * that has not caught up must not be able to end the turn. Confirm against
    * the catalog before failing a request.
    *
-   * Neither can a stale *credential* snapshot end the turn. `hasConfiguredAuth()`
-   * reads the same cache, so when it goes stale it refuses both sides at once
-   * and nothing below the catalog is left to consult; the old code threw here,
-   * which ended the turn with an error pi does not retry and stalled a release
-   * for 3.6 h on 2026-11-01. So the last resort hands pi the catalog entry
-   * anyway. A stale snapshot then costs one failed request, which pi reports in
-   * its own words, instead of a dead turn the router cannot recover from; a
-   * correct one costs nothing, because pi would have refused the request either
-   * way. This can only reach that point on a machine whose router exists at all,
-   * and the router is registered under `deepseek`, so a DeepSeek entry is in the
-   * catalog whenever this code runs.
+   * Neither can a stale *credential* snapshot be worked around here. pi checks
+   * credentials again on whatever `route()` returns — "If `route()` throws, or
+   * returns a virtual model or a model without credentials, the request ends
+   * with an error response" (docs/virtual-models.md), implemented in
+   * `resolveModel` as `hasConfiguredAuth(target.provider)` right after the
+   * awaited `route()` — and that reads the same snapshot this file reads. So a
+   * return value cannot bypass it: handing back the catalog entry would only
+   * trade this error for pi's own, which names the routed model and blames a
+   * credential. Throwing here is the whole remedy available to an extension;
+   * the way out is `/reload`, which rebuilds the registry, and the message says
+   * so.
    */
   function resolveEither(ctx: RouteContext, ref: ModelRef): CatalogModel {
     const available = availableIds(ctx);
@@ -409,26 +429,11 @@ export default function (pi: ExtensionAPI) {
       note(`availability snapshot omitted ${fallback.provider}/${fallback.id}; using the catalog entry`);
       return fallback;
     }
-    const lastResort = findInCatalog(ctx, ref) ?? findInCatalog(ctx, otherSide(ref));
-    if (lastResort) {
-      // Not `note()`: this one is the difference between a recovered turn and a
-      // dead one, so it gets its own once-per-session line rather than being
-      // suppressed by whichever stale-snapshot warning came first.
-      if (!warnedLastResort) {
-        warnedLastResort = true;
-        console.error(
-          `deepseek-routing: no provider reports credentials; trying ${lastResort.provider}/${lastResort.id} ` +
-            `anyway, because a stale credential snapshot must not end the turn. Run /reload or restart to ` +
-            `rebuild the registry; if the request then fails, check the deepinfra credential in auth.json`,
-        );
-      }
-      return lastResort;
-    }
     const other = otherSide(ref);
     throw new Error(
-      `deepseek-routing: neither ${ref.provider}/${ref.id} nor ${other?.provider}/${other?.id} is in the ` +
-        `model catalog. This is not a credential problem — the catalog itself has lost both entries, so the ` +
-        `router cannot name a model to retry with. Run /reload, or restart, to rebuild it`,
+      `deepseek-routing: neither ${ref.provider}/${ref.id} nor ${other?.provider}/${other?.id} is usable ` +
+        `— no credentials, or missing from the catalog. The model registry looks stale: run /reload, or ` +
+        `restart, to rebuild it. If that persists, check the deepinfra credential in ~/.pi/agent/auth.json`,
     );
   }
 
@@ -456,7 +461,7 @@ export default function (pi: ExtensionAPI) {
     contextWindow: CONTEXT_WINDOW,
     maxTokens: MAX_TOKENS,
     input: ["text", "image"],
-    route(request: RouteRequest, ctx: RouteContext) {
+    async route(request: RouteRequest, ctx: RouteContext) {
       const tier = currentTier();
 
       // Tool follow-ups and steering mid-turn: stay where the turn started, so
@@ -488,10 +493,14 @@ export default function (pi: ExtensionAPI) {
         }
       }
 
-      // A fresh user message (or a direct request such as a compaction
-      // summary) starts a new decision: clear any failover, repick by clock
-      // and price.
-      const target = resolveEither(ctx, chooseSide(tier));
+      // A fresh user message (or a direct request such as a compaction summary)
+      // starts a new decision. Wait for the live price first, so the decision is
+      // never made on the seeded list price when the real one is a request away;
+      // pi awaits `route()`, and the wait is bounded by the fetch timeout.
+      // Continuations and retries above deliberately skip it — they must not
+      // spend latency mid-turn.
+      await refreshPricing();
+      const target = resolveEither(ctx, chooseSide(currentTier()));
       return {
         model: target,
         thinkingLevel: request.thinkingLevel,
@@ -503,20 +512,17 @@ export default function (pi: ExtensionAPI) {
   // Pick up DeepInfra's current discount once a session exists (never in the
   // factory, which also runs for --list-models and other one-shot invocations).
   pi.on("session_start", () => {
-    void fetchDeepInfraCost()
-      .then((cost) => {
-        if (!cost) return;
-        const changed =
-          cost.input !== deepInfraCost.input ||
-          cost.output !== deepInfraCost.output ||
-          cost.cacheRead !== deepInfraCost.cacheRead;
-        if (!changed) return;
-        deepInfraCost = cost;
-        registerDeepInfra(cost);
-      })
-      .catch(() => {
-        // Offline, or DeepInfra is having a bad day: the baseline cost and
-        // DeepSeek direct keep working.
-      });
+    void refreshPricing().then((cost) => {
+      // Offline, or DeepInfra is having a bad day: list price and DeepSeek
+      // direct keep working.
+      if (!cost) return;
+      const changed =
+        cost.input !== deepInfraCost.input ||
+        cost.output !== deepInfraCost.output ||
+        cost.cacheRead !== deepInfraCost.cacheRead;
+      if (!changed) return;
+      deepInfraCost = cost;
+      registerDeepInfra(cost);
+    });
   });
 }

@@ -187,28 +187,34 @@ the measured split of a turn's tokens is:
 | cache read (cache hit) | 99.4% | 59% |
 | output | 0.27% | 31% |
 
-So cache reads are ~73% of the cost *difference* between two providers, output
-~19% and input ~9%. `TOKEN_MIX` in the shared module holds that measurement and
-`cheaperOnMyMix` compares the two cards at it, after scaling DeepInfra's input
-axis by `DEEPINFRA_INPUT_MULTIPLIER` (1.87) for the cache misses it re-reads
-that DeepSeek does not. Blended over a billion tokens of this usage:
+Cache reads are therefore both the heaviest axis and the one the two cards
+differ most on — DeepInfra's list price is 2x DeepSeek's off-peak there, 1.33x
+on input and exactly equal on output — so the decision is essentially a
+cache-read comparison. `TOKEN_MIX` in the shared module holds that measurement
+and `cheaperOnMyMix` compares the two cards at it, after scaling DeepInfra's
+input axis by `DEEPINFRA_INPUT_MULTIPLIER` (1.87) for the cache misses it
+re-reads that DeepSeek does not. Blended over a billion tokens of this usage:
 
 | | DeepSeek | DeepInfra list | DeepInfra @51% |
 | --- | --- | --- | --- |
 | off-peak | $5.09 | $8.84 | $4.33 |
 | peak | $10.18 | $8.84 | $4.33 |
 
-The old rule required DeepInfra to beat DeepSeek on *all three* axes, which is
-the same as ignoring the weighting and demanding a 50% discount. The real
-off-peak break-even is **42%** (38% without the cache-miss penalty). At 51% the
+The old rule required DeepInfra to beat DeepSeek on *all three* axes. That test
+is never wrong, just far too conservative: it demands a 50% discount where this
+mix's break-even is **42%** (38% without the cache-miss penalty). At 51% the
 promo wins at every hour; at 30% — what DeepInfra's un-suffixed
 `DeepSeek-V4.1-Flash` lists — it loses off-peak and wins at peak.
 
-**No tier is hardcoded.** The peak branch runs the same comparison as the
-off-peak one, against DeepSeek's peak card instead of its off-peak card. There
-is no "peak goes to DeepInfra" rule to fall out of date: if DeepInfra's price
-rises above DeepSeek's peak price, peak returns to DeepSeek with no code change,
-and the footer label follows because it is derived from the same call.
+**No tier is hardcoded, and no price is assumed.** The peak branch runs the same
+comparison as the off-peak one, against DeepSeek's peak card instead of its
+off-peak card, so a DeepInfra price above DeepSeek's peak price sends peak back
+to DeepSeek with no code change. The extension is seeded with DeepInfra's *list*
+price, never with the current promo, and `route()` awaits the live fetch before
+deciding — so a session whose fetch fails routes conservatively on list price
+instead of on an assumed discount. (`PI_DEEPSEEK_TIER` still forces a tier for
+testing, and the footer label shows which side the comparison picked, not what a
+DeepSeek-only machine would end up using.)
 
 - DeepInfra publishes its rates publicly at `/v1/openai/models`, so the extension
   refetches them each session and re-registers the model's cost — the footer's

@@ -22,7 +22,8 @@
 // Comparing providers needs a third input the rate card does not carry: how
 // this machine spends tokens. `TOKEN_MIX` below is that measurement, and
 // `blendedPrice` is the one number to compare two cards by. Never compare
-// providers axis-by-axis — the axes differ in weight by ~200x.
+// providers axis-by-axis — a dominance test on three prices of very different
+// weight is what made the router 8 points of discount too conservative.
 
 export interface RateSet {
   input: number;
@@ -54,8 +55,8 @@ export const RATES: Record<string, { offPeak: RateSet; peak: RateSet }> = {
 /**
  * Chinese public holidays are off-peak all day ("in full"). Add UTC dates
  * ("YYYY-MM-DD") here when the State Council publishes them; an unlisted
- * holiday is treated as a weekday, which over-routes to DeepInfra for that
- * day rather than mis-pricing a request.
+ * holiday is treated as a weekday, so the day is priced against DeepSeek's peak
+ * card and the router may pick the other side on that basis.
  */
 export const DEEPSEEK_HOLIDAYS: readonly string[] = [];
 
@@ -94,7 +95,7 @@ export interface ModelRef {
   id: string;
 }
 
-/** DeepSeek direct — cheapest off-peak (half price) and the billing baseline. */
+/** DeepSeek direct — half price off-peak, and the billing baseline. */
 export const DEEPSEEK_FLASH: ModelRef = { provider: "deepseek", id: "deepseek-flash" };
 
 /**
@@ -116,15 +117,6 @@ export const DEEPINFRA_FLASH: ModelRef = {
  */
 export const DEEPINFRA_LIST: RateSet = { input: 0.2, output: 0.6, cacheRead: 0.006 };
 
-/** Promotional discount in effect on 2026-11-01 (51% off). */
-export const DEEPINFRA_BASELINE_DISCOUNT = 0.51;
-
-/** Usable when the live pricing fetch has not run or failed. */
-export const DEEPINFRA_BASELINE_COST: RateSet = effectiveCost(
-  DEEPINFRA_LIST,
-  DEEPINFRA_BASELINE_DISCOUNT,
-);
-
 /** DeepInfra's discount is a fraction off list: 0.51 -> pay 49%. */
 export function effectiveCost(list: RateSet, discount: number): RateSet {
   const factor = 1 - discount;
@@ -144,19 +136,25 @@ export function deepseekCost(tier: Tier): RateSet {
  * How this machine actually spends tokens, as shares of one turn's total token
  * count — the weighting every provider comparison below uses.
  *
- * Measured over 38,563 assistant messages on deepseek-flash, 2026-10-14..10-31
- * (DeepSeek-only, so DeepInfra's cache behaviour cannot contaminate the
- * baseline): 29,453,562 input misses, 8,485,451,768 cache reads, 22,644,177
- * output. Cache reads are 99.4% of every prompt, because a long agent session
- * replays its whole history each turn.
+ * Measured over 38,556 assistant messages on deepseek-flash, 2026-10-14 until
+ * 2026-11-01 09:00 UTC — the DeepSeek-only period, before the router took over,
+ * so DeepInfra's cache behaviour cannot contaminate the baseline. Reproduce with
+ *   measure-token-mix.mjs --since 2026-10-14 --until 2026-11-01T09:00
+ * which prints 29,452,209 input misses, 8,485,449,080 cache reads and
+ * 22,644,163 output. Cache reads are 99.4% of every prompt, because a long
+ * agent session replays its whole history each turn.
  *
  * Token shares and SPEND shares are wildly different, and only the token
  * shares belong in a price comparison. On DeepSeek's off-peak card these
- * tokens spend 10.2% on input, 58.6% on cache reads, 31.2% on output — so
- * cache reads are ~73% of the cost *difference* between two providers, output
- * ~19% and input ~9%. Weighting the axes equally (the old `cheaperOnEveryAxis`
- * rule) therefore over-weights the two axes that barely matter, and demands a
- * 50% DeepInfra discount where the mix-weighted break-even is ~41%.
+ * tokens spend 10.2% on input, 58.6% on cache reads, 31.2% on output — and
+ * cache reads are both the heaviest axis and the one the two cards differ most
+ * on (DeepInfra list is 2x DeepSeek off-peak there, 1.33x on input and 1.0x on
+ * output), so the decision is essentially a cache-read comparison.
+ *
+ * The old `cheaperOnEveryAxis` rule tested dominance instead: DeepInfra had to
+ * be at least as cheap on all three axes. That test is never *wrong*, it is
+ * just far too conservative — it demands a 50% DeepInfra discount where this
+ * mix's break-even is 42.5%.
  */
 export const TOKEN_MIX: RateSet = {
   input: 0.00345,
@@ -172,10 +170,13 @@ export const TOKEN_MIX: RateSet = {
  * `blendedPrice` so the comparison prices the tokens DeepInfra would actually
  * bill, not the ones DeepSeek bills.
  *
- * A narrower filter — sessions served entirely by one provider — gives 1.61,
- * so treat this as 1.6-1.9. It moves the off-peak break-even from 38% to 42%,
- * i.e. it only decides the 38-42% band, and it is small next to the 2x that
- * separates the two cards on cache reads.
+ * An estimate, not a measurement with an interval. A narrower filter — sessions
+ * served entirely by one provider — gives 1.61, so the two filters bracket
+ * 1.6-1.9; that is a choice of sampling, not a confidence range, and the ratio
+ * of two per-session medians is not exactly the ratio to apply to an aggregate
+ * mix (taken literally, the implied per-session figure is ~2.1). It moves the
+ * off-peak break-even from 38% to 42-44%, so it only decides that band, and it
+ * is small next to the 2x that separates the two cards on cache reads.
  */
 export const DEEPINFRA_INPUT_MULTIPLIER = 1.87;
 
@@ -203,8 +204,7 @@ export function blendedPrice(rates: RateSet, inputMultiplier = 1): number {
  * Whether `candidate` costs less than `baseline` for this machine's token mix,
  * with `candidate`'s extra cache misses accounted for. Replaces the old
  * every-axis test, which is 8 points of discount too conservative: 50% against
- * this mix's 42% break-even.
- */
+ * this mix's 42% break-even.*/
 export function cheaperOnMyMix(
   candidate: RateSet,
   baseline: RateSet,
