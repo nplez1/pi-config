@@ -204,6 +204,12 @@ off-peak break-even is **42%** (38% without the cache-miss penalty). At 51% the
 promo wins at every hour; at 30% — what DeepInfra's un-suffixed
 `DeepSeek-V4.1-Flash` lists — it loses off-peak and wins at peak.
 
+**No tier is hardcoded.** The peak branch runs the same comparison as the
+off-peak one, against DeepSeek's peak card instead of its off-peak card. There
+is no "peak goes to DeepInfra" rule to fall out of date: if DeepInfra's price
+rises above DeepSeek's peak price, peak returns to DeepSeek with no code change,
+and the footer label follows because it is derived from the same call.
+
 - DeepInfra publishes its rates publicly at `/v1/openai/models`, so the extension
   refetches them each session and re-registers the model's cost — the footer's
   dollar figure tracks the real billed rate, promos included. `models.json`

@@ -72,6 +72,16 @@ describe("cheaperOnMyMix", () => {
     expect(margin).toBeLessThan(0.9);
   });
 
+  // No tier is pre-decided. The peak branch is the same comparison as every
+  // other, so a DeepInfra card dearer than DeepSeek's peak card has to lose
+  // there — this is the guard against "peak -> DeepInfra" creeping back in as
+  // an assumption rather than a result.
+  test("does not assume DeepInfra wins at peak", () => {
+    const dearer = { input: 0.5, output: 1.5, cacheRead: 0.012 };
+    expect(cheaperOnMyMix(dearer, deepseekCost("peak"), DEEPINFRA_INPUT_MULTIPLIER)).toBe(false);
+    expect(cheaperOnMyMix(dearer, deepseekCost("off-peak"), DEEPINFRA_INPUT_MULTIPLIER)).toBe(false);
+  });
+
   test("off-peak break-even is ~42% off, not the 50% an every-axis rule needs", () => {
     const offPeak = deepseekCost("off-peak");
     let breakEven = 0;

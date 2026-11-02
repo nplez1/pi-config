@@ -11,6 +11,12 @@
 //   peak      -> DeepInfra
 //   off-peak  -> DeepSeek, unless a DeepInfra promo beats it
 //
+// Neither tier is pre-decided. Every request compares the two cards at this
+// machine's measured token mix and takes whichever is cheaper; the two lines
+// above are just what that arithmetic returns for the rates in force on
+// 2026-11-01. No branch in this file assumes DeepInfra wins at peak — a change
+// to either card, or to the mix, changes the answer on its own.
+//
 // "Cheaper" is measured, not asserted axis by axis. `TOKEN_MIX` in
 // shared/deepseek-schedule.ts records how this machine actually spends tokens
 // (99.4% of every prompt is a cache read), and `cheaperOnMyMix` compares the
@@ -19,10 +25,10 @@
 // DeepInfra discount where the mix-weighted break-even is 42%.
 //
 //  - Promos. DeepInfra discounts its list price from time to time (51% off on
-//    2026-11-01, so $0.098/$0.294/$0.00294). Its list card already wins at peak
-//    (13% cheaper on this machine's mix, cache-miss penalty included) and loses
-//    badly off-peak (74% dearer), so a promo is what makes it the better side
-//    at every hour. DeepInfra publishes its rates publicly at
+//    2026-11-01, so $0.098/$0.294/$0.00294). On those cards its list price is
+//    already ahead at peak and far behind off-peak, so the promo is what makes
+//    it the cheaper side at every hour — but that is a reading of the numbers,
+//    not a rule the code encodes. DeepInfra publishes its rates publicly at
 //    /v1/openai/models, so the extension refetches them each session instead of
 //    trusting a hardcoded number.
 //

@@ -98,11 +98,11 @@ export interface ModelRef {
 export const DEEPSEEK_FLASH: ModelRef = { provider: "deepseek", id: "deepseek-flash" };
 
 /**
- * Same checkpoint (DeepSeek-V4.1-Flash-1017) resold by DeepInfra. Flat pricing,
- * so it is the better deal whenever DeepSeek is at peak: $0.20/$0.60 vs
- * $0.30/$1.20 per 1M input/output — 13% cheaper than DeepSeek's peak card on
- * this machine's mix even at list price, and 57% cheaper with the 2026-11-01
- * promo. Off-peak is the other way round: list price costs 74% more.
+ * Same checkpoint (DeepSeek-V4.1-Flash-1017) resold by DeepInfra at a flat
+ * rate. Which tier it wins is not declared anywhere — `cheaperOnMyMix` decides
+ * it per request. On the 2026-11-01 cards its list price is 13% cheaper than
+ * DeepSeek's peak card on this machine's mix and 74% dearer than the off-peak
+ * one; the 51% promo is 57% cheaper than peak and 15% cheaper than off-peak.
  */
 export const DEEPINFRA_FLASH: ModelRef = {
   provider: "deepinfra",
