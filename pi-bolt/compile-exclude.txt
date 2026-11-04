@@ -20,3 +20,8 @@
 # The await is deliberate upstream (the i18n SDK is an optional peer), so there is
 # nothing to wait for. Loading it from its files instead costs ~11 ms.
 juicesharp-rpiv-ask-user-question
+
+# The file shim and linked multi-file directory appear as two compile targets.
+# Load this extension from its files until bundling both targets is verified.
+fast-search
+fast-search-global

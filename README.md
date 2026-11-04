@@ -144,6 +144,15 @@ Every step prints a SKIP instead of failing the install; `PI_CONFIG_SKIP_PIBOLT=
 leaves Pi-Bolt out entirely. `pi-real` (or `PI_REAL=1 pi`) still reaches the stock
 launcher, and `pi-bolt/pi-swap.sh remove` reverts the swap.
 
+The fast-search extension uses `fd` and `rg` behind the existing `find` and
+`grep` tools. `install.sh` installs missing commands with Homebrew (`fd` and
+`ripgrep`) when available; if Homebrew is unavailable or installation fails,
+install them separately and search falls back to native until they are on
+`PATH`. It never installs Homebrew itself; set `PI_CONFIG_SKIP_BREW=1` to
+skip this step. See
+[`fast-search/README.md`](dot-pi/agent/extensions/fast-search/README.md) for
+compatibility limits, tests and rollback.
+
 Re-running it is safe and additive, whether the machine already has pi or ran an
 older version of this script: files it would replace are backed up, machine-owned
 keys (`defaultProvider`, `defaultModel`, `enabledModels`) are never overwritten,

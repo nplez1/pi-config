@@ -24,6 +24,7 @@
 #
 # Env: PI_CONFIG_SKIP_PLUGINS=1  skip submodule fetch + npm install (offline test)
 #      PI_CONFIG_SKIP_PIBOLT=1   skip installing/compiling/swapping Pi-Bolt (offline test)
+#      PI_CONFIG_SKIP_BREW=1     skip installing search tools with Homebrew (offline test)
 #
 set -euo pipefail
 
@@ -291,6 +292,38 @@ if [ "$MODE" = "uninstall" ]; then
   exit 0
 fi
 
+# Search extensions use these commands from PATH, but can fall back without them.
+# Only install missing commands; do not install Homebrew or change shell settings.
+echo "Search tools (fd and ripgrep):"
+if [ "${PI_CONFIG_SKIP_BREW:-0}" = "1" ]; then
+  echo "  skip     PI_CONFIG_SKIP_BREW=1"
+else
+  missing=()
+  command -v fd >/dev/null 2>&1 || missing+=(fd)
+  command -v rg >/dev/null 2>&1 || missing+=(ripgrep)
+  if [ "${#missing[@]}" -eq 0 ]; then
+    echo "  ok       fd and rg are on PATH"
+  elif ! command -v brew >/dev/null 2>&1; then
+    echo "  SKIP     Homebrew not on PATH; install fd and ripgrep manually or set up Homebrew, then run: brew install ${missing[*]}"
+    echo "  note     search falls back to native tools when fd or rg is unavailable"
+  elif [ "$MODE" = "dry-run" ]; then
+    echo "  would    brew install ${missing[*]}"
+  elif HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_UPGRADE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 brew install "${missing[@]}"; then
+    unavailable=()
+    command -v fd >/dev/null 2>&1 || unavailable+=(fd)
+    command -v rg >/dev/null 2>&1 || unavailable+=(rg)
+    if [ "${#unavailable[@]}" -eq 0 ]; then
+      echo "  ok       fd and rg are on PATH"
+    else
+      echo "  SKIP     ${unavailable[*]} still unavailable on PATH; check Homebrew's PATH setup or install the tools manually"
+    fi
+  else
+    echo "  SKIP     Homebrew install failed; retry: brew install ${missing[*]} (or install the tools manually)"
+    echo "  note     search falls back to native tools when fd or rg is unavailable"
+  fi
+fi
+
+echo
 echo "Portable files (symlinked):"
 while IFS=$'\t' read -r rel dst; do link "$rel" "$dst"; done < <(portable_targets)
 
