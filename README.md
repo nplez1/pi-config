@@ -177,6 +177,49 @@ agent), never touches a whole directory that can
 hold untracked user files (e.g. `~/.pi/agent/extensions`, which also has Orca
 extensions not in this repo), and supports `--dry-run` and `uninstall`.
 
+## GitHub Copilot Fusion Standard
+
+`extensions/copilot-fusion.ts` adds **`copilot-fusion/standard`**. Select it in
+`/model` or start Pi with `--model copilot-fusion/standard`; keep your existing
+`github-copilot` login. Pi runs its own tools and streams the model GitHub
+selects, with the Fusion routing token passed only in that request's headers.
+The token is kept in memory, never saved in Pi's session or model catalog.
+
+If `enabledModels` is configured, add `copilot-fusion/standard` to that
+machine-owned list. The physical `github-copilot` models Fusion may select must
+also be in the active scope. A missing, disabled, or unsupported selected model
+fails explicitly; the extension never substitutes a different model or routes
+through a proxy. The picker entry is available only when GitHub Copilot is
+configured; it reuses Pi's Copilot credentials rather than storing another login.
+
+GitHub currently advertises a [30% Fusion discount for paid plans through
+November 30, 2026](https://docs.github.com/copilot/concepts/models/copilot-fusion).
+Actual billing is determined by GitHub and account policy. Pi's displayed dollar
+estimate is not a Copilot AI-credit receipt; check GitHub's usage and billing.
+The extension uses GitHub's client routing protocol, which may change. It exposes
+Standard only; High and Max require multi-model orchestration and are not
+implemented here. Before the first Fusion response, Pi may display the previous
+model's window or a conservative scope-based hint; afterward it displays the
+selected physical model's total context window. GitHub may enforce a smaller
+prompt-input limit, which is used for compaction when supplied by the router.
+The selected model's output limit is used for requests.
+
+Pi can check compaction before Fusion selects a model. The extension cancels
+those pre-route checks, then Pi performs **automatic threshold and overflow
+compaction** against the chosen model. This avoids shrinking context based on a
+previous or merely possible model. The `pi-smart-compaction` plugin skips its
+idle-resume compaction for Fusion because that runs before routing; explicit
+`/compact` and `/smart-compaction force` remain available.
+
+Run the isolated tests with:
+
+```sh
+bun test dot-pi/agent/extensions/shared/copilot-fusion-*.test.ts
+python3 tests/fusion_auth_test.py
+python3 tests/fusion_compaction_test.py
+(cd plugins/pi-smart-compaction && npm test)
+```
+
 ## DeepSeek peak/off-peak routing
 
 DeepSeek bills two tiers by wall clock (peak = 2x off-peak: 01:00-04:00 and
