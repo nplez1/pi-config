@@ -1,0 +1,239 @@
+import type { ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
+
+import { continuationPrompt } from "./prompts.ts";
+import { goalDeliveryDetails, type GoalDeliveries } from "./goal-delivery.ts";
+import { reconstructGoal } from "./state.ts";
+import {
+  recoveryPhaseBlocksContinuation,
+  type GoalRecoveryMachineState,
+} from "./recovery-machine.ts";
+import { isRecoveryPendingAttention } from "./recovery.ts";
+import { CONTINUATION_RETRY_MS } from "./runtime-config.ts";
+import type { StaleQueuedWorkGuard } from "./stale-queued-work-guard.ts";
+import type { ThreadGoal } from "./types.ts";
+
+interface ContinuationSchedulerDeps {
+  deliveries: Pick<GoalDeliveries, "send">;
+  getGoal: () => ThreadGoal | null;
+  getRecoveryState: () => GoalRecoveryMachineState;
+  staleQueuedWorkGuard: StaleQueuedWorkGuard;
+  getCurrentTurnIndex: () => number | null;
+  getAgentRunSequence: () => number;
+}
+
+interface PostCompactContinuationOptions {
+  turnIndex: number | null;
+  agentRunSequence: number;
+  prepareContinuation?: () => boolean;
+}
+
+export function createContinuationScheduler(deps: ContinuationSchedulerDeps) {
+  let continuationQueuedFor: string | null = null;
+  let fullGoalNeededFor: string | null = null;
+  let continuationScheduledFor: string | null = null;
+  let continuationScheduledDelayMs: number | null = null;
+  let continuationTimer: ReturnType<typeof setTimeout> | null = null;
+  let postCompactContinuationTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const clearContinuationTimer = (): void => {
+    if (continuationTimer) {
+      clearTimeout(continuationTimer);
+      continuationTimer = null;
+    }
+    continuationScheduledFor = null;
+    continuationScheduledDelayMs = null;
+  };
+
+  const clearPostCompactContinuationFallback = (): void => {
+    if (!postCompactContinuationTimer) {
+      return;
+    }
+    clearTimeout(postCompactContinuationTimer);
+    postCompactContinuationTimer = null;
+  };
+
+  const clearContinuationState = (): void => {
+    clearContinuationTimer();
+    continuationQueuedFor = null;
+  };
+
+  const clearContinuationStateFor = (goalId: string): void => {
+    if (continuationQueuedFor === goalId) {
+      continuationQueuedFor = null;
+    }
+    if (continuationScheduledFor === goalId) {
+      clearContinuationTimer();
+    }
+  };
+
+  const markContinuationQueued = (goalId: string): void => {
+    continuationQueuedFor = goalId;
+  };
+
+  const requireFullGoal = (): void => {
+    fullGoalNeededFor = deps.getGoal()?.goalId ?? null;
+  };
+
+  const restoreCompactionRefresh = (branch: readonly SessionEntry[]): void => {
+    const compactIndex = branch.findLastIndex((entry) => entry.type === "compaction");
+    fullGoalNeededFor = compactIndex < 0 ? null : reconstructGoal(branch.slice(0, compactIndex)).goal?.goalId ?? null;
+    if (fullGoalNeededFor === null) return;
+    for (const entry of branch.slice(compactIndex + 1)) {
+      if (entry.type !== "custom_message") continue;
+      const details = goalDeliveryDetails({ role: "custom", customType: entry.customType, details: entry.details });
+      if (details?.kind === "continuation" && details.lifecycle === "delivered" &&
+          details.goalId === fullGoalNeededFor && details.objectiveRefresh === true) {
+        fullGoalNeededFor = null;
+        return;
+      }
+    }
+  };
+
+  // Consume at delivery, not enqueue: compaction may occur with a continuation
+  // already queued, and a native retry must not discard the pending refresh.
+  const fullPromptForDelivery = (goalId: string): string | null => {
+    const goal = deps.getGoal();
+    if (fullGoalNeededFor !== goalId || !goal || goal.goalId !== goalId || goal.status !== "active") {
+      return null;
+    }
+    fullGoalNeededFor = null;
+    return continuationPrompt(goal);
+  };
+
+  const hasPendingRecoveryAttention = (): boolean => {
+    const goal = deps.getGoal();
+    return Boolean(goal?.status === "active" && isRecoveryPendingAttention(deps.getRecoveryState().attention));
+  };
+
+  const sendContinuation = (goalToContinue: ThreadGoal): void => {
+    continuationQueuedFor = goalToContinue.goalId;
+    deps.deliveries.send(goalToContinue, "continuation");
+  };
+
+  const canPlanContinuationFor = (goal: ThreadGoal | null): goal is ThreadGoal => {
+    return Boolean(
+      !deps.staleQueuedWorkGuard.isBlockingContinuation() &&
+        goal &&
+        goal.status === "active" &&
+        continuationQueuedFor !== goal.goalId &&
+        !hasPendingRecoveryAttention() &&
+        !recoveryPhaseBlocksContinuation(deps.getRecoveryState().phase),
+    );
+  };
+
+  const scheduleContinuationCheck = (
+    goalId: string,
+    ctx: ExtensionContext,
+    delayMs: number,
+  ): void => {
+    if (continuationTimer && continuationScheduledFor === goalId) {
+      if (continuationScheduledDelayMs !== null && delayMs >= continuationScheduledDelayMs) {
+        return;
+      }
+      clearContinuationTimer();
+    } else if (continuationTimer) {
+      clearContinuationTimer();
+    }
+
+    continuationScheduledFor = goalId;
+    continuationScheduledDelayMs = delayMs;
+    continuationTimer = setTimeout(() => {
+      continuationTimer = null;
+      continuationScheduledFor = null;
+      continuationScheduledDelayMs = null;
+      maybeContinue(ctx);
+    }, delayMs);
+    continuationTimer.unref?.();
+  };
+
+  const maybeContinue = (ctx: ExtensionContext, duringAgentEnd = false): void => {
+    const goal = deps.getGoal();
+    if (!canPlanContinuationFor(goal)) {
+      return;
+    }
+
+    const goalId = goal.goalId;
+    if ((!duringAgentEnd && !ctx.isIdle()) || ctx.hasPendingMessages()) {
+      scheduleContinuationCheck(goalId, ctx, CONTINUATION_RETRY_MS);
+      return;
+    }
+
+    clearContinuationTimer();
+    const currentGoal = deps.getGoal();
+    if (!currentGoal || currentGoal.status !== "active" || currentGoal.goalId !== goalId) {
+      return;
+    }
+    sendContinuation(currentGoal);
+  };
+
+  const maybeContinueAfterCurrentEvent = (ctx: ExtensionContext): void => {
+    const goal = deps.getGoal();
+    if (!canPlanContinuationFor(goal)) {
+      return;
+    }
+    scheduleContinuationCheck(goal.goalId, ctx, 0);
+  };
+
+  const canSchedulePostCompactFallbackFor = (goal: ThreadGoal | null, prepareContinuation?: () => boolean): goal is ThreadGoal => {
+    return Boolean(
+      !deps.staleQueuedWorkGuard.isBlockingContinuation() &&
+        goal &&
+        goal.status === "active" &&
+        continuationQueuedFor !== goal.goalId &&
+        !hasPendingRecoveryAttention() &&
+        (prepareContinuation || !recoveryPhaseBlocksContinuation(deps.getRecoveryState().phase)),
+    );
+  };
+
+  const maybeContinueAfterPostCompactFallback = (
+    ctx: ExtensionContext,
+    options: PostCompactContinuationOptions,
+  ): void => {
+    clearPostCompactContinuationFallback();
+    const goal = deps.getGoal();
+    if (!canSchedulePostCompactFallbackFor(goal, options.prepareContinuation)) {
+      return;
+    }
+
+    const goalId = goal.goalId;
+    const runFallback = (): void => {
+      postCompactContinuationTimer = null;
+      const currentGoal = deps.getGoal();
+      if (!currentGoal || currentGoal.status !== "active" || currentGoal.goalId !== goalId) {
+        return;
+      }
+      if (deps.getCurrentTurnIndex() !== options.turnIndex) {
+        return;
+      }
+      if (deps.getAgentRunSequence() !== options.agentRunSequence) {
+        return;
+      }
+      if (!ctx.isIdle() || ctx.hasPendingMessages()) {
+        postCompactContinuationTimer = setTimeout(runFallback, CONTINUATION_RETRY_MS);
+        postCompactContinuationTimer.unref?.();
+        return;
+      }
+      if (options.prepareContinuation && !options.prepareContinuation()) {
+        return;
+      }
+      maybeContinue(ctx);
+    };
+
+    postCompactContinuationTimer = setTimeout(runFallback, CONTINUATION_RETRY_MS);
+    postCompactContinuationTimer.unref?.();
+  };
+
+  return {
+    clearContinuationState,
+    clearContinuationStateFor,
+    clearContinuationTimer,
+    clearPostCompactContinuationFallback,
+    markContinuationQueued,
+    requireFullGoal,
+    restoreCompactionRefresh,
+    fullPromptForDelivery,
+    maybeContinue,
+    maybeContinueAfterCurrentEvent,
+    maybeContinueAfterPostCompactFallback,
+  };
+}

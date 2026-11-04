@@ -348,7 +348,22 @@ const seed = JSON.parse(fs.readFileSync(seedPath, "utf8"));
 // What capture strips: this machine's account choices, never synced in.
 const machineOwned = new Set(["defaultProvider", "defaultModel", "enabledModels", "lastChangelogVersion"]);
 const changes = [];
-const pkgName = (entry) => entry.replace(/^-/, "").replace(/@[^/@]+$/, "");
+const sourceOf = (entry) => typeof entry === "string" ? entry : entry?.source;
+const pkgName = (entry) => (sourceOf(entry) ?? "").replace(/^-/, "").replace(/@[^/@]+$/, "");
+// Replace the npm goal package with the repo's versioned local copy. Preserve
+// object-form resource filters, and never load both copies of the extension.
+if (Array.isArray(live.packages) && (seed.packages ?? []).some((e) => sourceOf(e) === "plugins/pi-codex-goal")) {
+  const localGoal = "plugins/pi-codex-goal";
+  let hasLocalGoal = live.packages.some((e) => sourceOf(e) === localGoal);
+  live.packages = live.packages.flatMap((entry) => {
+    const source = sourceOf(entry);
+    if (!/^npm:pi-codex-goal(?:@[^/]+)?$/.test(source ?? "")) return [entry];
+    changes.push(`packages: ${source} -> ${localGoal}`);
+    if (hasLocalGoal) return [];
+    hasLocalGoal = true;
+    return [typeof entry === "string" ? localGoal : { ...entry, source: localGoal }];
+  });
+}
 for (const key of Object.keys(seed)) {
   if (machineOwned.has(key)) continue;
   if (key === "packages") {

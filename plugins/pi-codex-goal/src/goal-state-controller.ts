@@ -1,0 +1,227 @@
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+
+import type { GoalPersistence } from "./goal-persistence.ts";
+import type { StatusContext } from "./goal-runtime-status.ts";
+import {
+  applyGoalTransitionEffects,
+  planGoalTransition,
+  reloadGoalRuntimeEffects,
+  type GoalTransitionEffectHandlers,
+  type GoalTransitionRequest,
+} from "./goal-transition.ts";
+import {
+  applyHostOverflowUserResetPersistence,
+  beginHostOverflowRecovery,
+  requireHostOverflowUserReset,
+  setRecoveryPausedAttention,
+  syncHostOverflowUserResetFromSession,
+  type GoalRecoveryMachineState,
+} from "./recovery-machine.ts";
+import {
+  goalsEquivalent,
+  hostOverflowCapResetEntry,
+  reconstructGoal,
+  reconstructHostOverflowCapNeedsUserReset,
+  updateGoalStatus,
+} from "./state.ts";
+import { CUSTOM_ENTRY_TYPE, type GoalEntrySource, type GoalResult, type ThreadGoal } from "./types.ts";
+
+interface GoalStateControllerDeps {
+  pi: Pick<ExtensionAPI, "appendEntry">;
+  persistence: GoalPersistence;
+  getRecoveryState: () => GoalRecoveryMachineState;
+  transitionEffectHandlers: GoalTransitionEffectHandlers;
+  refreshUi: (ctx: StatusContext) => void;
+  invalidateDeliveries: () => void;
+}
+
+export interface GoalStateController {
+  applyGoalTransition: (
+    request: GoalTransitionRequest,
+    ctx: StatusContext | null,
+  ) => boolean;
+  beginOverflowRecovery: (ctx: StatusContext, needsUserReset?: boolean) => void;
+  updateGoal: (source: GoalEntrySource, ctx: ExtensionContext, status: "complete" | "blocked" | "waiting", reason?: string) => GoalResult;
+  flushGoalPersistence: GoalPersistence["flushGoalPersistence"];
+  getGoal: () => ThreadGoal | null;
+  isCurrentActiveGoalId: (goalId: string) => boolean;
+  maybeFlushRuntimePersistence: GoalPersistence["maybeFlushRuntimePersistence"];
+  pauseForAbort: (ctx: ExtensionContext) => void;
+  pauseForRecovery: (ctx: StatusContext, recoveryReason: string) => void;
+  persistHostOverflowUserReset: (needsReset: boolean) => void;
+  reloadFromSession: (ctx: ExtensionContext) => void;
+  resumePausedGoal: (ctx: StatusContext) => void;
+  resumeWaitingGoal: (ctx: StatusContext) => boolean;
+}
+
+export function createGoalStateController(deps: GoalStateControllerDeps) {
+  const getGoal = (): ThreadGoal | null => deps.persistence.getGoal();
+
+  const isCurrentActiveGoalId = (goalId: string): boolean => {
+    const goal = getGoal();
+    return goal?.goalId === goalId && goal.status === "active";
+  };
+
+  const applyGoalTransition = (
+    request: GoalTransitionRequest,
+    ctx: StatusContext | null,
+  ): boolean => {
+    const previous = getGoal();
+    const plan = planGoalTransition(previous, request);
+    if (plan.persist === "clear" ||
+        (plan.persist !== "skip" && (previous?.goalId !== plan.nextGoal?.goalId || previous?.status !== plan.nextGoal?.status))) {
+      deps.invalidateDeliveries();
+    }
+
+    applyGoalTransitionEffects(plan.beforePersist, deps.transitionEffectHandlers);
+
+    if (plan.persist === "clear") {
+      const clearedGoalId = getGoal()?.goalId ?? null;
+      deps.persistence.appendClearEntry(clearedGoalId, plan.source);
+      applyGoalTransitionEffects(plan.afterPersist, deps.transitionEffectHandlers);
+      if (ctx) {
+        deps.refreshUi(ctx);
+      }
+      return true;
+    }
+
+    if (plan.persist === "skip") {
+      applyGoalTransitionEffects(plan.afterPersist, deps.transitionEffectHandlers);
+      if (ctx) {
+        deps.refreshUi(ctx);
+      }
+      return false;
+    }
+
+    if (plan.persist === "defer") {
+      deps.persistence.setGoalSnapshot(plan.nextGoal);
+      if (ctx) {
+        deps.refreshUi(ctx);
+      }
+      return false;
+    }
+
+    deps.persistence.setGoalSnapshot(plan.nextGoal);
+    const persisted = deps.persistence.flushGoalPersistence(plan.source);
+    applyGoalTransitionEffects(plan.afterPersist, deps.transitionEffectHandlers);
+    if (ctx) {
+      deps.refreshUi(ctx);
+    }
+
+    return persisted;
+  };
+
+  const persistHostOverflowUserReset = (needsReset: boolean): void => {
+    if (!applyHostOverflowUserResetPersistence(deps.getRecoveryState(), needsReset)) {
+      return;
+    }
+    deps.pi.appendEntry(CUSTOM_ENTRY_TYPE, hostOverflowCapResetEntry(needsReset));
+  };
+
+  const beginOverflowRecovery = (ctx: StatusContext, needsUserReset = true): void => {
+    const goal = getGoal();
+    const hasActiveGoal = Boolean(goal && goal.status === "active");
+    let shouldPersist: boolean;
+
+    if (hasActiveGoal) {
+      applyGoalTransitionEffects([{ type: "clearContinuation" }], deps.transitionEffectHandlers);
+      const { persistHostOverflowCapReset } = beginHostOverflowRecovery(deps.getRecoveryState(), needsUserReset);
+      shouldPersist = persistHostOverflowCapReset;
+      deps.refreshUi(ctx);
+    } else {
+      shouldPersist = needsUserReset ? requireHostOverflowUserReset(deps.getRecoveryState()) :
+        applyHostOverflowUserResetPersistence(deps.getRecoveryState(), false);
+    }
+
+    if (shouldPersist) {
+      deps.pi.appendEntry(CUSTOM_ENTRY_TYPE, hostOverflowCapResetEntry(needsUserReset));
+    }
+  };
+
+  const reloadFromSession = (ctx: ExtensionContext): void => {
+    deps.invalidateDeliveries();
+    const previousGoalId = getGoal()?.goalId ?? null;
+    const branch = ctx.sessionManager.getBranch();
+    const reconstructed = reconstructGoal(branch).goal;
+    deps.persistence.setGoalSnapshot(reconstructed);
+    deps.persistence.syncPersistedSnapshot(reconstructed);
+    syncHostOverflowUserResetFromSession(
+      deps.getRecoveryState(),
+      reconstructHostOverflowCapNeedsUserReset(branch),
+    );
+    applyGoalTransitionEffects(
+      reloadGoalRuntimeEffects(previousGoalId, reconstructed),
+      deps.transitionEffectHandlers,
+    );
+    deps.refreshUi(ctx);
+  };
+
+  const pauseForAbort = (ctx: ExtensionContext): void => {
+    const goal = getGoal();
+    if (!goal || goal.status !== "active") {
+      return;
+    }
+
+    applyGoalTransition({ kind: "abort_pause" }, ctx);
+  };
+
+  const pauseForRecovery = (ctx: StatusContext, recoveryReason: string): void => {
+    const goal = getGoal();
+    if (goal?.status === "paused") {
+      setRecoveryPausedAttention(deps.getRecoveryState(), recoveryReason);
+      deps.refreshUi(ctx);
+      return;
+    }
+    if (!goal || goal.status !== "active") {
+      return;
+    }
+
+    applyGoalTransition({ kind: "recovery_pause", recoveryReason }, ctx);
+  };
+
+  const resumePausedGoal = (ctx: StatusContext): void => {
+    const goal = getGoal();
+    if (!goal || goal.status !== "paused") {
+      return;
+    }
+
+    applyGoalTransition({ kind: "resume_active" }, ctx);
+  };
+
+  const resumeWaitingGoal = (ctx: StatusContext): boolean => {
+    if (getGoal()?.status !== "waiting") return false;
+    applyGoalTransition({ kind: "resume_waiting" }, ctx);
+    return true;
+  };
+
+  const updateGoal = (source: GoalEntrySource, ctx: ExtensionContext, status: "complete" | "blocked" | "waiting", reason?: string): GoalResult => {
+    const goal = getGoal();
+    const result = updateGoalStatus(goal, status, reason);
+    if (!result.ok || !result.goal) {
+      return result;
+    }
+    if (goal && goalsEquivalent(goal, result.goal)) {
+      return result;
+    }
+    applyGoalTransition({ kind: "set", nextGoal: result.goal, source }, ctx);
+    return result;
+  };
+
+  const controller: GoalStateController = {
+    applyGoalTransition,
+    beginOverflowRecovery,
+    updateGoal,
+    flushGoalPersistence: deps.persistence.flushGoalPersistence,
+    getGoal,
+    isCurrentActiveGoalId,
+    maybeFlushRuntimePersistence: deps.persistence.maybeFlushRuntimePersistence,
+    pauseForAbort,
+    pauseForRecovery,
+    persistHostOverflowUserReset,
+    reloadFromSession,
+    resumePausedGoal,
+    resumeWaitingGoal,
+  };
+
+  return controller;
+}

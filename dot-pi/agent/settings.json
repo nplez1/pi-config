@@ -8,7 +8,7 @@
     "plugins/pi-subagents",
     "plugins/pi-advisor-subagent",
     "npm:pi-web-access",
-    "npm:pi-codex-goal",
+    "plugins/pi-codex-goal",
     "npm:pi-mimo-provider",
     "plugins/pi-todo",
     "plugins/pi-smart-compaction",

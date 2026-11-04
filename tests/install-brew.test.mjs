@@ -132,6 +132,41 @@ test('offline brew skip prevents installation', t => {
   assert.deepEqual(f.calls(), []);
 });
 
+test('migrates the goal package while preserving filters and machine settings', t => {
+  const f = fixture(t, { fd: true, rg: true });
+  const seed = path.join(f.repo, 'dot-pi/agent/settings.json');
+  const live = path.join(f.home, '.pi/agent/settings.json');
+  fs.writeFileSync(seed, JSON.stringify({ packages: ['plugins/pi-codex-goal', 'npm:new-package'] }));
+  fs.mkdirSync(path.dirname(live), { recursive: true });
+  const original = { defaultModel: 'local-model', packages: [
+    { source: 'npm:pi-codex-goal@0.7.7', prompts: [] },
+    { source: 'npm:existing', extensions: [] },
+  ] };
+  fs.writeFileSync(live, JSON.stringify(original));
+  assert.match(f.run('--dry-run'), /npm:pi-codex-goal@0\.7\.7 -> plugins\/pi-codex-goal/);
+  assert.deepEqual(JSON.parse(fs.readFileSync(live)), original);
+  f.run();
+  const result = JSON.parse(fs.readFileSync(live));
+  assert.equal(result.defaultModel, 'local-model');
+  assert.deepEqual(result.packages, [
+    { source: 'plugins/pi-codex-goal', prompts: [] },
+    { source: 'npm:existing', extensions: [] },
+    'npm:new-package',
+  ]);
+  f.run();
+  assert.deepEqual(JSON.parse(fs.readFileSync(live)), result);
+});
+
+test('removes an old npm goal entry when the local package already exists', t => {
+  const f = fixture(t, { fd: true, rg: true });
+  fs.writeFileSync(path.join(f.repo, 'dot-pi/agent/settings.json'), JSON.stringify({ packages: ['plugins/pi-codex-goal'] }));
+  const live = path.join(f.home, '.pi/agent/settings.json');
+  fs.mkdirSync(path.dirname(live), { recursive: true });
+  fs.writeFileSync(live, JSON.stringify({ packages: ['npm:pi-codex-goal', 'plugins/pi-codex-goal'] }));
+  f.run();
+  assert.deepEqual(JSON.parse(fs.readFileSync(live)).packages, ['plugins/pi-codex-goal']);
+});
+
 test('capture and uninstall never invoke brew, even with missing commands', t => {
   const f = fixture(t);
   assert.match(f.run('capture'), /Publishing shared settings/);

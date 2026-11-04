@@ -123,7 +123,11 @@ pi-bolt/                          -> ~/.pi/agent/pi-bolt-bundles
 
 `settings.json` refers to the forks as `plugins/<name>`, which pi resolves
 relative to `~/.pi/agent`; the `~/.pi/agent/plugins` symlink makes that path
-clone-location-independent.
+clone-location-independent. `plugins/pi-codex-goal` is a vendored upstream
+release with a one-row goal footer; see its [customization notes](plugins/pi-codex-goal/PI-CONFIG.md).
+The installer replaces the old npm package entry on existing machines, preserving
+its resource filters. Restart Pi or run `/reload` after installing; a Pi-Bolt
+recompile can restore compiled-extension startup speed.
 
 ## Install on another machine
 
