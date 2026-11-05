@@ -70,6 +70,11 @@ async function route(h: ReturnType<typeof harness>, text: string, reason = "user
 }
 
 describe("Copilot Fusion Pi provider", () => {
+  test("registers the virtual model under the short Fusion/Standard name", () => {
+    const h = harness();
+    expect((h.getVirtual() as unknown as { name?: string }).name).toBe("Fusion/Standard");
+  });
+
   test("availability follows Copilot configuration rather than the wrapper marker", async () => {
     const h = harness();
     const missing = { ctx: { env: async () => undefined } };

@@ -168,7 +168,7 @@ export default function (pi: ExtensionAPI) {
 
   function registerVirtual(contextWindow: number) {
     pi.registerVirtualModel({
-      provider: PROVIDER, id: MODEL, name: "Copilot Fusion Standard",
+      provider: PROVIDER, id: MODEL, name: "Fusion/Standard",
       input: ["text", "image"], contextWindow, maxTokens: 4096,
       async route(request, ctx) {
         const sessionId = ctx.sessionManager.getSessionId();

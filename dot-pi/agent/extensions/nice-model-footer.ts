@@ -280,6 +280,18 @@ export default function (pi: ExtensionAPI) {
 								? `${modelName} • thinking off`
 								: `${modelName} • ${thinkingLevel}`;
 					}
+					// A virtual model routes each request; show where the latest response
+					// went, e.g. "Fusion/Standard → GPT-6 Luna". The transcript records
+					// the physical model on each assistant message.
+					if (ctx.model?.api === "pi-virtual") {
+						const latest = ctx.sessionManager
+							.getBranch()
+							.findLast((entry) => entry.type === "message" && entry.message.role === "assistant");
+						if (latest?.type === "message" && latest.message.role === "assistant") {
+							const physical = ctx.modelRegistry.find(latest.message.provider, latest.message.model);
+							rightSideWithoutProvider += ` → ${physical?.name ?? latest.message.model}`;
+						}
+					}
 					let rightSide = rightSideWithoutProvider;
 					if (footerData.getAvailableProviderCount() > 1 && ctx.model) {
 						rightSide = `(${ctx.model.provider}) ${rightSideWithoutProvider}`;

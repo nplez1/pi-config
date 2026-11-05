@@ -183,7 +183,10 @@ extensions not in this repo), and supports `--dry-run` and `uninstall`.
 `/model` or start Pi with `--model copilot-fusion/standard`; keep your existing
 `github-copilot` login. Pi runs its own tools and streams the model GitHub
 selects, with the Fusion routing token passed only in that request's headers.
-The token is kept in memory, never saved in Pi's session or model catalog.
+The token is kept in memory, never saved in Pi's session or model catalog. The
+picker shows the selection as `Fusion/Standard`, and the footer's model segment
+shows where the latest response was routed, e.g. `(copilot-fusion)
+Fusion/Standard → GPT-6 Luna`.
 
 If `enabledModels` is configured, add `copilot-fusion/standard` to that
 machine-owned list. The physical `github-copilot` models Fusion may select must
@@ -217,6 +220,7 @@ Run the isolated tests with:
 bun test dot-pi/agent/extensions/shared/copilot-fusion-*.test.ts
 python3 tests/fusion_auth_test.py
 python3 tests/fusion_compaction_test.py
+node --test tests/nice-model-footer.test.mjs
 (cd plugins/pi-smart-compaction && npm test)
 ```
 

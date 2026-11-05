@@ -9,12 +9,10 @@
   machine configured no preference: when the spawn carries no explicit model
   request, inherit the session model — that is the configured answer. When I *did*
   ask for that shorthand, a `null` role is not an answer: say the role is unset on
-  this machine and ask me which model to use. Do not inherit silently and do not
-  substitute.
+  this machine and ask me which model to use.
 - Shorthand → role: **Explore**/**Fast** → `exploration` (`thinking: "medium"` for agents; `effort: "medium"` for workflows), **Deep**/**Pro** → `heavy`, **Opus** → `opus`, **Sonnet** → `sonnet`. The last two name the Claude Code CLI backend on the seeding machine (`claude/opus`, `claude/sonnet`); a machine without that CLI retargets them in its own file.
-- Treat every one of those names as shorthand, not a model ID. Always pass the
-  explicit provider/model ID the roles file gives; an agent type's default model
-  does not satisfy this request.
+- Those names are shorthand, not model IDs. Pass the explicit provider/model
+  ID from the roles file; an agent type's default does not satisfy the request.
 - **Precedence:** an explicit model request in my prompt beats an agent type's
   configured default (`agentOverrides` in `subagents.json`), so "Explore/Fast"
   means the roles file's `exploration` ID even when that default is something
