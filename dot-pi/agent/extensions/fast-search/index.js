@@ -5,7 +5,7 @@ export default pi=>{
   if(process.env.PI_FAST_SEARCH_BACKEND==='native')return;
   const active=new Set(pi.getActiveTools()),all=pi.getAllTools();
   if(!['find','grep'].some(name=>active.has(name)&&all.find(x=>x.name===name)?.sourceInfo?.source==='builtin'))return;
-  // The compatibility rules mirror Pi 1.4.0's native search semantics.
+  // The compatibility rules mirror the reviewed Pi 1.4.0 and 1.5.0 native search semantics.
   if(!await supportedRuntime()){
    try{ctx.ui?.notify?.('Fast search: unsupported Pi search version; retaining original built-in tools.','warning')}catch{}
    return;

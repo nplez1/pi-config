@@ -1,11 +1,11 @@
-// Compatibility primitives for Pi-Bolt's native find/grep walker (1.4).
+// Compatibility primitives for Pi-Bolt's native find/grep walker (Pi 1.4 and 1.5).
 // This module intentionally has no Pi, TypeBox, or executable dependencies.
 import { constants as fsConstants, closeSync, existsSync, fstatSync, openSync, readSync, statSync } from "node:fs";
 import { readdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 
-export const NATIVE_COMPAT_VERSION = "1.4.0";
+export const NATIVE_COMPAT_VERSIONS = Object.freeze(["1.4.0", "1.5.0"]);
 export const MAX_RULE_FILE_BYTES = 4 * 1024 * 1024;
 const MAX_BRACE_EXPANSIONS = 1024;
 const MAX_BRACE_DEPTH = 256;
@@ -21,8 +21,8 @@ export class CannotProveParityError extends Error {
 
 /** Require callers that know the installed native version to gate this helper. */
 export function assertNativeVersion(version) {
-  if (version !== NATIVE_COMPAT_VERSION) {
-    throw new CannotProveParityError(`supported Pi-Bolt native version is exactly ${NATIVE_COMPAT_VERSION}; got ${String(version)}`);
+  if (!NATIVE_COMPAT_VERSIONS.includes(version)) {
+    throw new CannotProveParityError(`supported Pi native versions are ${NATIVE_COMPAT_VERSIONS.join(", ")}; got ${String(version)}`);
   }
   return true;
 }

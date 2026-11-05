@@ -18,7 +18,7 @@ export default pi=>pi.on('session_start',async(_event,ctx)=>{
    ['count/a.txt','needle\n'],['count/b.txt','needle\n'],['count/c.txt','needle\n'],['1 results limit reached.txt','needle\n']]) await put(name,text);
   await put('.gitignore','ignored/\n*.tmp\n!keep.tmp\n');await put('.ignore','skipthis.txt\n');await put('.fdignore','fd-only.txt\n');await put('.rgignore','rg-only.txt\n');await put('.git/info/exclude','excluded.txt\n');
   await mkdir(path.join(root,'nested-repo','.git'),{recursive:true});await put('nested-repo/.gitignore','nested-ignore.txt\n');await put('nested-repo/nested-ignore.txt','needle\n');await put('nested-repo/fd-only.txt','needle\n');await put('nested-repo/global-secret.txt','globalneedle\n');
-  await put('onlyignored/.gitignore','secret.txt\n');await put('onlyignored/secret.txt','private-needle\n');await put('onlyignored/public.txt','ordinary\n');await put('onlyignored/context.txt','before\ncontextneedle\nmiddle\ncontextneedle\nafter\n');await put('onlyignored/weird\\slash.txt','backslashneedle\n');await put('onlyignored/..weird/match.txt','dotdotneedle\n');await put('onlyignored/long-content.txt','x'.repeat(700)+'needlelong\n');await put('onlyignored/a\u00a0b.txt','unicodeneedle\n');await put('onlyignored/a b.txt','ordinary\n');
+  await put('onlyignored/.gitignore','secret.txt\n');await put('onlyignored/secret.txt','private-needle\n');await put('onlyignored/public.txt','ordinary\n');await put('onlyignored/context.txt','before\ncontextneedle\nmiddle\ncontextneedle\nafter\n');await put('onlyignored/lone-cr.txt','before\rstill-before\ncrneedle\nafter\rstill-after\n');await put('onlyignored/weird\\slash.txt','backslashneedle\n');await put('onlyignored/..weird/match.txt','dotdotneedle\n');await put('onlyignored/long-content.txt','x'.repeat(700)+'needlelong\n');await put('onlyignored/a\u00a0b.txt','unicodeneedle\n');await put('onlyignored/a b.txt','ordinary\n');
   await symlink('visible',path.join(root,'link-visible'));await symlink('lower.txt',path.join(root,'link-file.txt'));
   await mkdir(path.join(root,'bulk'));for(let batch=0;batch<8;batch++)await Promise.all(Array.from({length:100},(_,i)=>put(`bulk/bigfile-${String(batch*100+i).padStart(4,'0')}-${'x'.repeat(80)}.dat`)));
   for(let batch=0;batch<2;batch++)await Promise.all(Array.from({length:70},(_,i)=>put(`grepbulk/nested/data-${batch*70+i}.dat`,'bulkneedle '+ 'x'.repeat(440)+'\n')));
@@ -60,6 +60,7 @@ export default pi=>pi.on('session_start',async(_event,ctx)=>{
    {path:path.join(root,'onlyignored'),pattern:'\\bcontextneedle\\b',limit:100},
    {path:path.join(root,'onlyignored'),pattern:'contextneedle',literal:true,glob:'*.txt',context:1,limit:100},
    {path:path.join(root,'onlyignored'),pattern:'contextneedle',literal:true,glob:'*.txt',context:2,limit:100},
+   {path:path.join(root,'onlyignored'),pattern:'crneedle',literal:true,glob:'*.txt',context:1,limit:100},
    {path:path.join(root,'onlyignored'),pattern:'private-needle|contextneedle',glob:'*.txt',context:1,limit:100},
    {path:path.join(root,'onlyignored'),pattern:'private-needle|contextneedle',glob:'*.{txt,md}',context:1,limit:100},
    {path:path.join(root,'onlyignored'),pattern:'backslashneedle',literal:true,glob:'*.txt',limit:100},
@@ -73,7 +74,8 @@ export default pi=>pi.on('session_start',async(_event,ctx)=>{
   const out=[];for(const [kind,cases,baseTool,fastTool,raceTool] of [['find',fc,nativeFind,fastFind,raceFind],['grep',gc,nativeGrep,fastGrep,raceGrep]]){
    for(const args of cases){const before=performance.now(),native=await comparable(baseTool,args);decisions.length=0;const external=await comparable(fastTool,args);
     const eligibleRoots=[path.join(root,'onlyignored'),`~/${path.relative(process.env.HOME,path.join(root,'onlyignored'))}`,`@${path.join(root,'onlyignored')}`];
-    const expectBackend=kind==='grep'&&eligibleRoots.includes(args.path)&&(['contextneedle','.*contextneedle','\\bcontextneedle\\b'].includes(args.pattern))&&[undefined,'','!*.txt'].includes(args.glob)?'rg':undefined;
+    const expectBackend=kind==='grep'&&eligibleRoots.includes(args.path)&&(['contextneedle','.*contextneedle','\\bcontextneedle\\b'].includes(args.pattern))&&[undefined,'','!*.txt'].includes(args.glob)?'rg':
+     kind==='grep'&&args.pattern==='crneedle'?'rg':undefined;
     out.push({kind,args,mode:'forced',native,external,decision:decisions.at(-1),expectBackend,equal:JSON.stringify(native)===JSON.stringify(external),elapsedMs:Math.round(performance.now()-before)});
     decisions.length=0;const raced=await comparable(raceTool,args);
     out.push({kind,args,mode:'race',native,external:raced,decision:decisions.at(-1),equal:JSON.stringify(native)===JSON.stringify(raced)});

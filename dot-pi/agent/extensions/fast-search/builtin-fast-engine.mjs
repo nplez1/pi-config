@@ -1,4 +1,4 @@
-// Same-contract Pi-Bolt 1.4 search backend.
+// Same-contract Pi-Bolt search backend for Pi 1.4 and 1.5.
 // fd/rg only generate conservative candidates; native Pi formats results and
 // handles cases we cannot prove compatible. No shell command is rewritten.
 import { createFindToolDefinition,createGrepToolDefinition,DEFAULT_MAX_BYTES,truncateHead,formatSize,VERSION } from '@earendil-works/pi-coding-agent';
@@ -7,8 +7,8 @@ import {createNativeFilter,createNativeFindMatcher,nativeGrepGlobFilter,CannotPr
 import {collectFdCandidates,collectRgCandidateFiles,mandatoryGrepLiterals,resolveExecutable,NativeFallback} from './builtin-fast-candidates.mjs';
 import {raceSearch} from './builtin-race.mjs';
 
-// The ignore and glob compatibility code mirrors Pi 1.4.0's native walker;
-// other versions remain native until their behavior is verified.
+// The ignore and glob compatibility code mirrors the native walker shared by
+// Pi-Bolt's Pi 1.4.0 and 1.5.0 builds; other versions remain native until verified.
 function searchExecutable(name){
  const found=resolveExecutable(name);if(!found)throw new NativeFallback(`${name} unavailable`);
  return found;

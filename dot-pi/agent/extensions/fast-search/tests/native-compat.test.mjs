@@ -10,7 +10,7 @@ import {
   createNativeFilter,
   MAX_RULE_FILE_BYTES,
   nativeGlobMatches,
-  NATIVE_COMPAT_VERSION,
+  NATIVE_COMPAT_VERSIONS,
 } from "../builtin-native-compat.mjs";
 
 const roots = [];
@@ -56,9 +56,11 @@ test("nativeGlobMatches preserves native basename, prefix, anchor, braces and gl
 });
 
 test("assertNativeVersion is an explicit conservative version gate", () => {
-  assert.equal(NATIVE_COMPAT_VERSION, "1.4.0");
+  assert.deepEqual(NATIVE_COMPAT_VERSIONS, ["1.4.0", "1.5.0"]);
   assert.equal(assertNativeVersion("1.4.0"), true);
+  assert.equal(assertNativeVersion("1.5.0"), true);
   assert.throws(() => assertNativeVersion("1.5"), (error) => error instanceof CannotProveParityError && /cannot prove parity/.test(error.message));
+  assert.throws(() => assertNativeVersion("1.5.1"), /cannot prove parity/);
   assert.throws(() => assertNativeVersion(undefined), /cannot prove parity/);
 });
 
