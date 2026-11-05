@@ -74,6 +74,8 @@ const MODEL_ABBREVIATIONS: Record<string, string> = {
 	"fireworks/accounts/fireworks/routers/kimi-latest": "KimiLatest",
 	"fireworks/accounts/fireworks/routers/minimax-latest": "MiniMaxLatest",
 	"fireworks/accounts/fireworks/routers/qwen-max-latest": "QwenMaxLatest",
+	"m5-omlx/Qwen3.8-27B-oQ4e-mtp": "Qwen3.8-27B-oQ4e",
+	"m5-omlx/Qwen3.8-27B_Uncen-oQ4e": "Qwen3.8-27B-UNCEN",
 	"omlx/Qwen3.6-35B-A3B-oQ6-mtp": "Q3.6-35B",
 	"omlx/Qwen3.6-35B-A3B-oQ4-mtp": "Q3.6-35B",
 	"omlx/Qwen3.6-27B-oQ4-fp16-mtp": "Q3.6-27B",
