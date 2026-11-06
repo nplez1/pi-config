@@ -8,8 +8,12 @@
 # half: forgetting to pass `--only` again just rebuilds everything and dies on
 # the first extension the compiler refuses.
 #
-# An entry that is no longer installed is harmless, and so is an entry that is no
-# longer needed — `pi-bolt compile --no-exclude` puts everything back.
+# An entry that is no longer needed is harmless — `pi-bolt compile --no-exclude`
+# puts everything back. An entry naming an extension that is no longer INSTALLED is
+# not: pi-bolt 1.0.9 rejects the whole flag ("no extension is named …", exit 1)
+# and compiles nothing, so a stale name silently stops every later compile —
+# `install.sh` reports it as "SKIP compile failed". Remove a name here when its
+# extension leaves the install, and put it back if it returns.
 
 # 2.15.0 registers its i18n strings at module top level with
 # `await import("@juicesharp/rpiv-i18n/loader")`. Bun's compiler refuses to
@@ -23,5 +27,9 @@ juicesharp-rpiv-ask-user-question
 
 # The file shim and linked multi-file directory appear as two compile targets.
 # Load this extension from its files until bundling both targets is verified.
-fast-search
-fast-search-global
+#
+# fast-search is NOT installed by install.sh, and pi-bolt refuses the whole flag
+# for a name it cannot resolve (see above), so these two lines are kept out until
+# it is installed again — then add them back:
+#   fast-search
+#   fast-search-global
