@@ -37,9 +37,9 @@ function formatCwdForFooter(cwd: string, home?: string): string {
  */
 const MODEL_ABBREVIATIONS: Record<string, string> = {
 	"deepseek/deepseek-flash": "DSv4.1Flash",
-	"deepseek/deepseek-flash-auto": "DSv4.1FlashAuto",
+	"deepseek/deepseek-flash-auto": "Auto",
 	"deepseek/deepseek-v4-pro": "DSv4Pro",
-	"deepinfra/deepseek-ai/DeepSeek-V4.1-Flash-1017": "DSv4.1Flash1017",
+	"deepinfra/deepseek-ai/DeepSeek-V4.1-Flash-1017": "v4.1Flash v1017",
 	"xiaomi/mimo-v2.6-flash": "MiMoV2.6Flash",
 	"xiaomi/mimo-v2.6-pro": "MiMoV2.6Pro",
 	"xiaomi/mimo-v2.6-pro-ultraspeed": "MiMoV2.6ProUltra",
@@ -115,6 +115,30 @@ function footerModelLabel(model: { provider: string; id: string; name?: string }
 	const mapped = MODEL_ABBREVIATIONS[`${model.provider}/${model.id}`];
 	if (mapped) return mapped;
 	return abbreviateModelName(model.name || model.id.split("/").pop() || model.id);
+}
+
+/**
+ * Label for the model a virtual selection actually used, e.g. the arrow in
+ * "(deepseek) Auto • high → v4.1Flash v1017 (DeepInfra)". A curated label wins
+ * over the catalog name, which is long; because it also drops the provider
+ * words, the provider goes back in parentheses so the footer still says which
+ * side answered. Uncurated models keep their full name.
+ */
+function routedModelLabel(
+	registry: { getProviderDisplayName?: (provider: string) => string },
+	physical: { provider: string; id: string; name?: string } | undefined,
+	fallbackId: string,
+): string {
+	if (!physical) return fallbackId;
+	const mapped = MODEL_ABBREVIATIONS[`${physical.provider}/${physical.id}`];
+	if (!mapped) return physical.name ?? fallbackId;
+	let provider: string | undefined;
+	try {
+		provider = registry.getProviderDisplayName?.(physical.provider);
+	} catch {
+		provider = undefined;
+	}
+	return provider ? `${mapped} (${provider})` : mapped;
 }
 
 /**
@@ -291,7 +315,11 @@ export default function (pi: ExtensionAPI) {
 							.findLast((entry) => entry.type === "message" && entry.message.role === "assistant");
 						if (latest?.type === "message" && latest.message.role === "assistant") {
 							const physical = ctx.modelRegistry.find(latest.message.provider, latest.message.model);
-							rightSideWithoutProvider += ` → ${physical?.name ?? latest.message.model}`;
+							rightSideWithoutProvider += ` → ${routedModelLabel(
+								ctx.modelRegistry,
+								physical,
+								latest.message.model,
+							)}`;
 						}
 					}
 					let rightSide = rightSideWithoutProvider;

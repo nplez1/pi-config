@@ -34,7 +34,11 @@ const assistant = (provider, model) => ({
 const FUSION = { provider: 'copilot-fusion', id: 'standard', name: 'Fusion/Standard', api: 'pi-virtual', reasoning: false, contextWindow: 100000 };
 const LUNA = { provider: 'github-copilot', id: 'gpt-6-luna', name: 'GPT-6 Luna', api: 'openai-responses', reasoning: true, contextWindow: 1000000 };
 
-function render({ model, branch = [], providers = 2, width = 200 }) {
+// The deepseek router (deepseek-routing.ts) and the side it can route to.
+const DEEPSEEK_AUTO = { provider: 'deepseek', id: 'deepseek-flash-auto', name: 'Deepseek v4.1 Flash Auto', api: 'pi-virtual', reasoning: true, contextWindow: 1000000 };
+const DEEPINFRA_FLASH = { provider: 'deepinfra', id: 'deepseek-ai/DeepSeek-V4.1-Flash-1017', name: 'Deepseek v4.1 Flash 1017 (DeepInfra)', api: 'openai-completions', reasoning: true, contextWindow: 1000000 };
+
+function render({ model, branch = [], providers = 2, width = 200, thinkingLevel = 'off', models = [LUNA], providerNames = {} }) {
   let footerFactory;
   const handlers = {};
   register({ on: (name, fn) => { handlers[name] = fn; } });
@@ -42,7 +46,7 @@ function render({ model, branch = [], providers = 2, width = 200 }) {
     mode: 'tui',
     cwd: '/tmp/work',
     model,
-    thinkingLevel: 'off',
+    thinkingLevel,
     sessionManager: {
       getEntries: () => branch,
       getBranch: () => branch,
@@ -53,7 +57,8 @@ function render({ model, branch = [], providers = 2, width = 200 }) {
     modelRegistry: {
       isUsingOAuth: () => false,
       getProvider: () => undefined,
-      find: (provider, id) => (provider === 'github-copilot' && id === 'gpt-6-luna' ? LUNA : undefined),
+      getProviderDisplayName: provider => providerNames[provider] ?? provider,
+      find: (provider, id) => models.find(m => m.provider === provider && m.id === id),
     },
     ui: { setFooter: factory => { footerFactory = factory; } },
   };
@@ -94,4 +99,21 @@ test('a single provider drops the parenthesized prefix but keeps the arrow', () 
   const out = render({ model: FUSION, branch: [assistant('github-copilot', 'gpt-6-luna')], providers: 1 });
   assert.ok(out.includes('Fusion/Standard → GPT-6 Luna'), out);
   assert.ok(!out.includes('(copilot-fusion)'), out);
+});
+
+test('the deepseek router shows its short label and the routed side', () => {
+  const out = render({
+    model: DEEPSEEK_AUTO,
+    branch: [assistant('deepinfra', DEEPINFRA_FLASH.id)],
+    thinkingLevel: 'high',
+    models: [DEEPINFRA_FLASH],
+    providerNames: { deepinfra: 'DeepInfra' },
+  });
+  assert.ok(out.includes('(deepseek) Auto • high → v4.1Flash v1017 (DeepInfra)'), out);
+});
+
+test('a directly selected deepinfra model shows the short label alone', () => {
+  const out = render({ model: DEEPINFRA_FLASH, models: [DEEPINFRA_FLASH] });
+  assert.ok(out.includes('(deepinfra) v4.1Flash v1017 • thinking off'), out);
+  assert.ok(!out.includes('→'), out);
 });
