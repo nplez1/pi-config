@@ -128,6 +128,11 @@ interface RouteContext {
     getAvailable?(): CatalogModel[];
     /** pi's own pre-flight check; present in pi 1.4.0. */
     hasConfiguredAuth?(model: CatalogModel): boolean;
+    /**
+     * Rebuild the provider/credential snapshot, scoped by `providers` — the
+     * programmatic form of `/reload`; present in pi 1.4.0.
+     */
+    refresh?(options?: { allowNetwork?: boolean; providers?: string[] }): Promise<unknown>;
   };
 }
 
@@ -426,19 +431,43 @@ export default function (pi: ExtensionAPI) {
    * that has not caught up must not be able to end the turn. Confirm against
    * the catalog before failing a request.
    *
-   * Neither can a stale *credential* snapshot be worked around here. pi checks
-   * credentials again on whatever `route()` returns — "If `route()` throws, or
-   * returns a virtual model or a model without credentials, the request ends
-   * with an error response" (docs/virtual-models.md), implemented in
-   * `resolveModel` as `hasConfiguredAuth(target.provider)` right after the
-   * awaited `route()` — and that reads the same snapshot this file reads. So a
-   * return value cannot bypass it: handing back the catalog entry would only
-   * trade this error for pi's own, which names the routed model and blames a
-   * credential. Throwing here is the whole remedy available to an extension;
-   * the way out is `/reload`, which rebuilds the registry, and the message says
-   * so.
+   * A stale *credential* snapshot is recoverable, and on resume it is the
+   * likeliest failure there is: `session_start` re-registers the DeepInfra
+   * side, the full availability refresh that follows replaces
+   * `configuredProviders` wholesale from live `checkAuth` results, and the
+   * first request of a resumed session can arrive while that set is
+   * momentarily empty — which reads as "neither provider has a key". pi does
+   * not trust the snapshot for this either; its send path accepts
+   * `hasConfiguredAuth(provider) || await checkAuth(provider)`. The registry
+   * exposes the same live check as `refresh({ providers })`, so re-check and
+   * re-resolve before failing. Returning the catalog entry alone would not do:
+   * pi re-checks credentials on whatever `route()` returns ("If `route()`
+   * throws, or returns a virtual model or a model without credentials, the
+   * request ends with an error response", docs/virtual-models.md, implemented
+   * in `resolveModel` as `hasConfiguredAuth(target.provider)` after the awaited
+   * `route()`) — but that check reads the snapshot the refresh has just
+   * rebuilt, so recovering the snapshot recovers the turn.
    */
-  function resolveEither(ctx: RouteContext, ref: ModelRef): CatalogModel {
+  async function resolveEither(ctx: RouteContext, ref: ModelRef): Promise<CatalogModel> {
+    const decided = decide(ctx, ref);
+    if (decided) return decided;
+    await recheckCredentials(ctx, ref);
+    const recovered = decide(ctx, ref);
+    if (recovered) {
+      note(`credential snapshot was stale; re-checked live and routed to ${recovered.provider}/${recovered.id}`);
+      return recovered;
+    }
+    const other = otherSide(ref);
+    throw new Error(
+      `deepseek-routing: neither ${ref.provider}/${ref.id} nor ${other?.provider}/${other?.id} is usable ` +
+        `— no credentials, or missing from the catalog, even after a live re-check. The model registry ` +
+        `looks stale: run /reload, or restart, to rebuild it. If that persists, check the deepinfra ` +
+        `credential in ~/.pi/agent/auth.json`,
+    );
+  }
+
+  /** The side the snapshots pick as they stand; undefined when neither is usable. */
+  function decide(ctx: RouteContext, ref: ModelRef): CatalogModel | undefined {
     const available = availableIds(ctx);
     const wanted = resolve(ctx, ref, available) ?? resolve(ctx, otherSide(ref), available);
     if (wanted) {
@@ -454,12 +483,21 @@ export default function (pi: ExtensionAPI) {
       note(`availability snapshot omitted ${fallback.provider}/${fallback.id}; using the catalog entry`);
       return fallback;
     }
-    const other = otherSide(ref);
-    throw new Error(
-      `deepseek-routing: neither ${ref.provider}/${ref.id} nor ${other?.provider}/${other?.id} is usable ` +
-        `— no credentials, or missing from the catalog. The model registry looks stale: run /reload, or ` +
-        `restart, to rebuild it. If that persists, check the deepinfra credential in ~/.pi/agent/auth.json`,
-    );
+    return undefined;
+  }
+
+  /**
+   * Rebuild the credential snapshot for the two sides from a live check — the
+   * scoped form of `/reload`. Best effort: a pi without `refresh()`, or a
+   * failing refresh, leaves the snapshot as it was and the caller throws.
+   */
+  async function recheckCredentials(ctx: RouteContext, ref: ModelRef): Promise<void> {
+    const providers = [ref.provider, otherSide(ref)?.provider].filter((id): id is string => Boolean(id));
+    try {
+      await ctx.modelRegistry.refresh?.({ allowNetwork: false, providers });
+    } catch {
+      // The stale snapshot stands; the error message covers that case.
+    }
   }
 
   /** One stderr note per streak of requests the snapshot could not place. */
@@ -493,7 +531,7 @@ export default function (pi: ExtensionAPI) {
       if (request.reason === "continuation") {
         const previous = request.previous?.model;
         if (previous && (previous.provider === DEEPSEEK_FLASH.provider || previous.provider === DEEPINFRA_FLASH.provider)) {
-          return { model: resolveEither(ctx, previous), thinkingLevel: request.thinkingLevel };
+          return { model: await resolveEither(ctx, previous), thinkingLevel: request.thinkingLevel };
         }
       }
 
@@ -512,7 +550,7 @@ export default function (pi: ExtensionAPI) {
           }
         }
         if (failed?.model) {
-          return { model: resolveEither(ctx, failed.model), thinkingLevel: request.thinkingLevel };
+          return { model: await resolveEither(ctx, failed.model), thinkingLevel: request.thinkingLevel };
         }
       }
 
@@ -523,7 +561,7 @@ export default function (pi: ExtensionAPI) {
       // Continuations and retries above deliberately skip it — they must not
       // spend latency mid-turn.
       await refreshPricing();
-      const target = resolveEither(ctx, chooseSide(currentTier()));
+      const target = await resolveEither(ctx, chooseSide(currentTier()));
       return {
         model: target,
         thinkingLevel: request.thinkingLevel,

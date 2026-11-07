@@ -26,6 +26,7 @@ interface FakeRegistry {
   find(provider: string, id: string): unknown;
   getAvailable?(): unknown[];
   hasConfiguredAuth?(model: unknown): boolean;
+  refresh?(options?: { allowNetwork?: boolean; providers?: string[] }): Promise<unknown>;
 }
 
 function registry(opts: {
@@ -33,18 +34,30 @@ function registry(opts: {
   configured: boolean;
   /** Whether getAvailable() answers at all; [] means "cannot answer". */
   snapshot?: boolean;
-}): FakeRegistry {
+  /** Whether a live re-check finds credentials, as pi's `refresh()` does. */
+  recheck?: boolean;
+}): FakeRegistry & { refreshes: string[][] } {
+  let configured = opts.configured;
+  const refreshes: string[][] = [];
   return {
+    refreshes,
     find: (provider, id) =>
       opts.sides.find((side) => side.provider === provider && side.id === id),
     getAvailable: () => (opts.snapshot === false ? [] : opts.sides),
-    hasConfiguredAuth: () => opts.configured,
+    hasConfiguredAuth: () => configured,
+    refresh: async (options) => {
+      refreshes.push(options?.providers ?? []);
+      if (opts.recheck) configured = true;
+      return {};
+    },
   };
 }
 
 const healthy = registry({ sides: [DEEPSEEK, DEEPINFRA], configured: true });
-/** Nothing reports credentials, and the availability cache cannot answer. */
+/** Nothing reports credentials, the cache cannot answer, and a live re-check agrees. */
 const staleCredentials = registry({ sides: [DEEPSEEK, DEEPINFRA], configured: false, snapshot: false });
+/** The snapshot lost both providers' credentials, but the keys are really there. */
+const recoverable = registry({ sides: [DEEPSEEK, DEEPINFRA], configured: false, snapshot: false, recheck: true });
 /** The availability cache says both are usable; pi's credential check says no. */
 const staleAvailability = registry({ sides: [DEEPSEEK, DEEPINFRA], configured: false });
 const emptyCatalog = registry({ sides: [], configured: false });
@@ -126,10 +139,24 @@ describe("router recovery", () => {
     }
   });
 
+  test("recovers a stale credential snapshot with a live re-check, instead of ending the turn", async () => {
+    // The resume failure: the availability refresh that `session_start` triggers
+    // replaces `configuredProviders` from live `checkAuth` results, and the
+    // first request can arrive while that set is momentarily empty. pi's own
+    // send path does not trust the snapshot (`hasConfiguredAuth() || await
+    // checkAuth()`), and `refresh({ providers })` runs that live check, so the
+    // router does the same before failing.
+    process.env.PI_DEEPSEEK_TIER = "off-peak";
+    const { routeAsPi } = await harness(recoverable);
+    expect((await routeAsPi()).model.provider).toBe("deepseek");
+    // Scoped to the two sides, not a whole-registry rebuild.
+    expect(recoverable.refreshes).toEqual([[DEEPSEEK.provider, DEEPINFRA.provider]]);
+  });
+
   test("throws, rather than returning a model pi would reject", async () => {
-    // pi re-checks credentials on the returned model, so no return value can
-    // recover a stale snapshot. The only remedy an extension has is a clear,
-    // actionable error: naming /reload is the point of it.
+    // When the live re-check agrees there is no credential, no return value can
+    // recover it: pi re-checks the same snapshot. The only remedy left is a
+    // clear, actionable error — naming /reload is the point of it.
     process.env.PI_DEEPSEEK_TIER = "off-peak";
     const { route } = await harness(staleCredentials);
     await expect(route()).rejects.toThrow(/\/reload/);
@@ -139,7 +166,9 @@ describe("router recovery", () => {
     // A documented limit, not a fix: the router trusts a non-empty availability
     // snapshot, pi then refuses the model it picked, and only /reload helps.
     // Pinned so nobody "fixes" the router by returning a model anyway — pi
-    // rejects that too, with a message that blames a credential.
+    // rejects that too, with a message that blames a credential. The live
+    // re-check does not apply here either: `resolve()` already succeeded, so
+    // there is nothing stale to rebuild.
     process.env.PI_DEEPSEEK_TIER = "off-peak";
     const { routeAsPi } = await harness(staleAvailability);
     await expect(routeAsPi()).rejects.toThrow(/no credentials/);
@@ -150,7 +179,6 @@ describe("router recovery", () => {
     const { route } = await harness(emptyCatalog);
     await expect(route()).rejects.toThrow(/no credentials, or missing from the catalog/);
   });
-
   test("falls to the other side when only it is in the catalog", async () => {
     // Whichever tier is asked for, a missing side must not become a throw.
     for (const tier of ["peak", "off-peak"] as const) {

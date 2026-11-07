@@ -310,9 +310,14 @@ decides the preferred side and nothing more: when it omits both sides — or com
 back empty — the router confirms against the catalog and notes it once on stderr,
 because `route()` throwing ends the request with an error pi does not retry and —
 every request going through the router — would keep ending it until pi was
-restarted. It cannot rescue the case where pi's own credential snapshot is what
-went stale: `hasConfiguredAuth()` reads the same snapshot, pi refuses every
-route, and the router says so instead of blaming a key that is probably fine.
+restarted. It also re-checks a stale credential snapshot live before failing: on
+resume, `session_start` re-registers the DeepInfra side and the availability
+refresh that follows replaces the configured-provider set wholesale, so the first
+request can arrive while that set is momentarily empty. pi's own send path does
+not trust it either (`hasConfiguredAuth() || await checkAuth()`), and
+`modelRegistry.refresh({ providers })` runs that live check, so the router
+rebuilds the snapshot for the two sides and re-resolves — the error, naming
+`/reload`, is only for the case where the live check agrees the key is missing.
 
 The schedule and rate card live in
 `extensions/shared/deepseek-schedule.ts`, shared with `deepseek-pricing.ts` so
