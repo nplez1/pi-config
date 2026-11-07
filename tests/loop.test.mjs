@@ -551,6 +551,22 @@ test('a cold job appears in the footer as soon as the scheduler announces it', a
   h.handlers.get('session_shutdown')();
 });
 
+// A cold job arms the scheduler's timer, not `/loop`'s — so without a tick of its
+// own the footer printed whatever the last event wrote and froze there ("next in
+// 2s" that never moved). The countdown has to be recomputed, not just rewritten.
+test('a cold-only session keeps ticking, so the countdown does not freeze', async (t) => {
+  t.mock.timers.enable({ apis: ['setInterval', 'Date'] });
+  const h = harness();
+  await h.handlers.get('session_start')({}, h.ctx);
+  h.bus.emit('subagents:scheduled', { type: 'added', job: coldJob() });
+  assert.equal(h.statuses.get('loop'), '◷ 1 job · next in 1m');
+  t.mock.timers.tick(1000);
+  assert.equal(h.statuses.get('loop'), '◷ 1 job · next in 59s');
+  t.mock.timers.tick(1000);
+  assert.equal(h.statuses.get('loop'), '◷ 1 job · next in 58s');
+  h.handlers.get('session_shutdown')();
+});
+
 // ── Session scope: resumed, never standing ──────────────────────────────────
 
 test('a resumed session restores its live loops, without a burst of catch-up fires', async () => {

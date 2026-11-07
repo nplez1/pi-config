@@ -114,8 +114,20 @@ case " ${1:-} " in
     ;;
 esac
 
-# Everything else may be a session: let the helper decorate the invocation, then
-# exec, so `pi` stays one process deep.
+# Everything else may be a session: rebuild a stale plugin bundle first, then let
+# the helper decorate the invocation and exec, so `pi` stays one process deep.
+#
+# A plugin edited in this repo — or bumped by an install — does not reach Pi-Bolt
+# until its bundle is rebuilt, and the loader only *warns* about that at launch:
+# restart, see no change, conclude the edit did nothing. rebuild.sh is ~5 ms when
+# nothing is stale, prints only when it rebuilds, and a failure is reported rather
+# than blocking the launch — a source broken mid-edit is exactly when pi should
+# still start and help fix it.
+stale="__BOLT_HOME__/rebuild.sh"
+if [ -x "$stale" ]; then
+  "$stale" >&2 || echo "pi-swap: bundle rebuild failed; the previous bundle is in use" >&2
+fi
+
 if [ -x "$helper" ]; then
   exec "$helper" "$bolt" "$@"
 fi

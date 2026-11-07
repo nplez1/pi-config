@@ -362,6 +362,10 @@ export default function (pi: ExtensionAPI) {
   const dynamicJob = (): Job | undefined => [...jobs.values()].find((job) => job.mode === "dynamic");
 
   function updateFooter(): void {
+    // Every path that changes what is armed lands here, so this is the one place
+    // that keeps the ticker in step with both backends — including the cold
+    // events that never touch `jobs`.
+    syncTicker();
     if (!uiCtx?.hasUI) return;
     const views: LoopFooterView[] = [
       ...[...jobs.values()].map((job) => ({
@@ -428,8 +432,20 @@ export default function (pi: ExtensionAPI) {
     unsubscribes.push(bus.on(EVENT_READY, () => void refreshColdJobs()));
   }
 
+  /**
+   * The ticker re-renders the footer's countdown, and cold work needs that as
+   * much as live work does: `/loop` owns no timer for a cold job, so with one
+   * armed and no live loop the footer kept whatever `next in …` was written at
+   * the last event and froze there. Live loops also use the tick to notice a due
+   * fire, which is why the ticker is not a footer-only concern.
+   */
+  function syncTicker(): void {
+    if (jobs.size + coldJobs.size > 0) ensureTicker();
+    else stopTickerIfIdle();
+  }
+
   function ensureTicker(): void {
-    if (ticker || jobs.size === 0) return;
+    if (ticker || jobs.size + coldJobs.size === 0) return;
     ticker = setInterval(tick, TICK_MS);
     // Why: a live interval would hold the process open on a clean exit; pi owns
     // its own lifetime, this timer should not extend it.
@@ -437,7 +453,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   function stopTickerIfIdle(): void {
-    if (jobs.size > 0 || !ticker) return;
+    if (jobs.size + coldJobs.size > 0 || !ticker) return;
     clearInterval(ticker);
     ticker = undefined;
   }
