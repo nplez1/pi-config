@@ -44,16 +44,20 @@
       "apiKey": "${OMLX_API_KEY}",
       "models": [
         {
-          "id": "Qwen3.6-35B-A3B-oQ6-mtp"
+          "id": "Qwen3.6-35B-A3B-oQ6-mtp",
+          "name": "Qwen3.6-35B-oQ6"
         },
         {
-          "id": "Qwen3.6-35B-A3B-oQ4-mtp"
+          "id": "Qwen3.6-35B-A3B-oQ4-mtp",
+          "name": "Qwen3.6-35B-oQ4"
         },
         {
-          "id": "Qwen3.6-27B-oQ4-fp16-mtp"
+          "id": "Qwen3.6-27B-oQ4-fp16-mtp",
+          "name": "Qwen3.6-27B-oQ4"
         },
         {
           "id": "Qwen3.8-27B-oQ4e-fp16-mtp",
+          "name": "Qwen3.8-27B-oQ4e",
           "contextWindow": 524288,
           "maxTokens": 262144,
           "reasoning": true,
@@ -82,15 +86,53 @@
         },
         {
           "id": "Laguna-S-2.1-oQ4e",
+          "name": "Laguna-S-2.1",
           "contextWindow": 262144
         },
         {
           "id": "Ornith-1.5-35B-A3B-oQ4e-fp16-mtp",
+          "name": "Ornith-1.5-35B",
           "contextWindow": 262144,
           "reasoning": true,
           "compat": {
             "thinkingFormat": "qwen",
             "supportsReasoningEffort": false
+          }
+        }
+      ]
+    },
+    "m5-omlx": {
+      "name": "M5 omlx",
+      "baseUrl": "http://100.98.144.27:8033/v1",
+      "api": "openai-completions",
+      "models": [
+        {
+          "id": "Qwen3.8-27B-Uncen-oQ4e",
+          "name": "Qwen3.8-27B-Uncen-oQ4e",
+          "contextWindow": 262144,
+          "maxTokens": 262144,
+          "reasoning": true,
+          "thinkingLevelMap": {
+            "minimal": "low",
+            "low": "low",
+            "medium": "medium",
+            "high": "xhigh",
+            "xhigh": "xhigh",
+            "max": "xhigh"
+          },
+          "compat": {
+            "thinkingFormat": "chat-template",
+            "maxTokensField": "max_tokens",
+            "chatTemplateKwargs": {
+              "enable_thinking": {
+                "$var": "thinking.enabled"
+              },
+              "preserve_thinking": true,
+              "reasoning_effort": {
+                "$var": "thinking.effort",
+                "omitWhenOff": true
+              }
+            }
           }
         }
       ]
@@ -172,7 +214,7 @@
       ],
       "modelOverrides": {
         "accounts/fireworks/models/deepseek-v4-flash-0731": {
-          "name": "DeepSeek v4 Flash v0731"
+          "name": "DeepSeek v4 Flash"
         }
       }
     },
