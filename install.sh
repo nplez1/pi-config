@@ -350,7 +350,8 @@ const machineOwned = new Set(["defaultProvider", "defaultModel", "enabledModels"
 const changes = [];
 const sourceOf = (entry) => typeof entry === "string" ? entry : entry?.source;
 const pkgName = (entry) => (sourceOf(entry) ?? "").replace(/^-/, "").replace(/@[^/@]+$/, "");
-// Replace the npm goal package with the repo's versioned local copy. Preserve
+// Replace the npm goal package with the repo's own fork (a submodule at
+// plugins/pi-codex-goal). Preserve
 // object-form resource filters, and never load both copies of the extension.
 if (Array.isArray(live.packages) && (seed.packages ?? []).some((e) => sourceOf(e) === "plugins/pi-codex-goal")) {
   const localGoal = "plugins/pi-codex-goal";

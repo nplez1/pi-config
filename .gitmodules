@@ -10,3 +10,6 @@
 [submodule "plugins/pi-smart-compaction"]
 	path = plugins/pi-smart-compaction
 	url = https://github.com/nplez1/pi-smart-compaction.git
+[submodule "plugins/pi-codex-goal"]
+	path = plugins/pi-codex-goal
+	url = https://github.com/nplez1/pi-codex-goal.git
