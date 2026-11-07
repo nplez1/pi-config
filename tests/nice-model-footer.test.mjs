@@ -26,10 +26,12 @@ fs.writeFileSync(path.join(tuiDir, 'index.js'), [
 const { default: register } = await import(pathToFileURL(path.join(root, 'nice-model-footer.ts')));
 
 const usage = { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: { total: 0.001 } };
-const assistant = (provider, model) => ({
+const assistant = (provider, model, u = usage) => ({
   type: 'message',
-  message: { role: 'assistant', provider, model, content: [], usage },
+  message: { role: 'assistant', provider, model, content: [], usage: u },
 });
+
+const withUsage = (overrides) => ({ ...usage, ...overrides, cost: { total: overrides.costTotal ?? usage.cost.total } });
 
 const FUSION = { provider: 'copilot-fusion', id: 'standard', name: 'Fusion/Standard', api: 'pi-virtual', reasoning: false, contextWindow: 100000 };
 const LUNA = { provider: 'github-copilot', id: 'gpt-6-luna', name: 'GPT-6 Luna', api: 'openai-responses', reasoning: true, contextWindow: 1000000 };
@@ -72,6 +74,53 @@ function render({ model, branch = [], providers = 2, width = 200, thinkingLevel 
   };
   return footerFactory({ requestRender: () => {} }, theme, footerData).render(width).join('\n');
 }
+
+test('cache read and write counters are gone from the stats row', () => {
+  const out = render({
+    model: LUNA,
+    branch: [assistant('github-copilot', 'gpt-6-luna', withUsage({ cacheRead: 15_000_000, cacheWrite: 48_000 }))],
+  });
+  assert.ok(!/\bR\d/.test(out), `no R counter: ${out}`);
+  assert.ok(!/\bW\d/.test(out), `no W counter: ${out}`);
+});
+
+test('the cache-hit rate survives, rounded to a whole percent', () => {
+  const out = render({
+    model: LUNA,
+    // 999 cache reads of a 1000-token prompt = 99.9% → CH100%.
+    branch: [assistant('github-copilot', 'gpt-6-luna', withUsage({ input: 1, cacheRead: 999, cacheWrite: 0 }))],
+  });
+  assert.ok(out.includes('CH100%'), out);
+});
+
+test('the cache-hit rate only appears once the session has cache traffic', () => {
+  const out = render({
+    model: LUNA,
+    branch: [assistant('github-copilot', 'gpt-6-luna', withUsage({ input: 1000, cacheRead: 0, cacheWrite: 0 }))],
+  });
+  assert.ok(!out.includes('CH'), out);
+});
+
+test('cost drops to two decimals and loses its leading zero under a dollar', () => {
+  const cents = render({
+    model: LUNA,
+    branch: [assistant('github-copilot', 'gpt-6-luna', withUsage({ costTotal: 0.084 }))],
+  });
+  assert.ok(cents.includes('$.08'), cents);
+
+  const dollars = render({
+    model: LUNA,
+    branch: [assistant('github-copilot', 'gpt-6-luna', withUsage({ costTotal: 1.239 }))],
+  });
+  assert.ok(dollars.includes('$1.24'), dollars);
+});
+
+test('context reads as a whole percent over a whole window', () => {
+  const out = render({ model: LUNA });
+  assert.ok(out.includes('12%/1M'), out);
+  assert.ok(!out.includes('12.3'), out);
+  assert.ok(!out.includes('1.0M'), out);
+});
 
 test('the loop call-out rides on the path line instead of taking its own row', () => {
   const out = render({

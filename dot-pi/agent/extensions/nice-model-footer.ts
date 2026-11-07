@@ -24,6 +24,29 @@ function formatTokens(count: number): string {
 	return `${Math.round(count / 1000000)}M`;
 }
 
+/**
+ * Token counts with no decimal point, for the context window: 1000000 → "1M".
+ *
+ * The ↑/↓ counters keep their decimal because they are read as magnitudes, while
+ * the window is a fixed capacity — "1.0M" there is a decimal that never changes.
+ */
+function formatTokensWhole(count: number): string {
+	if (count < 1000) return count.toString();
+	if (count < 1000000) return `${Math.round(count / 1000)}k`;
+	return `${Math.round(count / 1000000)}M`;
+}
+
+/**
+ * Dollars at two decimals, with the leading zero dropped below a dollar:
+ * 0.084 → "$.08", 1.234 → "$1.23". Two decimals is the resolution a session
+ * actually moves in, and the dropped zero buys back a column.
+ */
+function formatCost(total: number): string {
+	if (total <= 0) return "$0";
+	const fixed = total.toFixed(2);
+	return fixed.startsWith("0.") ? `$${fixed.slice(1)}` : `$${fixed}`;
+}
+
 function formatCwdForFooter(cwd: string, home?: string): string {
 	if (!home) return cwd;
 	if (cwd === home) return "~";
@@ -239,23 +262,21 @@ export default function (pi: ExtensionAPI) {
 					]);
 
 					// ---- usage totals from ALL session entries ----
+					// Cache read/write are deliberately not totalled: they are per-request
+					// magnitudes that only mean something as a hit rate, so the footer shows
+					// the latest request's rate instead of two ever-growing counters.
 					let input = 0,
 						output = 0,
-						cacheRead = 0,
-						cacheWrite = 0,
 						cost = 0;
 					let latestCacheHitRate: number | undefined;
+					let latestHadCacheTraffic = false;
 					const addUsage = (u: {
 						input: number;
 						output: number;
-						cacheRead: number;
-						cacheWrite: number;
 						cost: { total: number };
 					}) => {
 						input += u.input;
 						output += u.output;
-						cacheRead += u.cacheRead;
-						cacheWrite += u.cacheWrite;
 						cost += u.cost.total;
 					};
 					for (const entry of ctx.sessionManager.getEntries()) {
@@ -263,6 +284,7 @@ export default function (pi: ExtensionAPI) {
 							const u = (entry.message as AssistantMessage).usage;
 							addUsage(u);
 							const latestPromptTokens = u.input + u.cacheRead + u.cacheWrite;
+							latestHadCacheTraffic = u.cacheRead > 0 || u.cacheWrite > 0;
 							latestCacheHitRate =
 								latestPromptTokens > 0 ? (u.cacheRead / latestPromptTokens) * 100 : undefined;
 						} else if (entry.type === "message" && entry.message.role === "toolResult" && entry.message.usage) {
@@ -275,9 +297,11 @@ export default function (pi: ExtensionAPI) {
 					// ---- context usage ----
 					const contextUsage = ctx.getContextUsage();
 					const contextWindow = contextUsage?.contextWindow ?? ctx.model?.contextWindow ?? 0;
+					// Colour thresholds still read the raw value, so 70.4% warns even though
+					// it renders as "70%".
 					const contextPercentValue = contextUsage?.percent ?? 0;
 					const contextPercent =
-						contextUsage?.percent !== null ? contextPercentValue.toFixed(1) : "?";
+						contextUsage?.percent == null ? "?" : String(Math.round(contextUsage.percent));
 
 					// ---- pwd line ----
 					let pwd = formatCwdForFooter(ctx.sessionManager.getCwd(), process.env.HOME || process.env.USERPROFILE);
@@ -290,10 +314,8 @@ export default function (pi: ExtensionAPI) {
 					const statsParts: string[] = [];
 					if (input) statsParts.push(`↑${formatTokens(input)}`);
 					if (output) statsParts.push(`↓${formatTokens(output)}`);
-					if (cacheRead) statsParts.push(`R${formatTokens(cacheRead)}`);
-					if (cacheWrite) statsParts.push(`W${formatTokens(cacheWrite)}`);
-					if ((cacheRead > 0 || cacheWrite > 0) && latestCacheHitRate !== undefined) {
-						statsParts.push(`CH${latestCacheHitRate.toFixed(1)}%`);
+					if (latestHadCacheTraffic && latestCacheHitRate !== undefined) {
+						statsParts.push(`CH${Math.round(latestCacheHitRate)}%`);
 					}
 					// Kimi Coding is subscription-backed despite using API-key auth.
 					const usingSubscription = ctx.model
@@ -302,7 +324,7 @@ export default function (pi: ExtensionAPI) {
 								ctx.modelRegistry.getProvider(ctx.model.provider)?.auth?.oauth?.isSubscription === true)
 						: false;
 					if (cost || usingSubscription) {
-						statsParts.push(`$${cost.toFixed(3)}${usingSubscription ? " (sub)" : ""}`);
+						statsParts.push(`${formatCost(cost)}${usingSubscription ? " (sub)" : ""}`);
 					}
 
 					let contextPercentStr: string;
@@ -316,8 +338,8 @@ export default function (pi: ExtensionAPI) {
 						compactionNotes.length > 0 ? ` (${compactionNotes.join(", ")})` : "";
 					const contextPercentDisplay =
 						contextPercent === "?"
-							? `?/${formatTokens(contextWindow)}${compactionIndicator}`
-							: `${contextPercent}%/${formatTokens(contextWindow)}${compactionIndicator}`;
+							? `?/${formatTokensWhole(contextWindow)}${compactionIndicator}`
+							: `${contextPercent}%/${formatTokensWhole(contextWindow)}${compactionIndicator}`;
 					if (contextPercentValue > 90) {
 						contextPercentStr = theme.fg("error", contextPercentDisplay);
 					} else if (contextPercentValue > 70) {
