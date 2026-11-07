@@ -29,6 +29,23 @@ export const RPC_LIST = "subagents:rpc:schedules:list";
 export const RPC_CREATE = "subagents:rpc:schedules:create";
 export const RPC_REMOVE = "subagents:rpc:schedules:remove";
 
+/**
+ * Channels this extension SERVES, so the model can arm a live loop.
+ *
+ * The mirror image of the three above, and the literals are duplicated in
+ * pi-subagents' `src/schedule-live-rpc.ts` — two repos, one wire, no shared
+ * module to hang the constant on. Change one, change both.
+ *
+ * Cold work already flowed both ways: `/loop` calls pi-subagents for it. Live
+ * work only ever needed the user, because the only way to create a live loop
+ * was to type `/loop`. Giving the model a `backend: "live"` option means the
+ * call now runs the other way, and it has to land here: the `jobs` table is a
+ * closure in this extension, so nothing else can add to it.
+ */
+export const LIVE_CREATE = "loop:rpc:schedules:create";
+export const LIVE_LIST = "loop:rpc:schedules:list";
+export const LIVE_REMOVE = "loop:rpc:schedules:remove";
+
 /** Scheduler lifecycle events on the same bus. */
 export const EVENT_SCHEDULED = "subagents:scheduled";
 export const EVENT_READY = "subagents:scheduler_ready";

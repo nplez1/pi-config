@@ -363,17 +363,34 @@ model can cancel what you started. The Agent param was retired because it and
 `/loop` shared one scheduler — the louder guideline decided where a job landed,
 and a job created from a turn ended up somewhere the user was not looking.
 
-`manage_schedules` takes `create` (a `schedule` and a `prompt`, plus optional
-`name`, `subagent_type`, `model`, `thinking`, `max_turns`), `list`, and `cancel`
-with a job id. `create` registers a **cold** job: the model cannot arm a live tick
-in this session, because a live tick re-enters the conversation the model is
-already in, and only you get to decide that.
+`manage_schedules` takes `create` (a `schedule` and a `prompt`, plus a
+`backend` and, for cold jobs, optional `name`, `subagent_type`, `model`,
+`thinking`, `max_turns`), `list`, and `cancel` with a job id. `list` and
+`cancel` cover **both** backends, and `create` picks one:
+
+- `backend: "cold"` (the default) — a job in pi-subagents' scheduler; each fire
+  spawns a fresh subagent session. Cheap in this conversation: nothing is added
+  to your transcript.
+- `backend: "live"` — a loop in `/loop`'s own table; each fire re-enters **this**
+  session as a user message, inheriting the conversation, model and tools. It
+  pays for the whole transcript every fire and leaves its own turns behind, so
+  it is the one to use when you asked for the repeat to happen *here*, and not
+  something to arm off a vague "monitor X".
+
+Cold is the default because it is the safe one — a wrong cold job wastes tokens,
+a wrong live job also spends your context. Either way a job the model creates is
+the same object `/loop list` shows and `/loop stop` disarms, and `live` is refused
+cleanly (naming `/loop`) when that extension is not loaded.
 
 The two backends are reached the same way: live loops arm an in-process timer,
 cold ones go over the `subagents:rpc:schedules:{list,create,remove}` channels
 (`plugins/pi-subagents/src/schedule-rpc.ts`). The scheduler announces restored
 and changed jobs on `subagents:scheduled`, which is how `/loop` mirrors them
-without knowing where the scheduler keeps its store.
+without knowing where the scheduler keeps its store. The live backend runs the
+mirror image of that wiring — `loop:rpc:schedules:{list,create,remove}`, served
+by `loop.ts` and called from `plugins/pi-subagents/src/schedule-live-rpc.ts` —
+because live jobs are a closure inside `loop.ts` and nothing else can add to
+them.
 
 Self-paced mode is driven by the `ScheduleWakeup` tool, which the model calls at
 the end of each turn with `delaySeconds` (clamped to `[60, 3600]`), a `reason`,

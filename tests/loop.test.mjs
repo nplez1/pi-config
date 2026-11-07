@@ -633,3 +633,137 @@ test('an expired persisted loop is not restored', async () => {
   h.handlers.get('session_shutdown')();
   fs.rmSync(dir, { recursive: true, force: true });
 });
+
+// ── The live backend's RPC surface ──────────────────────────────────────────
+//
+// The model reaches live loops through pi-subagents' `manage_schedules` →
+// `backend: "live"`, which lands on these three channels. The literals are
+// hardcoded here on purpose: they are the wire contract with
+// `plugins/pi-subagents/src/schedule-live-rpc.ts`, and a test that imported the
+// constant would pass even after both sides were renamed apart.
+
+const LIVE_CREATE = 'loop:rpc:schedules:create';
+const LIVE_LIST = 'loop:rpc:schedules:list';
+const LIVE_REMOVE = 'loop:rpc:schedules:remove';
+
+/** The reply a channel answered with, or undefined when it stayed silent. */
+function replyTo(h, channel, requestId) {
+  const call = h.busCalls.find((c) => c.event === `${channel}:reply:${requestId}`);
+  return call?.data;
+}
+
+/** Emit one request and return its reply. */
+function ask(h, channel, requestId, params = {}) {
+  h.bus.emit(channel, { requestId, ...params });
+  return replyTo(h, channel, requestId);
+}
+
+async function started(options) {
+  const h = harness(options);
+  await h.handlers.get('session_start')({}, h.ctx);
+  return h;
+}
+
+test('a model-created live loop is armed, and the user is told what it costs', async () => {
+  const h = await started();
+  const reply = ask(h, LIVE_CREATE, 'r1', { schedule: '5m', prompt: 'check the deploy' });
+
+  assert.equal(reply.success, true);
+  assert.equal(reply.data.intervalMs, 300_000);
+  assert.ok(reply.data.id, 'the caller gets an id back to cancel with');
+  // The footer is how a live loop is visible at all — arming one silently would
+  // be a model spending the user's context with nothing on screen.
+  assert.match(h.statuses.get('loop'), /1 loop/);
+  assert.ok(
+    h.notices.some((n) => n.message.includes('armed by the model') && n.message.includes('main context')),
+    'the user is told a live loop appeared and that it costs main context'
+  );
+  h.handlers.get('session_shutdown')();
+});
+
+test('a model-created live loop does not fire mid-turn, unlike /loop at the prompt', async () => {
+  const h = await started();
+  ask(h, LIVE_CREATE, 'r1', { schedule: '1m', prompt: 'say hello' });
+
+  // `/loop 1m say hello` runs its first iteration immediately; a tool call
+  // arrives mid-turn, and firing here would steer the turn that created it.
+  assert.deepEqual(h.sent, [], 'nothing injected while the creating turn is in flight');
+  h.handlers.get('session_shutdown')();
+});
+
+test('the live backend refuses a schedule it cannot honour, naming where it belongs', async () => {
+  const h = await started();
+  const reply = ask(h, LIVE_CREATE, 'r1', { schedule: '0 0 9 * * 1', prompt: 'x' });
+
+  assert.equal(reply.success, false);
+  assert.match(reply.error, /not an interval/);
+  assert.match(reply.error, /cold backend/);
+  h.handlers.get('session_shutdown')();
+});
+
+test('a sub-minute interval is clamped to the floor rather than refused', async () => {
+  const h = await started();
+  const reply = ask(h, LIVE_CREATE, 'r1', { schedule: '10s', prompt: 'x' });
+
+  assert.equal(reply.success, true);
+  assert.equal(reply.data.intervalMs, loop.MIN_INTERVAL_MS);
+  h.handlers.get('session_shutdown')();
+});
+
+test('a prompt is required, so no loop is armed with nothing to say', async () => {
+  const h = await started();
+  const reply = ask(h, LIVE_CREATE, 'r1', { schedule: '5m', prompt: '   ' });
+
+  assert.equal(reply.success, false);
+  assert.match(reply.error, /prompt/);
+  assert.equal(h.statuses.get('loop'), undefined);
+  h.handlers.get('session_shutdown')();
+});
+
+test('list reports the live loops, so one tool can show both backends', async () => {
+  const h = await started();
+  ask(h, LIVE_CREATE, 'r1', { schedule: '5m', prompt: 'check the deploy' });
+  const reply = ask(h, LIVE_LIST, 'r2');
+
+  assert.equal(reply.success, true);
+  assert.equal(reply.data.jobs.length, 1);
+  assert.deepEqual(
+    { prompt: reply.data.jobs[0].prompt, intervalMs: reply.data.jobs[0].intervalMs },
+    { prompt: 'check the deploy', intervalMs: 300_000 }
+  );
+  h.handlers.get('session_shutdown')();
+});
+
+test('remove disarms a live loop, and an unknown id says so instead of pretending', async () => {
+  const h = await started();
+  const created = ask(h, LIVE_CREATE, 'r1', { schedule: '5m', prompt: 'x' });
+
+  const removed = ask(h, LIVE_REMOVE, 'r2', { jobId: created.data.id });
+  assert.equal(removed.success, true);
+  assert.equal(removed.data.removed, created.data.id);
+  assert.equal(h.statuses.get('loop'), undefined, 'nothing left armed');
+
+  const missing = ask(h, LIVE_REMOVE, 'r3', { jobId: 'nope' });
+  assert.equal(missing.success, false);
+  assert.match(missing.error, /No live loop with id "nope"/);
+  h.handlers.get('session_shutdown')();
+});
+
+test('a request with no requestId is ignored rather than answered into the void', async () => {
+  const h = await started();
+  h.bus.emit(LIVE_CREATE, { schedule: '5m', prompt: 'x' });
+  assert.equal(
+    h.busCalls.some((c) => c.event.startsWith(`${LIVE_CREATE}:reply:`)),
+    false
+  );
+  assert.equal(h.statuses.get('loop'), undefined);
+  h.handlers.get('session_shutdown')();
+});
+
+test('a session with no event bus registers no live channels, and still works', async () => {
+  const h = await started({ noBus: true });
+  // Nothing to emit on; the point is that wiring is a no-op rather than a crash.
+  await run(h, '5m check the deploy');
+  assert.deepEqual(h.sent, ['check the deploy']);
+  h.handlers.get('session_shutdown')();
+});

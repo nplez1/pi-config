@@ -60,6 +60,9 @@ import {
   describeCold,
   EVENT_READY,
   EVENT_SCHEDULED,
+  LIVE_CREATE,
+  LIVE_LIST,
+  LIVE_REMOVE,
   reduceColdJobs,
   RPC_CREATE,
   RPC_LIST,
@@ -358,6 +361,8 @@ export default function (pi: ExtensionAPI) {
   const unsubscribes: Array<() => void> = [];
   /** Subscriptions are per-activation; a second session_start must not double them. */
   let coldWired = false;
+  /** Same guard for the channels this extension SERVES to the model. */
+  let liveWired = false;
 
   const dynamicJob = (): Job | undefined => [...jobs.values()].find((job) => job.mode === "dynamic");
 
@@ -430,6 +435,110 @@ export default function (pi: ExtensionAPI) {
     // the store held. Subscribing here rather than reading the store ourselves
     // keeps the scheduler's storage private to the scheduler.
     unsubscribes.push(bus.on(EVENT_READY, () => void refreshColdJobs()));
+  }
+
+  // ── The live backend's RPC surface ────────────────────────────────────────
+  //
+  // `jobs` is a closure in this file, so no other extension can arm a live loop
+  // by writing to a store — the only way in was the slash command. These three
+  // channels are the way in for the model, via `manage_schedules` →
+  // `backend: "live"`. They mirror the cold channels pi-subagents serves, so a
+  // caller sees one symmetric pair: create/list/remove on both backends.
+  //
+  // Deliberately NOT a second model-facing tool registered here. The repo's
+  // rule is one door per audience — the user types `/loop`, the model calls
+  // `manage_schedules` — and a tool here would be the second model door the
+  // Agent tool's retired `schedule` param used to be.
+  function wireLiveBackend(): void {
+    if (!bus?.on || liveWired) return;
+    liveWired = true;
+
+    /** Reply on the per-request channel, or drop it when there is nobody to answer. */
+    function replyChannelFor(raw: unknown, channel: string): ((payload: unknown) => void) | undefined {
+      const requestId = (raw as { requestId?: unknown } | undefined)?.requestId;
+      if (typeof requestId !== "string") return undefined;
+      const replyChannel = `${channel}:reply:${requestId}`;
+      return (payload) => bus?.emit(replyChannel, payload);
+    }
+
+    unsubscribes.push(
+      bus.on(LIVE_CREATE, (raw) => {
+        const reply = replyChannelFor(raw, LIVE_CREATE);
+        if (!reply) return;
+        const request = raw as { schedule?: unknown; prompt?: unknown } | undefined;
+        try {
+          if (!uiCtx) throw new Error("This session has no context yet; try again once it has started.");
+          const prompt = typeof request?.prompt === "string" ? request.prompt.trim() : "";
+          if (!prompt) throw new Error("`prompt` is required.");
+          const schedule = typeof request?.schedule === "string" ? request.schedule.trim() : "";
+          const parsed = parseIntervalToken(schedule);
+          if (parsed === undefined) {
+            throw new Error(
+              `"${schedule}" is not an interval. A live loop needs one of 5m / 30m / 1h / 2d — cron and one-shot schedules only exist on the cold backend.`,
+            );
+          }
+          if (jobs.size >= MAX_LOOPS) {
+            throw new Error(`This session already has ${MAX_LOOPS} live loops; stop one before adding another.`);
+          }
+          // The floor is this extension's rule, so it is applied here rather than
+          // left to the caller: a sub-minute loop is a busy-wait with extra
+          // tokens, whoever asked for it.
+          const intervalMs = Math.max(parsed, MIN_INTERVAL_MS);
+          const job = makeJob("fixed", prompt, intervalMs);
+          addJob(job);
+          // No `fire(job)` here, unlike the slash command: that runs between
+          // turns, whereas this arrives mid-turn from a tool call. `makeJob`
+          // arms `nextAt` at now, so the ticker's drain() picks it up as soon as
+          // the session is idle — "runs immediately", never "steers the turn
+          // that created it".
+          if (uiCtx.hasUI) {
+            uiCtx.ui.notify(
+              `Live loop ${job.id} armed by the model · every ${formatInterval(intervalMs)} · re-enters this conversation, so each fire spends the main context · stop with /loop stop ${job.id}.`,
+              "info",
+            );
+          }
+          reply({ success: true, data: { id: job.id, intervalMs, nextAt: job.nextAt } });
+        } catch (err) {
+          reply({ success: false, error: err instanceof Error ? err.message : String(err) });
+        }
+      }),
+    );
+
+    unsubscribes.push(
+      bus.on(LIVE_LIST, (raw) => {
+        const reply = replyChannelFor(raw, LIVE_LIST);
+        if (!reply) return;
+        reply({
+          success: true,
+          data: {
+            jobs: [...jobs.values()].map((job) => ({
+              id: job.id,
+              prompt: job.prompt,
+              mode: job.mode,
+              intervalMs: job.intervalMs,
+              nextAt: job.nextAt,
+              runs: job.runs,
+            })),
+          },
+        });
+      }),
+    );
+
+    unsubscribes.push(
+      bus.on(LIVE_REMOVE, (raw) => {
+        const reply = replyChannelFor(raw, LIVE_REMOVE);
+        if (!reply) return;
+        const jobId = (raw as { jobId?: unknown } | undefined)?.jobId;
+        const job = typeof jobId === "string" ? jobs.get(jobId) : undefined;
+        if (!job) {
+          reply({ success: false, error: `No live loop with id "${String(jobId)}".` });
+          return;
+        }
+        job.stopped = true;
+        removeJob(job);
+        reply({ success: true, data: { removed: job.id } });
+      }),
+    );
   }
 
   /**
@@ -918,6 +1027,7 @@ export default function (pi: ExtensionAPI) {
     // its own loops again from the per-session store. Nothing outlives a
     // session, which is why there is no durable flag to set here.
     wireColdBackend();
+    wireLiveBackend();
     loadLoops(ctx);
     // The scheduler emits `subagents:scheduler_ready` from its own session_start
     // handler, which may run before this one. Asking once here covers the other
@@ -964,6 +1074,7 @@ export default function (pi: ExtensionAPI) {
     ticker = undefined;
     for (const off of unsubscribes.splice(0)) off();
     coldWired = false;
+    liveWired = false;
     jobs.clear();
     coldJobs = new Map();
     uiCtx = undefined;
