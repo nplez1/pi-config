@@ -5,8 +5,8 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-// Exercise the real vendored runtime in isolation. Pi normally supplies these
-// peer modules; the test only needs their two functions used by formatting.
+// Exercise the real fork runtime in isolation. Pi normally supplies these peer
+// modules; the test only needs the functions formatting uses.
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-goal-footer-'));
 after(() => fs.rmSync(root, { recursive: true, force: true }));
 const plugin = fileURLToPath(new URL('../plugins/pi-codex-goal/', import.meta.url));
@@ -27,6 +27,7 @@ function fixture(mode = 'tui') {
   let goal = null;
   let attention = null;
   let autoResume = false;
+  let backgroundWork = null;
   const statuses = [];
   const widgets = [];
   const ctx = { mode, ui: {
@@ -38,12 +39,14 @@ function fixture(mode = 'tui') {
     getGoalStatus: () => goal?.status ?? null,
     getRecoveryAttention: () => attention,
     isProviderLimitAutoResumeScheduled: () => autoResume,
+    getBackgroundWork: () => backgroundWork,
   });
   return {
     runtime, ctx, statuses, widgets,
     setGoal: value => { goal = value; },
     setAttention: value => { attention = value; },
     setAutoResume: value => { autoResume = value; },
+    setBackgroundWork: value => { backgroundWork = value; },
     last: () => statuses.at(-1)?.[1],
   };
 }
@@ -62,6 +65,19 @@ test('active goal has one sanitized status row and live refresh', t => {
   f.setGoal({ ...goal('active'), usage: { tokensUsed: 0, activeSeconds: 31 } });
   t.mock.timers.tick(1000);
   assert.equal(f.last(), 'Pursuing goal (31s) · Goal (active): Ship the feature');
+
+  // Background work is what the goal is doing, not a separate state: it rides
+  // in the same parenthesis as usage and never becomes "waiting".
+  f.setBackgroundWork({ count: 2, labels: ['Explore', 'review'], unknown: false });
+  t.mock.timers.tick(1000);
+  assert.equal(
+    f.last(),
+    'Pursuing goal (31s, 2 subagents: Explore, review) · Goal (active): Ship the feature',
+  );
+  f.setBackgroundWork({ count: 1, labels: [], unknown: true });
+  t.mock.timers.tick(1000);
+  assert.match(f.last(), /Pursuing goal \(31s, subagents running\)/);
+  f.setBackgroundWork(null);
   f.runtime.stopStatusRefresh();
 });
 
