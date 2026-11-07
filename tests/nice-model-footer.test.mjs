@@ -212,12 +212,42 @@ test('the deepseek router shows its short label and the routed side', () => {
     thinkingLevel: 'high',
     models: [DEEPINFRA_FLASH],
     providerNames: { deepinfra: 'DeepInfra' },
+    statuses: new Map([['deepseek-pricing', 'off-peak → DeepInfra']]),
   });
-  assert.ok(out.includes('(deepseek) Auto • high → v4.1Flash v1017 (DeepInfra)'), out);
+  // No "(deepseek)" prefix and no trailing "→ DeepInfra": the routed label
+  // already names the side that answered.
+  assert.ok(out.includes('Auto • high → v4.1F1017 (DeepInfra) • off-peak'), out);
+  assert.ok(!out.includes('(deepseek)'), out);
+  assert.ok(!out.includes('off-peak → DeepInfra'), out);
+});
+
+test('the deepseek tier keeps its target when it disagrees with the routed side', () => {
+  // A peak boundary can cross mid-session: the latest response went to
+  // DeepInfra, but the next request will not, so both sides are worth showing.
+  const out = render({
+    model: DEEPSEEK_AUTO,
+    branch: [assistant('deepinfra', DEEPINFRA_FLASH.id)],
+    thinkingLevel: 'high',
+    models: [DEEPINFRA_FLASH],
+    providerNames: { deepinfra: 'DeepInfra' },
+    statuses: new Map([['deepseek-pricing', 'peak → DeepSeek']]),
+  });
+  assert.ok(out.includes('Auto • high → v4.1F1017 (DeepInfra) • peak → DeepSeek'), out);
+});
+
+test('the deepseek tier keeps its target before the first response', () => {
+  const out = render({
+    model: DEEPSEEK_AUTO,
+    branch: [],
+    thinkingLevel: 'high',
+    models: [DEEPINFRA_FLASH],
+    statuses: new Map([['deepseek-pricing', 'off-peak → DeepInfra']]),
+  });
+  assert.ok(out.includes('Auto • high • off-peak → DeepInfra'), out);
 });
 
 test('a directly selected deepinfra model shows the short label alone', () => {
   const out = render({ model: DEEPINFRA_FLASH, models: [DEEPINFRA_FLASH] });
-  assert.ok(out.includes('(deepinfra) v4.1Flash v1017 • thinking off'), out);
+  assert.ok(out.includes('(deepinfra) v4.1F1017 • thinking off'), out);
   assert.ok(!out.includes('→'), out);
 });

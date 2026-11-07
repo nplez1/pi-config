@@ -62,7 +62,7 @@ const MODEL_ABBREVIATIONS: Record<string, string> = {
 	"deepseek/deepseek-flash": "DSv4.1Flash",
 	"deepseek/deepseek-flash-auto": "Auto",
 	"deepseek/deepseek-v4-pro": "DSv4Pro",
-	"deepinfra/deepseek-ai/DeepSeek-V4.1-Flash-1017": "v4.1Flash v1017",
+	"deepinfra/deepseek-ai/DeepSeek-V4.1-Flash-1017": "v4.1F1017",
 	"xiaomi/mimo-v2.6-flash": "MiMoV2.6Flash",
 	"xiaomi/mimo-v2.6-pro": "MiMoV2.6Pro",
 	"xiaomi/mimo-v2.6-pro-ultraspeed": "MiMoV2.6ProUltra",
@@ -142,26 +142,27 @@ function footerModelLabel(model: { provider: string; id: string; name?: string }
 
 /**
  * Label for the model a virtual selection actually used, e.g. the arrow in
- * "(deepseek) Auto • high → v4.1Flash v1017 (DeepInfra)". A curated label wins
- * over the catalog name, which is long; because it also drops the provider
- * words, the provider goes back in parentheses so the footer still says which
- * side answered. Uncurated models keep their full name.
+ * "Auto • high → v4.1F1017 (DeepInfra)". A curated label wins over the catalog
+ * name, which is long; because it also drops the provider words, the provider
+ * goes back in parentheses so the footer still says which side answered — that
+ * reported provider is what lets the caller drop a duplicate elsewhere on the
+ * line. Uncurated models keep their full name and report no provider.
  */
 function routedModelLabel(
 	registry: { getProviderDisplayName?: (provider: string) => string },
 	physical: { provider: string; id: string; name?: string } | undefined,
 	fallbackId: string,
-): string {
-	if (!physical) return fallbackId;
+): { text: string; provider?: string } {
+	if (!physical) return { text: fallbackId };
 	const mapped = MODEL_ABBREVIATIONS[`${physical.provider}/${physical.id}`];
-	if (!mapped) return physical.name ?? fallbackId;
+	if (!mapped) return { text: physical.name ?? fallbackId };
 	let provider: string | undefined;
 	try {
 		provider = registry.getProviderDisplayName?.(physical.provider);
 	} catch {
 		provider = undefined;
 	}
-	return provider ? `${mapped} (${provider})` : mapped;
+	return provider ? { text: `${mapped} (${provider})`, provider } : { text: mapped };
 }
 
 /**
@@ -171,6 +172,19 @@ function routedModelLabel(
 const SMART_COMPACTION_STATUS = "smart-compaction";
 function idleThresholdLabel(statuses: ReadonlyMap<string, string>): string | undefined {
 	return statuses.get(SMART_COMPACTION_STATUS)?.match(/idle≥\S+/)?.[0];
+}
+
+/**
+ * deepseek-routing publishes "off-peak → DeepInfra" so a bare model selection
+ * still says where the next request goes. Once the routed label names that same
+ * provider, only the billing tier is news. A status pointing somewhere the
+ * latest response did not go stays whole, because then the two disagree.
+ */
+function trimRoutedTarget(status: string, routedProvider: string | undefined): string {
+	if (!routedProvider) return status;
+	const arrow = status.match(/^(.+?)\s*→\s*(.+)$/);
+	if (!arrow) return status;
+	return arrow[2].trim() === routedProvider ? arrow[1].trim() : status;
 }
 
 /**
@@ -373,21 +387,24 @@ export default function (pi: ExtensionAPI) {
 					// A virtual model routes each request; show where the latest response
 					// went, e.g. "Fusion/Standard → GPT-6 Luna". The transcript records
 					// the physical model on each assistant message.
+					let routedProvider: string | undefined;
 					if (ctx.model?.api === "pi-virtual") {
 						const latest = ctx.sessionManager
 							.getBranch()
 							.findLast((entry) => entry.type === "message" && entry.message.role === "assistant");
 						if (latest?.type === "message" && latest.message.role === "assistant") {
 							const physical = ctx.modelRegistry.find(latest.message.provider, latest.message.model);
-							rightSideWithoutProvider += ` → ${routedModelLabel(
-								ctx.modelRegistry,
-								physical,
-								latest.message.model,
-							)}`;
+							const routed = routedModelLabel(ctx.modelRegistry, physical, latest.message.model);
+							rightSideWithoutProvider += ` → ${routed.text}`;
+							routedProvider = routed.provider;
 						}
 					}
 					let rightSide = rightSideWithoutProvider;
-					if (footerData.getAvailableProviderCount() > 1 && ctx.model) {
+					// The prefix names who is answering. A routed label that already carries
+					// its own "(DeepInfra)" has said that, so the prefix is dropped rather
+					// than repeated: "Auto • high → v4.1F1017 (DeepInfra)" needs no
+					// "(deepseek)" in front of it.
+					if (footerData.getAvailableProviderCount() > 1 && ctx.model && !routedProvider) {
 						rightSide = `(${ctx.model.provider}) ${rightSideWithoutProvider}`;
 						if (statsLeftWidth + 2 + visibleWidth(rightSide) > width) {
 							rightSide = rightSideWithoutProvider;
@@ -397,7 +414,7 @@ export default function (pi: ExtensionAPI) {
 					// ---- deepseek peak/off-peak indicator, after the model name ----
 					const deepseekStatus = footerData.getExtensionStatuses().get("deepseek-pricing");
 					if (deepseekStatus) {
-						rightSide = `${rightSide} • ${deepseekStatus}`;
+						rightSide = `${rightSide} • ${trimRoutedTarget(deepseekStatus, routedProvider)}`;
 					}
 
 					const minPadding = 2;
