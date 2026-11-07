@@ -355,6 +355,17 @@ live tick look nearly free.
 /loop list · /loop stop [id|all] both backends; cold rows are tagged [cold]
 ```
 
+The Agent tool's own `schedule` param is **off by default**: `/loop` is the only
+door into recurring work, so a job cannot end up somewhere the user is not
+looking. `"schedulingEnabled": true` in `subagents.json` reopens that door for
+anyone who wants it — it exposes the param, not the scheduler, which binds either
+way because `--cold` is built on it.
+
+From inside a turn, the model reaches the same jobs through `manage_schedules`
+(`list`, or `cancel` with a job id). Creating a job was possible from a turn while
+listing and cancelling it were not, which left "cancel that job" answerable only
+by hand — grepping the session's own JSONL for an id was the only route left.
+
 The two backends are reached the same way: live loops arm an in-process timer,
 cold ones go over the `subagents:rpc:schedules:{list,create,remove}` channels
 (`plugins/pi-subagents/src/schedule-rpc.ts`). The scheduler announces restored
