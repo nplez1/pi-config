@@ -1,15 +1,23 @@
 /**
- * loop.ts — `/loop`: session-scoped recurring prompts, with a persistent footer
- * call-out showing how many loops are armed and when the next one fires.
+ * loop.ts — `/loop`: every recurring prompt in a session, with a persistent
+ * footer call-out showing what is armed and when the next fire lands.
  *
- * Ported from Claude Code's bundled `/loop` skill (2.1.x), which is the one
- * recurring-work surface that behaves well in a terminal: the loop re-enters the
- * *live session* as a user message, so it inherits the conversation, the model,
- * and the tools — unlike a scheduled subagent, which starts cold. That
- * distinction is the whole point:
+ * Ported from Claude Code's bundled `/loop` skill (2.1.x), then widened: the
+ * same command now drives two backends, because the choice between them is about
+ * *where the tick runs*, not about which tool you reach for.
  *
- *   /loop      a prompt re-entering this session, dies with the session
- *   subagents  `Agent(schedule:)` — a job that spawns a fresh subagent per fire
+ *   live    a timer re-enters this session as a user message, so the tick
+ *           inherits the conversation, the model and the tools. The price is the
+ *           main context: every tick re-sends the transcript, and the tick's own
+ *           messages stay in it.
+ *   cold    the job lives in pi-subagents' scheduler, which spawns a fresh
+ *           subagent per fire. A context-free repeat pays for a small fresh
+ *           context instead of a growing large one — cheaper even when prompt
+ *           caching makes the live tick look nearly free.
+ *
+ * Both are session-scoped, both come back on `/resume`, and neither outlives the
+ * session. That is why there is no durable flag here: persistence across
+ * sessions is not a mode of this extension, it is a different product.
  *
  * Two modes, exactly as Claude's skill defines them:
  *
@@ -41,11 +49,24 @@
  *     still 60 s, because a sub-minute loop is a busy-wait with extra tokens.
  */
 
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { Type } from "typebox";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import {
+  callRpc,
+  coldNextAt,
+  describeCold,
+  EVENT_READY,
+  EVENT_SCHEDULED,
+  reduceColdJobs,
+  RPC_CREATE,
+  RPC_LIST,
+  RPC_REMOVE,
+  type ColdJob,
+  type RpcEventBus,
+} from "./shared/scheduled-rpc";
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -117,8 +138,13 @@ export type LoopJob = {
   fallbackArmed: boolean;
 };
 
-/** What the footer needs, so formatting stays pure and testable. */
-export type LoopFooterView = {
+/** What the footer needs, so formatting stays pure and testable. */export type LoopFooterView = {
+  /**
+   * Which backend this entry came from. The two are counted separately because
+   * they cost different things: a live tick pays the main context again, a cold
+   * one pays for a fresh subagent session instead.
+   */
+  kind: "live" | "cold";
   mode: LoopMode;
   nextAt?: number;
   quietStreak: number;
@@ -190,6 +216,18 @@ export function parseLoopInput(raw: string): ParsedLoop {
   return { ok: true, mode: "dynamic", prompt: input };
 }
 
+/**
+ * `--cold` selects the subagent backend and is stripped before the prompt is
+ * read, so `--cold` never leaks into the text the model is asked to act on.
+ * Deliberately position-independent: both `/loop 5m --cold x` and
+ * `/loop 5m x --cold` mean the same thing.
+ */
+export function stripColdFlag(raw: string): { cold: boolean; input: string } {
+  const tokens = raw.split(/\s+/).filter(Boolean);
+  const cold = tokens.includes("--cold");
+  return { cold, input: tokens.filter((token) => token !== "--cold").join(" ") };
+}
+
 // ── Formatting (pure) ────────────────────────────────────────────────────────
 
 /** `270000` → `4m 30s`. Deliberately coarse: this is a footer, not a stopwatch. */
@@ -218,18 +256,27 @@ export function formatDuration(ms: number): string {
  */
 export function formatFooter(views: readonly LoopFooterView[], now: number): string | undefined {
   if (views.length === 0) return undefined;
-  const count = views.length === 1 ? "1 loop" : `${views.length} loops`;
+  const live = views.filter((view) => view.kind === "live").length;
+  const cold = views.length - live;
   const nextAt = views.reduce<number | undefined>((soonest, view) => {
     if (view.nextAt === undefined) return soonest;
     return soonest === undefined || view.nextAt < soonest ? view.nextAt : soonest;
   }, undefined);
-  const parts = [`◷ ${count}`];
+  const parts = [`◷ ${countLabel(live, cold)}`];
   // A dynamic loop mid-turn has no armed wakeup yet: "running" is honest, where
   // "next in 0s" would not be.
   parts.push(nextAt === undefined ? "running" : `next in ${formatDuration(Math.max(0, nextAt - now))}`);
   const quiet = Math.max(0, ...views.map((view) => view.quietStreak));
   if (quiet >= 2) parts.push(`quiet ×${quiet}`);
   return parts.join(" · ");
+}
+
+/** `1 loop · 1 job` — each backend named, and omitted when it has none. */
+export function countLabel(live: number, cold: number): string {
+  const parts: string[] = [];
+  if (live > 0) parts.push(live === 1 ? "1 loop" : `${live} loops`);
+  if (cold > 0) parts.push(cold === 1 ? "1 job" : `${cold} jobs`);
+  return parts.join(" · ") || "nothing scheduled";
 }
 
 /** `1h 2m` for a loop's cadence in listings. */
@@ -300,17 +347,85 @@ export default function (pi: ExtensionAPI) {
   let uiCtx: ExtensionContext | undefined;
   /** The model's `ScheduleWakeup` prompt override applies to the next fire only. */
   let nextPromptOverride: string | undefined;
+  /**
+   * The cold backend, mirrored from pi-subagents' event stream. `/loop` owns no
+   * timer for these: the scheduler does, and this map exists so one footer can
+   * count both backends and `/loop list` can show them in one place.
+   */
+  let coldJobs = new Map<string, ColdJob>();
+  /** Undefined when the host gives no event bus (tests, or an older pi). */
+  const bus = (pi as { events?: RpcEventBus }).events;
+  const unsubscribes: Array<() => void> = [];
+  /** Subscriptions are per-activation; a second session_start must not double them. */
+  let coldWired = false;
 
   const dynamicJob = (): Job | undefined => [...jobs.values()].find((job) => job.mode === "dynamic");
 
   function updateFooter(): void {
     if (!uiCtx?.hasUI) return;
-    const views: LoopFooterView[] = [...jobs.values()].map((job) => ({
-      mode: job.mode,
-      nextAt: job.nextAt,
-      quietStreak: job.quietStreak,
-    }));
+    const views: LoopFooterView[] = [
+      ...[...jobs.values()].map((job) => ({
+        kind: "live" as const,
+        mode: job.mode,
+        nextAt: job.nextAt,
+        quietStreak: job.quietStreak,
+      })),
+      ...[...coldJobs.values()].map((job) => ({
+        kind: "cold" as const,
+        // A cold job has no self-paced mode; its cadence is always the schedule
+        // it was created with, and it never accumulates a quiet streak here.
+        mode: "fixed" as const,
+        nextAt: coldNextAt(job),
+        quietStreak: 0,
+      })),
+    ];
     uiCtx.ui.setStatus(STATUS_KEY, formatFooter(views, Date.now()));
+  }
+
+  /**
+   * Re-read the scheduler's job list. The event stream is the fast path, but it
+   * cannot express a next-run time after a fire, so this is also the repair
+   * step: one list call per fire keeps the countdown honest for cron jobs too.
+   */
+  async function refreshColdJobs(): Promise<void> {
+    if (!bus) return;
+    try {
+      const data = await callRpc<{ jobs?: ColdJob[] }>(bus, RPC_LIST, {});
+      coldJobs = new Map((data.jobs ?? []).map((job) => [job.id, job]));
+    } catch {
+      // No scheduler in this session — pi-subagents absent, or scheduling
+      // switched off. Live loops are unaffected, so this stays silent.
+      coldJobs = new Map();
+    }
+    updateFooter();
+  }
+
+  /** Ask the scheduler to cancel a cold job. False when there is nothing to ask. */
+  async function removeColdJob(id: string): Promise<boolean> {
+    if (!bus) return false;
+    try {
+      await callRpc(bus, RPC_REMOVE, { jobId: id });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function wireColdBackend(): void {
+    if (!bus?.on || coldWired) return;
+    coldWired = true;
+    unsubscribes.push(
+      bus.on(EVENT_SCHEDULED, (event) => {
+        coldJobs = reduceColdJobs(coldJobs, event);
+        // A fire is the one event whose payload cannot say when the next one is.
+        if ((event as { type?: string } | undefined)?.type === "fired") void refreshColdJobs();
+        else updateFooter();
+      }),
+    );
+    // Emitted by pi-subagents at session_start, after it has re-armed whatever
+    // the store held. Subscribing here rather than reading the store ourselves
+    // keeps the scheduler's storage private to the scheduler.
+    unsubscribes.push(bus.on(EVENT_READY, () => void refreshColdJobs()));
   }
 
   function ensureTicker(): void {
@@ -330,6 +445,7 @@ export default function (pi: ExtensionAPI) {
   function removeJob(job: Job): void {
     jobs.delete(job.id);
     stopTickerIfIdle();
+    saveLoops();
     updateFooter();
   }
 
@@ -358,6 +474,7 @@ export default function (pi: ExtensionAPI) {
       removeJob(job);
       if (uiCtx?.hasUI) uiCtx.ui.notify(`Loop expired after 7 days: "${truncate(prompt)}"`, "info");
     } else {
+      saveLoops();
       updateFooter();
     }
 
@@ -388,6 +505,86 @@ export default function (pi: ExtensionAPI) {
   function addJob(job: Job): void {
     jobs.set(job.id, job);
     ensureTicker();
+    saveLoops();
+    updateFooter();
+  }
+
+  // ── Session-scoped persistence ──────────────────────────────────────────────
+  //
+  // Live loops used to be memory-only, which made them the one backend that
+  // `/resume` could not restore. They are now written beside the session, keyed
+  // by session id: a new session starts empty, and a resumed one finds its own
+  // loops again. Nothing outlives the session — the file is per-session state,
+  // not a schedule that keeps running when nothing is listening.
+
+  /** `<cwd>/.pi/loops/<sessionId>.json`, mirroring pi-subagents' store layout. */
+  function loopsPath(): string | undefined {
+    return uiCtx ? loopsPathFor(uiCtx) : undefined;
+  }
+
+  function saveLoops(): void {
+    const path = loopsPath();
+    if (!path) return;
+    const data: PersistedLoops = {
+      version: 1,
+      loops: [...jobs.values()].map((job) => ({
+        id: job.id,
+        prompt: job.prompt,
+        mode: job.mode,
+        intervalMs: job.intervalMs,
+        createdAt: job.createdAt,
+        expiresAt: job.expiresAt,
+        runs: job.runs,
+      })),
+    };
+    try {
+      mkdirSync(dirname(path), { recursive: true });
+      const tmp = `${path}.tmp`;
+      writeFileSync(tmp, JSON.stringify(data, null, 2));
+      renameSync(tmp, path);
+    } catch {
+      // A loop that cannot be written still runs; persistence is a resume
+      // convenience, never a precondition for scheduling.
+    }
+  }
+
+  /**
+   * Re-arm the loops a resumed session had. No catch-up: a fixed loop resumes one
+   * interval from now, and a self-paced one gets the fallback wakeup, so a
+   * session that was closed overnight does not open with a burst of fires.
+   */
+  function loadLoops(ctx: ExtensionContext): void {
+    const path = loopsPathFor(ctx);
+    if (!path || !existsSync(path)) return;
+    let data: PersistedLoops;
+    try {
+      data = JSON.parse(readFileSync(path, "utf8")) as PersistedLoops;
+    } catch {
+      return;
+    }
+    const now = Date.now();
+    for (const saved of data.loops ?? []) {
+      if (!saved?.id || !saved.prompt || now >= saved.expiresAt) continue;
+      if (jobs.has(saved.id)) continue;
+      const restored: Job = {
+        id: saved.id,
+        prompt: saved.prompt,
+        mode: saved.mode === "dynamic" ? "dynamic" : "fixed",
+        intervalMs: saved.intervalMs,
+        nextAt:
+          saved.mode === "dynamic" ? now + FALLBACK_WAKEUP_MS : now + (saved.intervalMs ?? MIN_INTERVAL_MS),
+        createdAt: saved.createdAt,
+        expiresAt: saved.expiresAt,
+        runs: saved.runs ?? 0,
+        quietStreak: 0,
+        pending: false,
+        fallbackArmed: false,
+        stopped: false,
+      };
+      jobs.set(restored.id, restored);
+    }
+    if (jobs.size > 0) ensureTicker();
+    saveLoops();
     updateFooter();
   }
 
@@ -511,7 +708,8 @@ export default function (pi: ExtensionAPI) {
   // ── Command: /loop ─────────────────────────────────────────────────────────
 
   pi.registerCommand("loop", {
-    description: "Run a prompt repeatedly in this session: /loop [interval] <prompt> · /loop list · /loop stop [id|all]",
+    description:
+      "Run a prompt repeatedly in this session: /loop [interval] [--cold] <prompt> · /loop list · /loop stop [id|all]",
     getArgumentCompletions: (prefix: string) => {
       const values = ["list", "stop", "stop all", "5m", "10m", "30m", "1h"];
       const items = values
@@ -521,43 +719,64 @@ export default function (pi: ExtensionAPI) {
     },
     handler: async (args, ctx) => {
       uiCtx = ctx;
-      const input = args.trim();
+      const { cold, input } = stripColdFlag(args.trim());
       const [head, ...rest] = input.split(/\s+/);
 
-      if (head === "list" || (!input && jobs.size > 0)) {
-        if (jobs.size === 0) {
-          ctx.ui.notify("No loops running.", "info");
+      if (head === "list" || (!input && jobs.size + coldJobs.size > 0)) {
+        if (jobs.size === 0 && coldJobs.size === 0) {
+          ctx.ui.notify("Nothing scheduled.", "info");
           return;
         }
+        const now = Date.now();
         for (const job of jobs.values()) ctx.ui.notify(describe(job), "info");
+        for (const job of coldJobs.values()) ctx.ui.notify(describeCold(job, now), "info");
         return;
       }
 
       if (head === "stop") {
         const target = rest.join(" ").trim();
-        if (jobs.size === 0) {
-          ctx.ui.notify("No loops running.", "info");
-          return;
-        }
         if (!target || target === "all") {
+          // The mirror can lag a session start, and `stop all` must not report
+          // "nothing scheduled" while the scheduler still holds jobs.
+          await refreshColdJobs();
+          if (jobs.size + coldJobs.size === 0) {
+            ctx.ui.notify("Nothing scheduled.", "info");
+            return;
+          }
           const count = jobs.size;
           for (const job of [...jobs.values()]) {
             job.stopped = true;
             jobs.delete(job.id);
           }
           stopTickerIfIdle();
+          saveLoops();
+          let coldStopped = 0;
+          for (const id of [...coldJobs.keys()]) {
+            if (await removeColdJob(id)) coldStopped += 1;
+          }
+          await refreshColdJobs();
           updateFooter();
-          ctx.ui.notify(`Stopped ${count} loop${count === 1 ? "" : "s"}.`, "info");
+          const coldNote = coldStopped > 0 ? ` and ${coldStopped} job${coldStopped === 1 ? "" : "s"}` : "";
+          ctx.ui.notify(`Stopped ${count} loop${count === 1 ? "" : "s"}${coldNote}.`, "info");
           return;
         }
         const job = jobs.get(target);
-        if (!job) {
-          ctx.ui.notify(`No loop with id "${target}". Try /loop list.`, "warning");
+        if (job) {
+          job.stopped = true;
+          removeJob(job);
+          ctx.ui.notify(`Stopped loop ${target}.`, "info");
           return;
         }
-        job.stopped = true;
-        removeJob(job);
-        ctx.ui.notify(`Stopped loop ${target}.`, "info");
+        // A cold id is resolved against the scheduler, not the mirror: the mirror
+        // is filled from events and can lag a session start, and a `stop` typed
+        // early must still reach the job it names.
+        await refreshColdJobs();
+        if (coldJobs.has(target) && (await removeColdJob(target))) {
+          await refreshColdJobs();
+          ctx.ui.notify(`Stopped cold job ${target}.`, "info");
+          return;
+        }
+        ctx.ui.notify(`No scheduled work with id "${target}". Try /loop list.`, "warning");
         return;
       }
 
@@ -602,6 +821,46 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
+      // `--cold` hands the job to pi-subagents, which spawns a fresh subagent per
+      // fire instead of re-entering this session. Same command, same footer,
+      // same session-scoped lifetime — a different execution home.
+      if (cold) {
+        if (parsed.mode !== "fixed") {
+          ctx.ui.notify(
+            "--cold needs an interval: /loop 5m --cold <prompt>. A self-paced loop has to run in this session to pick its own delay.",
+            "warning",
+          );
+          return;
+        }
+        if (!bus) {
+          ctx.ui.notify("--cold needs pi-subagents for its scheduler, and this session has no event bus.", "warning");
+          return;
+        }
+        let coldCadence = parsed.intervalText;
+        if (parsed.intervalMs < MIN_INTERVAL_MS) {
+          ctx.ui.notify(
+            `${parsed.intervalText} is below the ${formatDuration(MIN_INTERVAL_MS)} floor; using ${formatDuration(MIN_INTERVAL_MS)}.`,
+            "warning",
+          );
+          coldCadence = formatDuration(MIN_INTERVAL_MS);
+        }
+        try {
+          const created = await callRpc<{ id: string; nextRun?: string }>(bus, RPC_CREATE, {
+            schedule: coldCadence,
+            prompt: parsed.prompt,
+            subagent_type: "general-purpose",
+          });
+          await refreshColdJobs();
+          ctx.ui.notify(
+            `Cold loop ${created.id} armed · every ${coldCadence} · runs in a subagent session, not this context · first run ${created.nextRun ?? "pending"} · stop with /loop stop ${created.id}.`,
+            "info",
+          );
+        } catch (err) {
+          ctx.ui.notify(`Cold loop not armed — ${err instanceof Error ? err.message : String(err)}`, "warning");
+        }
+        return;
+      }
+
       if (parsed.mode === "dynamic" && dynamicJob()) {
         ctx.ui.notify(
           "A self-paced loop is already running. Stop it first (/loop stop) or give this one an interval: /loop 5m <prompt>.",
@@ -639,8 +898,15 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     uiCtx = ctx;
-    // Loops are session-scoped by design (Claude restores only on --resume), so
-    // a new session starts empty and a stale footer segment is cleared here.
+    // Session-scoped by design: a new session starts empty, and `/resume` finds
+    // its own loops again from the per-session store. Nothing outlives a
+    // session, which is why there is no durable flag to set here.
+    wireColdBackend();
+    loadLoops(ctx);
+    // The scheduler emits `subagents:scheduler_ready` from its own session_start
+    // handler, which may run before this one. Asking once here covers the other
+    // ordering; the call is idempotent.
+    void refreshColdJobs();
     updateFooter();
   });
 
@@ -680,12 +946,43 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_shutdown", async () => {
     if (ticker) clearInterval(ticker);
     ticker = undefined;
+    for (const off of unsubscribes.splice(0)) off();
+    coldWired = false;
     jobs.clear();
+    coldJobs = new Map();
     uiCtx = undefined;
   });
 }
 
 // ── Small helpers ────────────────────────────────────────────────────────────
+
+/** On-disk shape for a session's live loops. */
+type PersistedLoops = {
+  version: 1;
+  loops: Array<{
+    id: string;
+    prompt: string;
+    mode: LoopMode;
+    intervalMs?: number;
+    createdAt: number;
+    expiresAt: number;
+    runs: number;
+  }>;
+};
+
+/** The session id a loop store is keyed by; undefined when the host exposes none. */
+function sessionIdOf(ctx: ExtensionContext | undefined): string | undefined {
+  const manager = (ctx as { sessionManager?: { getSessionId?: () => string | undefined } } | undefined)
+    ?.sessionManager;
+  return manager?.getSessionId?.();
+}
+
+/** `<cwd>/.pi/loops/<sessionId>.json` — per-session, never a standing schedule. */
+function loopsPathFor(ctx: ExtensionContext): string | undefined {
+  const sessionId = sessionIdOf(ctx);
+  return sessionId ? join(ctx.cwd, ".pi", "loops", `${sessionId}.json`) : undefined;
+}
+
 
 function text(value: string) {
   return { content: [{ type: "text" as const, text: value }], details: { result: value } };

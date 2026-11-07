@@ -10,7 +10,18 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-loop-'));
 after(() => fs.rmSync(root, { recursive: true, force: true }));
 const extension = fileURLToPath(new URL('../dot-pi/agent/extensions/loop.ts', import.meta.url));
-fs.cpSync(extension, path.join(root, 'loop.ts'));
+// `loop.ts` imports its cold-backend helper as `./shared/scheduled-rpc` (no
+// extension), which is what pi's loader resolves and what plain Node does not.
+// The copy gets the extension added rather than the source, so production keeps
+// the loader-shaped specifier and the test still runs on bare Node.
+fs.cpSync(
+  fileURLToPath(new URL('../dot-pi/agent/extensions/shared/scheduled-rpc.ts', import.meta.url)),
+  path.join(root, 'scheduled-rpc.ts'),
+);
+fs.writeFileSync(
+  path.join(root, 'loop.ts'),
+  fs.readFileSync(extension, 'utf8').replace('./shared/scheduled-rpc', './scheduled-rpc.ts'),
+);
 fs.writeFileSync(path.join(root, 'package.json'), '{"type":"module"}');
 
 // Minimal TypeBox stand-in: the tests never validate a schema, they only need
@@ -107,29 +118,51 @@ test('footer counts loops and shows the soonest next run', () => {
   const now = 1_000_000;
   const footer = loop.formatFooter(
     [
-      { mode: 'fixed', nextAt: now + 270_000, quietStreak: 0 },
-      { mode: 'fixed', nextAt: now + 60_000, quietStreak: 0 },
+      { kind: 'live', mode: 'fixed', nextAt: now + 270_000, quietStreak: 0 },
+      { kind: 'live', mode: 'fixed', nextAt: now + 60_000, quietStreak: 0 },
     ],
     now
   );
   assert.equal(footer, '◷ 2 loops · next in 1m');
 });
 
+test('footer names both backends when both are scheduled', () => {
+  const now = 1_000_000;
+  const footer = loop.formatFooter(
+    [
+      { kind: 'live', mode: 'fixed', nextAt: now + 300_000, quietStreak: 0 },
+      { kind: 'cold', mode: 'fixed', nextAt: now + 60_000, quietStreak: 0 },
+    ],
+    now
+  );
+  // The soonest fire wins regardless of backend, and each is counted on its own.
+  assert.equal(footer, '◷ 1 loop · 1 job · next in 1m');
+});
+
+test('footer says only "job" when the live backend has nothing armed', () => {
+  const now = 1_000_000;
+  const footer = loop.formatFooter([{ kind: 'cold', mode: 'fixed', nextAt: now + 120_000, quietStreak: 0 }], now);
+  assert.equal(footer, '◷ 1 job · next in 2m');
+});
+
 test('footer says "running" while a dynamic loop awaits its wakeup', () => {
-  const footer = loop.formatFooter([{ mode: 'dynamic', nextAt: undefined, quietStreak: 0 }], 1_000_000);
+  const footer = loop.formatFooter([{ kind: 'live', mode: 'dynamic', nextAt: undefined, quietStreak: 0 }], 1_000_000);
   assert.equal(footer, '◷ 1 loop · running');
 });
 
 test('footer surfaces a quiet streak only once it is worth mentioning', () => {
   const now = 1_000_000;
-  const view = (quietStreak) => ({ mode: 'dynamic', nextAt: now + 60_000, quietStreak });
+  const view = (quietStreak) => ({ kind: 'live', mode: 'dynamic', nextAt: now + 60_000, quietStreak });
   assert.equal(loop.formatFooter([view(1)], now), '◷ 1 loop · next in 1m');
   assert.equal(loop.formatFooter([view(3)], now), '◷ 1 loop · next in 1m · quiet ×3');
 });
 
 test('footer clamps a past-due next run to zero rather than going negative', () => {
   const now = 1_000_000;
-  assert.equal(loop.formatFooter([{ mode: 'fixed', nextAt: now - 5_000, quietStreak: 0 }], now), '◷ 1 loop · next in 0s');
+  assert.equal(
+    loop.formatFooter([{ kind: 'live', mode: 'fixed', nextAt: now - 5_000, quietStreak: 0 }], now),
+    '◷ 1 loop · next in 0s'
+  );
 });
 
 // ── Scheduling arithmetic ───────────────────────────────────────────────────
@@ -166,18 +199,69 @@ test('the documented limits are the ones Claude uses', () => {
 
 // ── Extension wiring (fake pi, no model call) ───────────────────────────────
 
-function harness() {
+function harness(options = {}) {
   const tools = new Map();
   const commands = new Map();
   const handlers = new Map();
   const statuses = new Map();
   const notices = [];
   const sent = [];
+  const busCalls = [];
+  const busHandlers = new Map();
+  // A fake pi-subagents scheduler: enough of the three RPCs for `/loop` to drive
+  // the cold backend, with an in-memory job list it can list, create into, and
+  // remove from.
+  const coldJobs = new Map((options.coldJobs ?? []).map((job) => [job.id, job]));
+
+  const bus = {
+    on(event, fn) {
+      const set = busHandlers.get(event) ?? new Set();
+      set.add(fn);
+      busHandlers.set(event, set);
+      return () => set.delete(fn);
+    },
+    emit(event, data) {
+      busCalls.push({ event, data });
+      if (!event.startsWith('subagents:rpc:schedules:')) {
+        // A real bus notifies subscribers; that is how the scheduler's own events
+        // reach `/loop`, so the fake has to do it too.
+        for (const fn of busHandlers.get(event) ?? []) fn(data);
+        return;
+      }
+      const replyChannel = `${event}:reply:${data.requestId}`;
+      let reply;
+      if (options.failRpc) reply = { success: false, error: options.failRpc };
+      else if (event.endsWith(':list')) reply = { success: true, data: { jobs: [...coldJobs.values()] } };
+      else if (event.endsWith(':create')) {
+        const id = `cold${coldJobs.size + 1}`;
+        coldJobs.set(id, {
+          id,
+          name: data.prompt,
+          schedule: data.schedule,
+          scheduleType: 'interval',
+          enabled: true,
+          prompt: data.prompt,
+          runCount: 0,
+          nextRun: new Date(Date.now() + 60_000).toISOString(),
+        });
+        reply = { success: true, data: { id, nextRun: coldJobs.get(id).nextRun } };
+      } else if (event.endsWith(':remove')) {
+        coldJobs.delete(data.jobId);
+        reply = { success: true, data: { removed: data.jobId } };
+      }
+      // Reply out of band, the way a real extension would: the caller is already
+      // awaiting the promise this emit is inside of.
+      queueMicrotask(() => {
+        for (const fn of busHandlers.get(replyChannel) ?? []) fn(reply);
+      });
+    },
+  };
 
   const ctx = {
-    cwd: root,
+    cwd: options.cwd ?? root,
     hasUI: true,
     isIdle: () => true,
+    ...(options.sessionId ? { sessionManager: { getSessionId: () => options.sessionId } } : {}),
     ui: {
       setStatus: (key, value) => statuses.set(key, value),
       notify: (message, level) => notices.push({ message, level }),
@@ -185,14 +269,15 @@ function harness() {
   };
 
   const pi = {
+    events: options.noBus ? undefined : bus,
     registerTool: (tool) => tools.set(tool.name, tool),
-    registerCommand: (name, options) => commands.set(name, options),
+    registerCommand: (name, options2) => commands.set(name, options2),
     on: (event, handler) => handlers.set(event, handler),
     sendUserMessage: (content) => sent.push(content),
   };
 
   loop.default(pi);
-  return { tools, commands, handlers, statuses, notices, sent, ctx, pi };
+  return { tools, commands, handlers, statuses, notices, sent, ctx, pi, bus, busCalls, coldJobs };
 }
 
 const tool = (h) => h.tools.get('ScheduleWakeup');
@@ -357,4 +442,178 @@ test('bare /loop with no loop.md shows usage rather than arming an empty loop', 
   assert.match(h.notices.at(-1).message, /^Usage: \/loop \[interval\] <prompt>/);
   assert.deepEqual(h.sent, []);
   h.handlers.get('session_shutdown')();
+});
+
+// ── Cold backend: the same command, a subagent execution home ───────────────
+//
+// Cold exists because a live tick pays for the main context every fire: the whole
+// transcript goes back to the model, and the tick's messages stay in it. A cold
+// tick is a separate subagent session. Both are session-scoped, so the only
+// difference a user should see is the tag and the footer count.
+
+const coldJob = (overrides = {}) => ({
+  id: 'cold-a',
+  name: 'say hello',
+  schedule: '1m',
+  scheduleType: 'interval',
+  intervalMs: 60_000,
+  enabled: true,
+  prompt: 'say hello',
+  runCount: 0,
+  nextRun: new Date(Date.now() + 60_000).toISOString(),
+  ...overrides,
+});
+
+test('--cold is stripped wherever it appears, so it never reaches the prompt', () => {
+  assert.deepEqual(loop.stripColdFlag('1m --cold say hello'), { cold: true, input: '1m say hello' });
+  assert.deepEqual(loop.stripColdFlag('1m say hello --cold'), { cold: true, input: '1m say hello' });
+  assert.deepEqual(loop.stripColdFlag('1m say hello'), { cold: false, input: '1m say hello' });
+});
+
+test('/loop 5m --cold hands the job to the scheduler instead of the session', async () => {
+  const h = harness();
+  await run(h, '5m --cold say hello');
+
+  // The whole point: nothing is injected into this conversation.
+  assert.deepEqual(h.sent, []);
+  const created = h.busCalls.find((call) => call.event.endsWith(':create'));
+  assert.equal(created.data.schedule, '5m');
+  assert.equal(created.data.prompt, 'say hello');
+  assert.match(h.notices.at(-1).message, /Cold loop cold1 armed · every 5m · runs in a subagent session/);
+  assert.equal(h.statuses.get('loop'), '◷ 1 job · next in 1m');
+  h.handlers.get('session_shutdown')();
+});
+
+test('--cold refuses a self-paced loop, which needs a session to pace itself in', async () => {
+  const h = harness();
+  await run(h, '--cold say hello');
+  assert.match(h.notices.at(-1).message, /--cold needs an interval/);
+  assert.equal(h.busCalls.filter((call) => call.event.endsWith(':create')).length, 0);
+  h.handlers.get('session_shutdown')();
+});
+
+test('--cold reports the scheduler being unavailable rather than arming nothing', async () => {
+  const h = harness({ noBus: true });
+  await run(h, '5m --cold say hello');
+  assert.match(h.notices.at(-1).message, /--cold needs pi-subagents/);
+  assert.deepEqual(h.sent, []);
+  h.handlers.get('session_shutdown')();
+});
+
+test('--cold surfaces a scheduler refusal instead of pretending it worked', async () => {
+  const h = harness({ failRpc: 'Scheduler is not active in this session yet.' });
+  await run(h, '5m --cold say hello');
+  assert.match(h.notices.at(-1).message, /Cold loop not armed — Scheduler is not active/);
+  assert.equal(h.statuses.get('loop'), undefined);
+  h.handlers.get('session_shutdown')();
+});
+
+test('/loop list shows both backends, each tagged with its execution home', async () => {
+  const h = harness({ coldJobs: [coldJob()] });
+  await h.handlers.get('session_start')({}, h.ctx);
+  await run(h, '30m sweep the queue');
+  h.notices.length = 0;
+  await run(h, 'list');
+  assert.equal(h.notices.length, 2);
+  assert.match(h.notices[0].message, /^◷ [a-z0-9]+ · every 30m · next in 30m · runs 1 · expires in 7d · "sweep the queue"$/);
+  assert.match(h.notices[1].message, /^◷ cold-a · \[cold\] every 1m · next in 1m · runs 0 · "say hello"$/);
+  h.handlers.get('session_shutdown')();
+});
+
+test('/loop stop routes a cold id to the scheduler', async () => {
+  const h = harness({ coldJobs: [coldJob()] });
+  await h.handlers.get('session_start')({}, h.ctx);
+  await run(h, 'stop cold-a');
+  const removed = h.busCalls.find((call) => call.event.endsWith(':remove'));
+  assert.equal(removed.data.jobId, 'cold-a');
+  assert.match(h.notices.at(-1).message, /Stopped cold job cold-a\./);
+  assert.equal(h.statuses.get('loop'), undefined);
+  h.handlers.get('session_shutdown')();
+});
+
+test('/loop stop all stops both backends and counts them separately', async () => {
+  const h = harness({ coldJobs: [coldJob()] });
+  await h.handlers.get('session_start')({}, h.ctx);
+  await run(h, '30m sweep the queue');
+  await run(h, 'stop all');
+  assert.match(h.notices.at(-1).message, /^Stopped 1 loop and 1 job\.$/);
+  assert.equal(h.statuses.get('loop'), undefined);
+  h.handlers.get('session_shutdown')();
+});
+
+test('a cold job appears in the footer as soon as the scheduler announces it', async () => {
+  const h = harness();
+  await h.handlers.get('session_start')({}, h.ctx);
+  h.bus.emit('subagents:scheduled', { type: 'added', job: coldJob() });
+  assert.equal(h.statuses.get('loop'), '◷ 1 job · next in 1m');
+  h.bus.emit('subagents:scheduled', { type: 'removed', jobId: 'cold-a' });
+  assert.equal(h.statuses.get('loop'), undefined);
+  h.handlers.get('session_shutdown')();
+});
+
+// ── Session scope: resumed, never standing ──────────────────────────────────
+
+test('a resumed session restores its live loops, without a burst of catch-up fires', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-loop-resume-'));
+  const sessionId = 'session-abc';
+  fs.mkdirSync(path.join(dir, '.pi', 'loops'), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, '.pi', 'loops', `${sessionId}.json`),
+    JSON.stringify({
+      version: 1,
+      loops: [
+        {
+          id: 'kept',
+          prompt: 'check the deploy',
+          mode: 'fixed',
+          intervalMs: 300_000,
+          createdAt: Date.now() - 60_000,
+          expiresAt: Date.now() + 86_400_000,
+          runs: 4,
+        },
+      ],
+    })
+  );
+
+  const h = harness({ cwd: dir, sessionId });
+  await h.handlers.get('session_start')({}, h.ctx);
+
+  // Restored and visible, but nothing was injected: the missed slot is dropped,
+  // not replayed, and the next fire is a full interval away.
+  assert.equal(h.statuses.get('loop'), '◷ 1 loop · next in 5m');
+  assert.deepEqual(h.sent, []);
+  h.notices.length = 0;
+  await run(h, 'list');
+  assert.match(h.notices[0].message, /runs 4/);
+  h.handlers.get('session_shutdown')();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('a new session does not inherit another session\'s loops', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-loop-fresh-'));
+  fs.mkdirSync(path.join(dir, '.pi', 'loops'), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, '.pi', 'loops', 'other-session.json'),
+    JSON.stringify({ version: 1, loops: [{ id: 'x', prompt: 'p', mode: 'fixed', intervalMs: 60_000, createdAt: 1, expiresAt: Date.now() + 86_400_000, runs: 0 }] })
+  );
+  const h = harness({ cwd: dir, sessionId: 'this-session' });
+  await h.handlers.get('session_start')({}, h.ctx);
+  assert.equal(h.statuses.get('loop'), undefined);
+  h.handlers.get('session_shutdown')();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('an expired persisted loop is not restored', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-loop-expired-'));
+  const sessionId = 'session-old';
+  fs.mkdirSync(path.join(dir, '.pi', 'loops'), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, '.pi', 'loops', `${sessionId}.json`),
+    JSON.stringify({ version: 1, loops: [{ id: 'gone', prompt: 'p', mode: 'fixed', intervalMs: 60_000, createdAt: 1, expiresAt: Date.now() - 1, runs: 9 }] })
+  );
+  const h = harness({ cwd: dir, sessionId });
+  await h.handlers.get('session_start')({}, h.ctx);
+  assert.equal(h.statuses.get('loop'), undefined);
+  h.handlers.get('session_shutdown')();
+  fs.rmSync(dir, { recursive: true, force: true });
 });

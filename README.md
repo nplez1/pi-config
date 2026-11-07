@@ -331,31 +331,48 @@ Known gap: DeepSeek's docs also make Chinese public holidays off-peak all day;
 `DEEPSEEK_HOLIDAYS` in the shared module is empty, so a holiday is treated as a
 normal weekday (it over-routes to DeepInfra for that day rather than mis-pricing).
 
-## `/loop` — recurring prompts in the live session
+## `/loop` — one scheduler, two execution homes
 
-`extensions/loop.ts` ports Claude Code's `/loop`: a prompt that re-enters **this
-session** on a cadence, so it keeps the conversation, the model, and the tools.
-That is the point of it — a scheduled *subagent* (`Agent(schedule:)`, the
-`pi-subagents` scheduler) starts cold every fire; a loop does not.
+`extensions/loop.ts` owns every recurring prompt in a session. It has two
+backends and presents them as one command, one list, and one footer segment:
+
+| backend | what fires | cost per tick |
+| --- | --- | --- |
+| live (default) | the prompt re-enters **this** session — conversation, model and tools intact | the whole transcript goes to the model again |
+| cold (`--cold`) | the `pi-subagents` scheduler spawns a fresh subagent session | a small fresh context, nothing added here |
+
+Cold is **not** about persistence — both backends are session-scoped, both come
+back on `/resume`, and neither outlives the session. Cold is about context: a
+context-free repeat costs less in a subagent even when prompt caching makes the
+live tick look nearly free.
 
 ```text
-/loop 5m check the deploy        fixed interval — a timer, first run immediately
-/loop check the deploy           self-paced — the model picks each delay
+/loop 5m check the deploy        live, fixed interval — first run immediately
+/loop check the deploy           live, self-paced — the model picks each delay
+/loop 1m --cold say hello        cold — a subagent session per fire
 /loop                            self-paced on .pi/loop.md (or ~/.pi/agent/loop.md)
 /loop 5m                         that file at a fixed cadence
-/loop list · /loop stop [id|all] inspect, then stop
+/loop list · /loop stop [id|all] both backends; cold rows are tagged [cold]
 ```
+
+The two backends are reached the same way: live loops arm an in-process timer,
+cold ones go over the `subagents:rpc:schedules:{list,create,remove}` channels
+(`plugins/pi-subagents/src/schedule-rpc.ts`). The scheduler announces restored
+and changed jobs on `subagents:scheduled`, which is how `/loop` mirrors them
+without knowing where the scheduler keeps its store.
 
 Self-paced mode is driven by the `ScheduleWakeup` tool, which the model calls at
 the end of each turn with `delaySeconds` (clamped to `[60, 3600]`), a `reason`,
 and `noop` for a tick that changed nothing. A turn that ends without scheduling
 one gets a single 20-minute grace wakeup; a second silent turn ends the loop.
+It is live-only: a cold loop has no session to pace itself in.
 
 The count and the soonest fire ride on the footer's **path/branch row** —
-`~/Code/pi-config (main) • ◷ 1 loop · next in 4m 30s` — plus `quiet ×N` while
-consecutive no-op ticks pile up. It is appended there rather than given a status
-row of its own (`nice-model-footer.ts` pulls the `loop` status out of the status
-list), and a narrow footer truncates the path before it truncates the countdown.
+`~/Code/pi-config (main) • ◷ 1 loop · 1 job · next in 4m 30s` — naming each
+backend that has work armed, plus `quiet ×N` while consecutive live no-op ticks
+pile up. It is appended there rather than given a status row of its own
+(`nice-model-footer.ts` pulls the `loop` status out of the status list), and a
+narrow footer truncates the path before it truncates the countdown.
 Claude's REPL has no such persistent counter (2.1.316 shows a `next run` row per
 tool call instead); `setStatus` is what makes it possible here.
 
@@ -368,15 +385,18 @@ Rules carried over from Claude, each of which is a lesson rather than a detail:
 | 7-day expiry, one final fire | a forgotten loop cannot run forever |
 | 60 s floor | anything faster is a busy-wait with extra tokens |
 | First iteration runs at creation | a loop you cannot see start is one you cannot trust |
-| Max 50 loops, one self-paced loop | a pending wakeup is a per-session slot |
+| Max 50 live loops, one self-paced loop | a pending wakeup is a per-session slot |
 
-Session-scoped by design: loops die with the session, exactly as Claude's do
-outside `--resume`. For work that must survive the terminal, use the
-`pi-subagents` scheduler (`Agent(schedule:)`), which spawns a fresh subagent per
-fire instead of re-entering this session.
+Session-scoped, restored on `/resume`, never standing: live loops are written to
+`.pi/loops/<sessionId>.json` and cold jobs to `.pi/subagent-schedules/<sessionId>.json`.
+A new session starts empty, a resumed one re-arms its own work one interval out
+(no replay of missed slots), and closing the terminal stops everything — there is
+no durable flag to set, because a schedule nobody is listening to is not a
+feature.
 
 ```sh
 node --test tests/loop.test.mjs
+(cd plugins/pi-subagents && npx vitest run)
 ```
 
 ## Intentionally not tracked
