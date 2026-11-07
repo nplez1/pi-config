@@ -38,19 +38,19 @@ const LUNA = { provider: 'github-copilot', id: 'gpt-6-luna', name: 'GPT-6 Luna',
 const DEEPSEEK_AUTO = { provider: 'deepseek', id: 'deepseek-flash-auto', name: 'Deepseek v4.1 Flash Auto', api: 'pi-virtual', reasoning: true, contextWindow: 1000000 };
 const DEEPINFRA_FLASH = { provider: 'deepinfra', id: 'deepseek-ai/DeepSeek-V4.1-Flash-1017', name: 'Deepseek v4.1 Flash 1017 (DeepInfra)', api: 'openai-completions', reasoning: true, contextWindow: 1000000 };
 
-function render({ model, branch = [], providers = 2, width = 200, thinkingLevel = 'off', models = [LUNA], providerNames = {} }) {
+function render({ model, branch = [], providers = 2, width = 200, thinkingLevel = 'off', models = [LUNA], providerNames = {}, statuses = new Map(), cwd = '/tmp/work' }) {
   let footerFactory;
   const handlers = {};
   register({ on: (name, fn) => { handlers[name] = fn; } });
   const ctx = {
     mode: 'tui',
-    cwd: '/tmp/work',
+    cwd,
     model,
     thinkingLevel,
     sessionManager: {
       getEntries: () => branch,
       getBranch: () => branch,
-      getCwd: () => '/tmp/work',
+      getCwd: () => cwd,
       getSessionName: () => undefined,
     },
     getContextUsage: () => ({ contextWindow: model?.contextWindow ?? 100000, percent: 12.3 }),
@@ -66,12 +66,67 @@ function render({ model, branch = [], providers = 2, width = 200, thinkingLevel 
   const theme = { fg: (_color, s) => s, bold: s => s };
   const footerData = {
     getGitBranch: () => undefined,
-    getExtensionStatuses: () => new Map(),
+    getExtensionStatuses: () => statuses,
     getAvailableProviderCount: () => providers,
     onBranchChange: () => () => {},
   };
   return footerFactory({ requestRender: () => {} }, theme, footerData).render(width).join('\n');
 }
+
+test('the loop call-out rides on the path line instead of taking its own row', () => {
+  const out = render({
+    model: LUNA,
+    statuses: new Map([['loop', '◷ 1 loop · next in 4m 30s']]),
+  });
+  const lines = out.split('\n');
+  assert.equal(lines[0], '/tmp/work • ◷ 1 loop · next in 4m 30s', out);
+  assert.equal(lines.filter(line => line.includes('◷')).length, 1, 'exactly one line carries the loop');
+  assert.ok(!lines.slice(1).some(line => line.includes('loop')), out);
+});
+
+test('the loop call-out is the one thing a narrow footer keeps', () => {
+  // 40 columns cannot hold the path and the countdown: the path gives way.
+  const out = render({
+    model: LUNA,
+    width: 40,
+    statuses: new Map([['loop', '◷ 2 loops · next in 12m']]),
+  });
+  const first = out.split('\n')[0];
+  assert.ok(first.endsWith('◷ 2 loops · next in 12m'), out);
+  assert.ok(first.length <= 40, `${first} is wider than the footer`);
+});
+
+test('a loop call-out that cannot fit at all is truncated, not dropped', () => {
+  const out = render({
+    model: LUNA,
+    width: 12,
+    statuses: new Map([['loop', '◷ 2 loops · next in 12m']]),
+  });
+  const first = out.split('\n')[0];
+  assert.equal(first, '◷ 2 loops...', out);
+});
+
+test('unrelated extension statuses still get their own row', () => {
+  const out = render({
+    model: LUNA,
+    statuses: new Map([
+      ['loop', '◷ 1 loop · running'],
+      ['zeta-ext', 'ready'],
+      ['alpha-ext', 'watching'],
+    ]),
+  });
+  const lines = out.split('\n');
+  assert.equal(lines[0], '/tmp/work • ◷ 1 loop · running', out);
+  assert.equal(lines.at(-1), 'watching ready', out);
+});
+
+test('a multi-line status is flattened before it reaches the path line', () => {
+  const out = render({
+    model: LUNA,
+    statuses: new Map([['loop', '◷ 1 loop\nnext  in\t4m']]),
+  });
+  assert.equal(out.split('\n')[0], '/tmp/work • ◷ 1 loop next in 4m', out);
+});
 
 test('a virtual selection shows where the latest response routed', () => {
   const out = render({ model: FUSION, branch: [assistant('github-copilot', 'gpt-6-luna')] });

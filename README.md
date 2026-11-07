@@ -221,6 +221,7 @@ bun test dot-pi/agent/extensions/shared/copilot-fusion-*.test.ts
 python3 tests/fusion_auth_test.py
 python3 tests/fusion_compaction_test.py
 node --test tests/nice-model-footer.test.mjs
+node --test tests/loop.test.mjs
 (cd plugins/pi-smart-compaction && npm test)
 ```
 
@@ -329,6 +330,54 @@ provider `deepinfra` (it is not tracked, and `models.json` holds no key):
 Known gap: DeepSeek's docs also make Chinese public holidays off-peak all day;
 `DEEPSEEK_HOLIDAYS` in the shared module is empty, so a holiday is treated as a
 normal weekday (it over-routes to DeepInfra for that day rather than mis-pricing).
+
+## `/loop` — recurring prompts in the live session
+
+`extensions/loop.ts` ports Claude Code's `/loop`: a prompt that re-enters **this
+session** on a cadence, so it keeps the conversation, the model, and the tools.
+That is the point of it — a scheduled *subagent* (`Agent(schedule:)`, the
+`pi-subagents` scheduler) starts cold every fire; a loop does not.
+
+```text
+/loop 5m check the deploy        fixed interval — a timer, first run immediately
+/loop check the deploy           self-paced — the model picks each delay
+/loop                            self-paced on .pi/loop.md (or ~/.pi/agent/loop.md)
+/loop 5m                         that file at a fixed cadence
+/loop list · /loop stop [id|all] inspect, then stop
+```
+
+Self-paced mode is driven by the `ScheduleWakeup` tool, which the model calls at
+the end of each turn with `delaySeconds` (clamped to `[60, 3600]`), a `reason`,
+and `noop` for a tick that changed nothing. A turn that ends without scheduling
+one gets a single 20-minute grace wakeup; a second silent turn ends the loop.
+
+The count and the soonest fire ride on the footer's **path/branch row** —
+`~/Code/pi-config (main) • ◷ 1 loop · next in 4m 30s` — plus `quiet ×N` while
+consecutive no-op ticks pile up. It is appended there rather than given a status
+row of its own (`nice-model-footer.ts` pulls the `loop` status out of the status
+list), and a narrow footer truncates the path before it truncates the countdown.
+Claude's REPL has no such persistent counter (2.1.316 shows a `next run` row per
+tool call instead); `setStatus` is what makes it possible here.
+
+Rules carried over from Claude, each of which is a lesson rather than a detail:
+
+| Rule | Why |
+| --- | --- |
+| Fires land between turns, never mid-response | a due loop waits for the run to settle |
+| No catch-up | N missed fires become one fire, not N |
+| 7-day expiry, one final fire | a forgotten loop cannot run forever |
+| 60 s floor | anything faster is a busy-wait with extra tokens |
+| First iteration runs at creation | a loop you cannot see start is one you cannot trust |
+| Max 50 loops, one self-paced loop | a pending wakeup is a per-session slot |
+
+Session-scoped by design: loops die with the session, exactly as Claude's do
+outside `--resume`. For work that must survive the terminal, use the
+`pi-subagents` scheduler (`Agent(schedule:)`), which spawns a fresh subagent per
+fire instead of re-entering this session.
+
+```sh
+node --test tests/loop.test.mjs
+```
 
 ## Intentionally not tracked
 

@@ -150,6 +150,48 @@ function idleThresholdLabel(statuses: ReadonlyMap<string, string>): string | und
 	return statuses.get(SMART_COMPACTION_STATUS)?.match(/idle≥\S+/)?.[0];
 }
 
+/**
+ * `/loop` publishes "◷ 1 loop · next in 4m 30s". It belongs on the path line —
+ * a scheduled loop is a property of where the session is running, and a second
+ * status row for one countdown costs a line for the whole session.
+ */
+const LOOP_STATUS = "loop";
+
+/** Statuses that render somewhere other than the trailing status row. */
+const STATUSES_RENDERED_ELSEWHERE = new Set(["deepseek-pricing", SMART_COMPACTION_STATUS, LOOP_STATUS]);
+
+/** Footer statuses are single-line by contract; flatten anything an extension lets through. */
+function normalizeStatusText(text: string | undefined): string | undefined {
+	if (!text) return undefined;
+	const flat = text
+		.replace(/[\r\n\t]/g, " ")
+		.replace(/ +/g, " ")
+		.trim();
+	return flat || undefined;
+}
+
+/**
+ * The path/branch row, with the loop call-out appended to it.
+ *
+ * The path is what gets truncated when the two do not fit, because the countdown
+ * is the part that changes and the part a person is looking for; a truncated path
+ * still identifies the directory.
+ */
+function composePwdLine(
+	pwd: string,
+	loopStatus: string | undefined,
+	width: number,
+	dim: (text: string) => string,
+): string {
+	if (!loopStatus) return truncateToWidth(dim(pwd), width, dim("..."));
+	const tail = ` • ${loopStatus}`;
+	const tailWidth = visibleWidth(tail);
+	if (tailWidth >= width) return truncateToWidth(dim(loopStatus), width, dim("..."));
+	const room = width - tailWidth;
+	const head = visibleWidth(pwd) > room ? truncateToWidth(pwd, room, "...") : pwd;
+	return truncateToWidth(dim(`${head}${tail}`), width, dim("..."));
+}
+
 /** Read compaction.enabled from global + project settings.json (project wins). */
 const settingsCache = new Map<string, { mtime: number; enabled: boolean | undefined }>();
 function readCompactionEnabled(paths: string[]): boolean {
@@ -359,22 +401,22 @@ export default function (pi: ExtensionAPI) {
 					const remainder = statsLine.slice(statsLeft.length);
 					const dimRemainder = theme.fg("dim", remainder);
 
-					const pwdLine = truncateToWidth(theme.fg("dim", pwd), width, theme.fg("dim", "..."));
+					const pwdLine = composePwdLine(
+						pwd,
+						normalizeStatusText(extensionStatuses.get(LOOP_STATUS)),
+						width,
+						(text) => theme.fg("dim", text),
+					);
 
 					const lines = [pwdLine, dimStatsLeft + dimRemainder];
 
 					if (extensionStatuses.size > 0) {
 						const sortedStatuses = Array.from(extensionStatuses.entries())
-							// Both are rendered elsewhere: deepseek after the model name,
-							// smart-compaction inside the context-usage parentheses.
-							.filter(([key]) => key !== "deepseek-pricing" && key !== SMART_COMPACTION_STATUS)
+							// Rendered elsewhere: deepseek after the model name, smart-compaction
+							// inside the context-usage parentheses, loop on the path line.
+							.filter(([key]) => !STATUSES_RENDERED_ELSEWHERE.has(key))
 							.sort(([a], [b]) => a.localeCompare(b))
-							.map(([, text]) =>
-								text
-									.replace(/[\r\n\t]/g, " ")
-									.replace(/ +/g, " ")
-									.trim(),
-							);
+							.map(([, text]) => normalizeStatusText(text));
 						const statusLine = sortedStatuses.filter(Boolean).join(" ");
 						// A status line that filtered down to nothing must not leave a blank row.
 						if (statusLine) lines.push(truncateToWidth(statusLine, width, theme.fg("dim", "...")));
