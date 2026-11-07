@@ -355,16 +355,19 @@ live tick look nearly free.
 /loop list · /loop stop [id|all] both backends; cold rows are tagged [cold]
 ```
 
-The Agent tool's own `schedule` param is **off by default**: `/loop` is the only
-door into recurring work, so a job cannot end up somewhere the user is not
-looking. `"schedulingEnabled": true` in `subagents.json` reopens that door for
-anyone who wants it — it exposes the param, not the scheduler, which binds either
-way because `--cold` is built on it.
+The Agent tool has **no** `schedule` param, and no setting adds one back.
+Recurring work has exactly two doors, one per audience: the user types `/loop`,
+the model calls `manage_schedules`. A job created through either is the same
+object in the same store, so `/loop list` shows what the model scheduled and the
+model can cancel what you started. The Agent param was retired because it and
+`/loop` shared one scheduler — the louder guideline decided where a job landed,
+and a job created from a turn ended up somewhere the user was not looking.
 
-From inside a turn, the model reaches the same jobs through `manage_schedules`
-(`list`, or `cancel` with a job id). Creating a job was possible from a turn while
-listing and cancelling it were not, which left "cancel that job" answerable only
-by hand — grepping the session's own JSONL for an id was the only route left.
+`manage_schedules` takes `create` (a `schedule` and a `prompt`, plus optional
+`name`, `subagent_type`, `model`, `thinking`, `max_turns`), `list`, and `cancel`
+with a job id. `create` registers a **cold** job: the model cannot arm a live tick
+in this session, because a live tick re-enters the conversation the model is
+already in, and only you get to decide that.
 
 The two backends are reached the same way: live loops arm an in-process timer,
 cold ones go over the `subagents:rpc:schedules:{list,create,remove}` channels
