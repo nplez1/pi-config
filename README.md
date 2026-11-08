@@ -233,14 +233,16 @@ is stale and rebuilds nothing, `-Force` rebuilds all three, `-Verbose` streams
 each builder's log.
 
 **The `pi` swap.** `pi-swap.ps1 apply` writes
-`%USERPROFILE%\.pi\agent\bin\pi.cmd` and puts that directory on the user `PATH`,
-so `pi` runs pi-bolt everywhere. A real launcher is preserved as `pi-real.cmd`
-first: the one it displaces in that directory, or a stock `pi` found elsewhere on
-`PATH` (npm installs into `%APPDATA%\npm`, which the shim would otherwise
-shadow), wrapped so it still resolves its own directory. `pi-real` or `PI_REAL=1`
-reaches it, `remove` puts the original back byte for byte, and with no preserved
-launcher `PI_REAL=1` exits 127 instead of quietly running pi-bolt. `status`
-prints what `pi`, `pi-real` and `pi-bolt` resolve to.
+`%USERPROFILE%\.pi\agent\bin\pi.cmd` and puts that directory on the user `PATH`
+(broadcasting the change, so Explorer and what it launches see it without a
+logoff), so `pi` runs pi-bolt everywhere. A real launcher is preserved as
+`pi-real.cmd` first: the one it displaces in that directory, or a stock `pi`
+found elsewhere on `PATH` — npm installs `pi.ps1`, `pi.cmd` and an extensionless
+script side by side, and only the `.cmd` is a launcher worth wrapping. `pi-real`
+or `PI_REAL=1` reaches it, and `remove` puts a displaced launcher back byte for
+byte (a wrapper to a stock pi elsewhere is simply deleted, since that pi never
+moved). With no preserved launcher, `PI_REAL=1` exits 127 instead of quietly
+running pi-bolt. `status` prints what `pi`, `pi-real` and `pi-bolt` resolve to.
 
 **Tests.** `node --test tests/*.test.mjs` covers `install.ps1`, `rebuild.ps1` and
 `pi-swap.ps1` against a disposable repo and `%USERPROFILE%`, with a `PATH` that

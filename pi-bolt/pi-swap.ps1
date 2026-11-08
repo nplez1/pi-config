@@ -50,6 +50,9 @@ $PiShim   = Join-Path $AgentBin 'pi.cmd'
 $PiReal   = Join-Path $AgentBin 'pi-real.cmd'
 $State    = Join-Path $BoltHome '.pi-swap-state'
 $Marker   = 'pi-swap-shim'
+# The pi-real wrapper needs its own marker: with the shim's marker it would be
+# mistaken for the shim itself after `remove` moved it into place.
+$RealMarker = 'pi-swap-real-wrapper'
 # A managed machine can refuse the user PATH write, and a test must never touch
 # the real one. Either way the shim is still written; only PATH is left alone.
 $SkipPath = $env:PI_SWAP_SKIP_PATH -eq '1'
@@ -82,16 +85,16 @@ function Get-ShimBody {
     'where pi-bolt >nul 2>&1 || goto pi_swap_missing',
     'rem The Unix shim routes `update`/`compile` through after-update.sh and',
     'rem rebuild.sh; those are bash and are not ported, so call pi-bolt directly.',
-    'pi-bolt %*',
+    'call pi-bolt %*',
     'exit /b %ERRORLEVEL%',
     '',
     ':pi_swap_real',
-    "if not exist `"$PiReal`" goto pi_swap_no_real",
-    "call `"$PiReal`" %*",
+    'if not exist "%~dp0pi-real.cmd" goto pi_swap_no_real',
+    'call "%~dp0pi-real.cmd" %*',
     'exit /b %ERRORLEVEL%',
     '',
     ':pi_swap_no_real',
-    "echo pi-swap: PI_REAL=1 but there is no preserved launcher at $PiReal. Revert with $BoltHome\pi-swap.ps1 remove 1>&2",
+    "echo pi-swap: PI_REAL=1 but there is no preserved launcher at %~dp0pi-real.cmd. Revert with $BoltHome\pi-swap.ps1 remove 1>&2",
     'exit /b 127',
     '',
     ':pi_swap_missing',
@@ -99,6 +102,23 @@ function Get-ShimBody {
     'exit /b 127'
   )
   return $body
+}
+
+# Set-ItemProperty writes the value but announces nothing, where
+# [Environment]::SetEnvironmentVariable used to broadcast WM_SETTINGCHANGE:
+# Explorer, and everything started from it (Start menu, VS Code, Orca — the very
+# reason this swap exists), would keep the old PATH until logoff.
+function Send-EnvironmentChange {
+  try {
+    if (-not ('PiSwap.NativeMethods' -as [type])) {
+      Add-Type -Namespace PiSwap -Name NativeMethods -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true, CharSet = System.Runtime.InteropServices.CharSet.Auto)]
+public static extern System.IntPtr SendMessageTimeout(System.IntPtr hWnd, uint Msg, System.UIntPtr wParam, string lParam, uint fuFlags, uint uTimeout, out System.UIntPtr lpdwResult);
+'@
+    }
+    $result = [System.UIntPtr]::Zero
+    [void][PiSwap.NativeMethods]::SendMessageTimeout([System.IntPtr]0xffff, 0x1A, [System.UIntPtr]::Zero, 'Environment', 2, 5000, [ref]$result)
+  } catch { }
 }
 
 # The .NET accessor expands REG_EXPAND_SZ and writes the result back as REG_SZ,
@@ -110,6 +130,9 @@ function Get-RawUserPath {
     $raw = $key.GetValue('Path', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
     if ($null -ne $raw) { return [string]$raw }
   } catch { }
+  # A scratch key with no value means "no user PATH", not "the real one": the
+  # test seam must never read this machine's value by accident.
+  if ($env:PI_SWAP_PATH_KEY) { return $null }
   return [Environment]::GetEnvironmentVariable('PATH', 'User')
 }
 
@@ -118,6 +141,7 @@ function Set-RawUserPath([string]$value) {
   # ExpandString keeps any %VARS% unexpanded, whether or not the old value was
   # REG_SZ; a value with no variables behaves identically either way.
   Set-ItemProperty -LiteralPath $PathKey -Name 'Path' -Value $value -Type ExpandString
+  Send-EnvironmentChange
 }
 
 function Test-PathHasAgentBin {
@@ -140,10 +164,17 @@ function Add-AgentBinToPath {
 function Remove-AgentBinFromPath {
   $userPath = Get-RawUserPath
   if (-not $userPath) { return $false }
-  $kept = $userPath -split ';' | Where-Object {
-    $t = $_.Trim(); $t -ne '' -and ($t.TrimEnd('\') -ine $AgentBin.TrimEnd('\'))
+  # Only the AgentBin entry goes: empty segments stay as they were.
+  $kept = @($userPath -split ';' | Where-Object { $_.TrimEnd('\') -ine $AgentBin.TrimEnd('\') })
+  $joined = $kept -join ';'
+  if ([string]::IsNullOrWhiteSpace($joined)) {
+    # There was no user PATH before apply, so leave none behind rather than an
+    # empty REG_EXPAND_SZ.
+    Remove-ItemProperty -LiteralPath $PathKey -Name 'Path' -ErrorAction SilentlyContinue
+    Send-EnvironmentChange
+  } else {
+    Set-RawUserPath $joined
   }
-  Set-RawUserPath ($kept -join ';')
   return $true
 }
 
@@ -151,12 +182,24 @@ function Remove-AgentBinFromPath {
 # once AgentBin is earlier on PATH; it would never be found by looking at the
 # shim's own path. Find it where it actually is, so `pi-real` exists when the
 # machine really has a pi to go back to.
+#
+# npm also drops pi.ps1 and an extensionless sh script beside pi.cmd, and
+# PowerShell resolves the .ps1 first — a wrapper around that opens in Notepad.
+# Only an application (.exe/.cmd/.bat) can be wrapped, and -All is what finds it
+# when AgentBin is already first on PATH.
 function Find-RealPi {
-  $found = Get-Command pi -ErrorAction SilentlyContinue | Select-Object -First 1
-  if (-not $found -or -not $found.Source) { return $null }
-  $dir = (Split-Path -Parent $found.Source).TrimEnd('\')
-  if ($dir -ieq $AgentBin.TrimEnd('\')) { return $null }   # that is our shim
-  return $found.Source
+  $found = Get-Command pi -All -ErrorAction SilentlyContinue |
+    Where-Object { $_.Source -and ($_.Extension -in @('.exe', '.cmd', '.bat')) } |
+    Where-Object { (Split-Path -Parent $_.Source).TrimEnd('\') -ine $AgentBin.TrimEnd('\') } |
+    Select-Object -First 1
+  if ($found) { return $found.Source }
+  return $null
+}
+
+function Test-IsRealWrapper([string]$path) {
+  if (-not (Test-Path -LiteralPath $path)) { return $false }
+  try { return (Select-String -LiteralPath $path -Pattern $RealMarker -SimpleMatch -Quiet) }
+  catch { return $false }
 }
 
 function Invoke-Apply {
@@ -187,17 +230,19 @@ function Invoke-Apply {
       # directory with %~dp0, which breaks the moment it is relocated.
       $body = @(
         '@echo off',
-        "rem $Marker - the real pi launcher, preserved by pi-swap.ps1",
-        "`"$real`" %*",
+        "rem $RealMarker - the real pi launcher, preserved by pi-swap.ps1",
+        "call `"$real`" %*",
         'exit /b %ERRORLEVEL%'
       )
-      Set-Content -LiteralPath $PiReal -Value $body -Encoding ASCII
+      # Default (ANSI), not ASCII: a profile path with non-ASCII characters would
+      # otherwise be written as '?' and neither file would run.
+      Set-Content -LiteralPath $PiReal -Value $body -Encoding Default
       Write-Output "pi-swap: preserved $real as $PiReal"
       $preserved = $true
     }
   }
 
-  Set-Content -LiteralPath $PiShim -Value (Get-ShimBody) -Encoding ASCII
+  Set-Content -LiteralPath $PiShim -Value (Get-ShimBody) -Encoding Default
   Write-Output "pi-swap: wrote $PiShim"
 
   if ($SkipPath) {
@@ -219,7 +264,14 @@ function Invoke-Apply {
 
 function Invoke-Remove {
   if (Test-IsShim $PiShim) {
-    if (Test-Path -LiteralPath $PiReal) {
+    if (Test-IsRealWrapper $PiReal) {
+      # The wrapper only pointed at a stock pi that never moved, so there is
+      # nothing to put back — and turning the wrapper into `pi` would leave a
+      # file Test-IsShim recognises, which the next apply would then skip.
+      Remove-Item -LiteralPath $PiShim -Force
+      Remove-Item -LiteralPath $PiReal -Force
+      Write-Output "pi-swap: removed the shim and its pi-real wrapper (the stock pi was never moved)"
+    } elseif (Test-Path -LiteralPath $PiReal) {
       Move-Item -LiteralPath $PiReal -Destination $PiShim -Force
       Write-Output "pi-swap: restored $PiShim from $PiReal"
     } else {
@@ -232,13 +284,18 @@ function Invoke-Remove {
     Write-Output "pi-swap: no shim at $PiShim"
   }
 
-  if ((Test-Path -LiteralPath $State) -and -not $SkipPath) {
-    if ((Get-Content -LiteralPath $State -Raw).Trim() -eq 'added-agent-bin-to-path') {
-      Remove-AgentBinFromPath | Out-Null
-      Write-Output "pi-swap: removed $AgentBin from your user PATH"
+  if (Test-Path -LiteralPath $State) {
+    if ($SkipPath) {
+      # The PATH entry is still there, so the record of it has to stay too.
+      Write-Output "pi-swap: PI_SWAP_SKIP_PATH=1 - left your user PATH alone (state kept for a later remove)"
+    } else {
+      if ((Get-Content -LiteralPath $State -Raw).Trim() -eq 'added-agent-bin-to-path') {
+        Remove-AgentBinFromPath | Out-Null
+        Write-Output "pi-swap: removed $AgentBin from your user PATH"
+      }
+      Remove-Item -LiteralPath $State -Force
     }
   }
-  if (Test-Path -LiteralPath $State) { Remove-Item -LiteralPath $State -Force }
 
   Write-Output 'pi-swap: removed - `pi` no longer runs pi-bolt'
 }

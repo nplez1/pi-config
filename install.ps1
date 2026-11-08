@@ -119,8 +119,23 @@ function Get-LinkTarget([string]$path) {
   $item = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
   if (-not $item) { return $null }
   if ($item.LinkTarget) { return $item.LinkTarget }
-  if ($item.Target) { return ($item.Target -join '') }
+  # A hardlink can have many names; Target lists all of them, so joining them
+  # would build a garbage path. One name is enough for display.
+  if ($item.Target) { return (@($item.Target) | Select-Object -First 1) }
   return $null
+}
+
+# Does this link (or hardlink, which has no single target) point at $src? A
+# multi-name hardlink lists every name, so any match counts.
+function Test-LinkPointsAt([string]$path, [string]$src) {
+  $item = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+  if (-not $item) { return $false }
+  foreach ($target in @($item.Target)) {
+    if (-not $target) { continue }
+    $resolved = Resolve-Path -LiteralPath $target -ErrorAction SilentlyContinue
+    if ($resolved -and $resolved.Path -eq $src) { return $true }
+  }
+  return $false
 }
 
 # Create a link. Symlink needs privilege (Developer Mode or elevated); a
@@ -130,7 +145,7 @@ function Get-LinkTarget([string]$path) {
 # the hardlink tier, since a directory cannot be hardlinked.
 function New-ConfigLink([string]$src, [string]$dst) {
   $isDir = Test-Path -LiteralPath $src -PathType Container
-  $pinned = $env:PI_CONFIG_LINK_MODE
+  $pinned = $script:LinkMode
   if (-not $pinned -or $pinned -eq 'symlink') {
     try { New-Item -ItemType SymbolicLink -Path $dst -Target $src -ErrorAction Stop | Out-Null; return 'symlink' } catch { }
   }
@@ -158,11 +173,8 @@ function New-ConfigLink([string]$src, [string]$dst) {
 function Invoke-Link([string]$rel, [string]$dst) {
   $src = Join-Path $Repo ($rel -replace '/', '\')
   if (-not (Test-Path -LiteralPath $src)) { Write-Line 'skip' "$rel (missing in repo)"; return }
-  if (Test-IsLink $dst) {
-    $cur = Get-LinkTarget $dst
-    if ($cur -and ((Resolve-Path -LiteralPath $cur -ErrorAction SilentlyContinue).Path -eq $src)) {
-      Write-Line 'ok' $dst; return
-    }
+  if (Test-LinkPointsAt $dst $src) {
+    Write-Line 'ok' $dst; return
   }
   $parent = Split-Path -Parent $dst
   if ($Mode -ne 'dry-run') { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
@@ -203,13 +215,18 @@ function Invoke-Seed([string]$rel, [string]$dst) {
   $parent = Split-Path -Parent $dst
   if ($Mode -ne 'dry-run') { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
 
-  if (Test-IsLink $dst) {
+  if (Test-LinkPointsAt $dst $src) {
     Write-Line 'convert' "$dst (link -> local copy)"
     if ($Mode -ne 'dry-run') {
       Remove-Item -LiteralPath $dst -Force -ErrorAction SilentlyContinue
       Copy-Item -LiteralPath $src -Destination $dst -Force
       $script:Changed++
     }
+  } elseif (Test-IsLink $dst) {
+    # A link to something else — including a hardlink to a file outside this
+    # repo — is the machine's own file. Converting it would delete the values it
+    # holds, so leave it alone.
+    Write-Line 'keep' "$dst (link to $(Get-LinkTarget $dst); use 'capture' to publish changes)"
   } elseif (Test-Path -LiteralPath $dst) {
     Write-Line 'keep' "$dst (machine-owned; use 'capture' to publish changes)"
   } else {
@@ -386,6 +403,14 @@ function Invoke-Uninstall {
 }
 
 # ------------------------------------------------------------------ main -----
+# Validate the tier before anything is linked: an unrecognised value would
+# otherwise make New-ConfigLink return $null and SKIP every target.
+$script:LinkMode = $env:PI_CONFIG_LINK_MODE
+if ($script:LinkMode -and $script:LinkMode -notin @('symlink', 'hardlink', 'copy')) {
+  Write-Line 'WARN' "unknown PI_CONFIG_LINK_MODE '$($script:LinkMode)'; using the default tiers"
+  $script:LinkMode = $null
+}
+
 Write-Output "pi-config (Windows port) — repo: $Repo"
 Write-Output "home: $HomeDir"
 Write-Output "mode: $Mode"

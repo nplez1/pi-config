@@ -200,7 +200,26 @@ test('uninstall removes the links into the repo and leaves machine-owned files',
   // Removing a link must never reach through it.
   assert.ok(fs.existsSync(path.join(f.repo, 'dot-pi/agent/models.json')), 'uninstall must not touch the repo file');
   assert.ok(fs.existsSync(path.join(f.repo, 'plugins')), 'uninstall must not delete the repo plugins');
+  assert.ok(fs.existsSync(path.join(f.repo, 'dot-pi/agent/extensions/fast-search/index.js')),
+    'uninstall must not delete a linked directory\'s contents');
+  assert.equal(fs.existsSync(path.join(f.home, '.pi/agent/extensions/fast-search')), false);
   assert.equal(fs.existsSync(path.join(f.home, '.pi/agent/plugins')), false, 'the plugins link is removed');
+});
+
+test('a machine-owned file hardlinked outside the repo is kept, not overwritten', { skip }, (t) => {
+  const f = fixture(t);
+  // A hardlink to a file the user owns elsewhere: shared bytes, no path back into
+  // this repo. Converting it would delete the values it holds.
+  const outside = path.join(f.root, 'my-settings.json');
+  fs.writeFileSync(outside, '{"defaultModel":"mine"}\n');
+  const live = path.join(f.home, '.pi/agent/settings.json');
+  fs.mkdirSync(path.dirname(live), { recursive: true });
+  fs.linkSync(outside, live);
+
+  const out = f.ok(f.install(), 'install over a foreign hardlink');
+  assert.match(out, /^keep\s+.*settings\.json/m);
+  assert.match(fs.readFileSync(live, 'utf8'), /mine/, 'machine values must survive');
+  assert.deepEqual(f.backups(), [], 'nothing should be backed up or replaced');
 });
 
 test('capture publishes shared keys and strips the account-owned ones', { skip }, (t) => {
@@ -395,20 +414,56 @@ test('pi-swap.ps1 preserves a stock pi that lives elsewhere on PATH', { skip }, 
   const f = fixture(t);
   const stock = path.join(f.root, 'npm');
   fs.mkdirSync(stock, { recursive: true });
-  fs.writeFileSync(path.join(stock, 'pi.cmd'), '@echo off\r\necho stock\r\n');
+  // npm drops all three names side by side, and PowerShell resolves the .ps1
+  // first — wrapping that one opens it in an editor instead of running pi.
+  fs.writeFileSync(path.join(stock, 'pi.cmd'), '@echo off\r\necho stock pi\r\nexit /b 0\r\n');
+  fs.writeFileSync(path.join(stock, 'pi.ps1'), 'Write-Output "stock pi ps1"\n');
+  fs.writeFileSync(path.join(stock, 'pi'), '#!/bin/sh\necho stock pi sh\n');
   fs.writeFileSync(path.join(f.bin, 'pi-bolt.cmd'), '@echo off\r\nexit /b 0\r\n');
   const extra = {
     PI_SWAP_SKIP_PATH: '1',
-    PATH: [f.bin, stock, nodeBin, system32].join(';'),
+    PATH: [f.bin, stock, nodeBin, system32, powershellDir].join(';'),
   };
 
   const applied = f.ok(f.swap(['apply'], extra), 'apply with a stock pi on PATH');
   assert.match(applied, /preserved .*pi\.cmd as/);
-  const real = fs.readFileSync(path.join(f.home, '.pi/agent/bin/pi-real.cmd'), 'utf8');
-  assert.ok(real.includes(path.join(stock, 'pi.cmd')), 'pi-real must point at the stock launcher by absolute path');
+  const realPath = path.join(f.home, '.pi/agent/bin/pi-real.cmd');
+  const real = fs.readFileSync(realPath, 'utf8');
+  assert.ok(real.includes(path.join(stock, 'pi.cmd')), `pi-real must wrap pi.cmd: ${real}`);
+  assert.equal(real.includes('pi.ps1'), false, 'a .ps1 is not a launcher to wrap');
+
+  // PI_REAL=1 through the shim has to reach the stock launcher.
+  const viaShim = spawnSync('cmd.exe', ['/c', path.join(f.home, '.pi/agent/bin/pi.cmd')],
+    { env: { ...f.env, ...extra, PI_REAL: '1' }, encoding: 'utf8' });
+  assert.equal(viaShim.status, 0, `PI_REAL=1 failed:\n${viaShim.stdout}${viaShim.stderr}`);
+  assert.match(viaShim.stdout, /stock pi/, `PI_REAL=1 must run the stock pi: ${viaShim.stdout}`);
+
+  // remove drops both: the stock pi never moved, so there is nothing to restore,
+  // and a wrapper left behind would make the next apply skip preservation.
+  f.ok(f.swap(['remove'], extra), 'remove');
+  assert.equal(fs.existsSync(realPath), false, 'the wrapper must not outlive remove');
+  assert.equal(fs.existsSync(path.join(f.home, '.pi/agent/bin/pi.cmd')), false);
+  assert.ok(fs.existsSync(path.join(stock, 'pi.cmd')), 'the stock launcher is untouched');
 });
 
-test('pi-swap.ps1 keeps an unexpanded REG_EXPAND_SZ user PATH', { skip }, (t) => {
+test('the shim propagates pi-bolt exit codes and reports a missing pi-bolt', { skip }, (t) => {
+  const f = fixture(t);
+  const shim = path.join(f.home, '.pi/agent/bin/pi.cmd');
+  const bolt = path.join(f.bin, 'pi-bolt.cmd');
+  fs.writeFileSync(bolt, '@echo off\r\nexit /b 3\r\n');
+  f.ok(f.swap(['apply'], { PI_SWAP_SKIP_PATH: '1' }), 'apply');
+
+  const propagated = spawnSync('cmd.exe', ['/c', shim], { env: f.env, encoding: 'utf8' });
+  assert.equal(propagated.status, 3, `the shim must return pi-bolt's code:\n${propagated.stdout}${propagated.stderr}`);
+
+  // Without pi-bolt on PATH the shim has to say so and fail, not fall through.
+  fs.rmSync(bolt);
+  const missing = spawnSync('cmd.exe', ['/c', shim], { env: f.env, encoding: 'utf8' });
+  assert.equal(missing.status, 127, `a missing pi-bolt must exit 127:\n${missing.stdout}${missing.stderr}`);
+  assert.match(`${missing.stdout}${missing.stderr}`, /pi-bolt is not on PATH/);
+});
+
+test('pi-swap.ps1 keeps an unexpanded user PATH and its value kind', { skip }, (t) => {
   const f = fixture(t);
   fs.writeFileSync(path.join(f.bin, 'pi-bolt.cmd'), '@echo off\r\nexit /b 0\r\n');
   // A scratch registry key stands in for HKCU:\Environment, so the real user
@@ -416,22 +471,33 @@ test('pi-swap.ps1 keeps an unexpanded REG_EXPAND_SZ user PATH', { skip }, (t) =>
   const key = `HKCU:\\Software\\pi-config-test-${process.pid}`;
   const ps = (command) => execFileSync(powershell, ['-NoProfile', '-Command', command],
     { encoding: 'utf8', env: f.env });
-  ps(`New-Item -Path '${key}' -Force | Out-Null; ` +
-     `Set-ItemProperty -LiteralPath '${key}' -Name 'Path' -Value '%USERPROFILE%\\bin' -Type ExpandString`);
+  ps(`New-Item -Path '${key}' -Force | Out-Null`);
   t.after(() => {
     try { ps(`Remove-Item -LiteralPath '${key}' -Recurse -Force -ErrorAction SilentlyContinue`) } catch {}
   });
-  const read = () => ps(`(Get-Item -LiteralPath '${key}').GetValue('Path', $null, ` +
+  const raw = () => ps(`(Get-Item -LiteralPath '${key}').GetValue('Path', $null, ` +
     `[Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)`).trim();
+  const kind = () => ps(`(Get-Item -LiteralPath '${key}').GetValueKind('Path')`).trim();
   const extra = { PI_SWAP_PATH_KEY: key };
 
+  // An expandable value: %VAR% must survive, and the kind must stay expandable —
+  // DoNotExpandEnvironmentNames also returns a literal %VAR% from REG_SZ, so the
+  // text alone would not prove the write kept it expandable.
+  ps(`Set-ItemProperty -LiteralPath '${key}' -Name 'Path' -Value '%USERPROFILE%\\bin' -Type ExpandString`);
   f.ok(f.swap(['apply'], extra), 'apply');
-  assert.ok(read().startsWith(path.join(f.home, '.pi/agent/bin')), `apply must prepend the agent bin: ${read()}`);
-  assert.ok(read().includes('%USERPROFILE%\\bin'),
-    `apply must not expand an existing %VAR% entry (it would become a fixed path): ${read()}`);
-
+  assert.ok(raw().startsWith(path.join(f.home, '.pi/agent/bin')), `apply must prepend the agent bin: ${raw()}`);
+  assert.ok(raw().includes('%USERPROFILE%\\bin'),
+    `apply must not expand an existing %VAR% entry (it would become a fixed path): ${raw()}`);
+  assert.equal(kind(), 'ExpandString');
   f.ok(f.swap(['remove'], extra), 'remove');
-  assert.equal(read(), '%USERPROFILE%\\bin', 'remove must restore the original value exactly');
+  assert.equal(raw(), '%USERPROFILE%\\bin', 'remove must restore the original value exactly');
+
+  // A plain REG_SZ value round-trips unchanged, with no separator drift.
+  ps(`Set-ItemProperty -LiteralPath '${key}' -Name 'Path' -Value 'C:\\tools\\bin;D:\\other' -Type String`);
+  f.ok(f.swap(['apply'], extra), 'apply over REG_SZ');
+  assert.equal(raw(), `${path.join(f.home, '.pi/agent/bin')};C:\\tools\\bin;D:\\other`);
+  f.ok(f.swap(['remove'], extra), 'remove over REG_SZ');
+  assert.equal(raw(), 'C:\\tools\\bin;D:\\other');
 });
 
 test('the shim fails loudly when PI_REAL=1 has nothing to restore', { skip }, (t) => {
