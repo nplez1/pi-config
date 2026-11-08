@@ -29,8 +29,11 @@
     * The Unix helper scripts (pi-bolt/rebuild.sh, pi-swap.sh, after-update.sh,
       deps-audit.sh) are bash. pi-bolt/rebuild.sh is replaced by
       pi-bolt/rebuild.ps1 (run it via pi-bolt/rebuild.cmd), which this script
-      runs; pi-bolt is provisioned with its own official Windows installer
-      instead of install.sh, and the `pi` swap is done by pi-swap.ps1.
+      runs, and the bundle and build-input halves of after-update.sh are
+      pi-bolt/after-update.ps1 (after-update.cmd), which the `pi` shim runs after
+      every `pi update`; the dependency audit and the compile set stay Unix-only.
+      pi-bolt is provisioned with its own official Windows installer instead of
+      install.sh, and the `pi` swap is done by pi-swap.ps1.
 
 .PARAMETER DryRun
   Print what would happen, change nothing.
@@ -680,10 +683,14 @@ Write-Output ''
 Write-Output 'Unix-only steps (not ported to Windows):'
 foreach ($item in @(
     'pi-bolt compile — unavailable: this build answers "compiling extensions in is not available on Windows yet"',
-    'pi-bolt/after-update.sh — bash; post-update compile/bundle/deps reconciliation (this script does the bundle half)',
     'pi-bolt/deps-audit.sh — bash; pins undici and runs npm audit fix',
     'patches/model-picker.mjs — patches the pi bundle, which Windows does not install'
   )) { Write-Line 'skip' $item }
+
+# The half of after-update.sh that does exist here, said out loud because a shim
+# written before pi-bolt/after-update.cmd existed does nothing after an update —
+# and `apply` above is what rewrites that shim.
+Write-Line 'note' '`pi update` runs pi-bolt\after-update.cmd afterwards (bundles + the web-access build input)'
 
 # `pi-bolt compile` is not merely unported — the Windows build refuses every
 # mode, including --list and --status, and it exits 0 while doing so. A future

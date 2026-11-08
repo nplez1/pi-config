@@ -438,6 +438,13 @@ started by pi or Orca gets the same file on `PATH`. After `pi update` and
 `pi compile` it runs `after-update.sh` — see [Keeping up to date](#keeping-up-to-date) —
 and it still preserves the command's exit code, so a failed update stays failed.
 
+On Windows the shim routes `pi update` through `after-update.cmd` instead
+(`after-update.ps1`, a port rather than the same script): the bundle and
+build-input halves only, because `pi-bolt compile` answers "compiling extensions
+in is not available on Windows yet" for every mode and `deps-audit.sh` stays
+bash. `pi-swap.ps1` writes that shim, and the Windows port as a whole is
+documented in the repository README.
+
 A stale rebuild reports two lines rather than the builder's whole log:
 
 ```

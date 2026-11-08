@@ -116,6 +116,7 @@ pi-bolt/                          -> ~/.pi/agent/pi-bolt-bundles
   lib/bundle-info.mjs             fingerprint + build-info writer + shim snippet
   compile-exclude.txt             extensions `pi-bolt compile` must leave out
   after-update.sh                 re-syncs deps, bundles and the compile set
+  after-update.ps1 / .cmd         the Windows half: bundles + the build input
   deps-audit.sh                   pins undici, then `npm audit fix`, in both trees
   pi-swap.sh                      the reversible `pi` -> pi-bolt switch
   pi-bolt-subagents/  pi-bolt-web-access/  pi-bolt-advisor-subagent/
@@ -205,7 +206,7 @@ assuming it:
 | portable files | symlinks | symlink, else junction (dirs) / hardlink (files), else a copy that says so |
 | `fd`, `rg` | Homebrew | `winget` (`sharkdp.fd`, `BurntSushi.ripgrep.MSVC`) |
 | Pi-Bolt | `install.sh` | the official Windows installer |
-| bundles | `rebuild.sh` from the `~/.zshrc` hook | `pi-bolt\rebuild.cmd`, run by hand — Windows has no launch hook |
+| bundles | `rebuild.sh` from the `~/.zshrc` hook | `after-update.cmd` after `pi update`, and `pi-bolt\rebuild.cmd` by hand |
 | `pi` → pi-bolt | `pi-swap.sh` | `pi-bolt\pi-swap.ps1` |
 
 The env vars are the same: `PI_CONFIG_SKIP_PLUGINS`, `PI_CONFIG_SKIP_PIBOLT`,
@@ -224,16 +225,21 @@ noticing the link is gone.
 **Not ported.** `pi-bolt compile` answers "compiling extensions in is not
 available on Windows yet" for every mode, so extensions load from files and the
 prebuilt `dist-bun` bundles are the only start-up lever — which is why the bundle
-rebuild matters more here than on Unix. The `pi` shim does the bundle half of
-`after-update.sh`: on `pi update` it runs pi-bolt's update and then rebuilds the
-bundles if they went stale, so a bumped pi-web-access cannot leave the old code
-running silently (`update --models` only rewrites the catalog and rebuilds
-nothing). `pi-bolt/after-update.sh`, `pi-bolt/deps-audit.sh` and
-`patches/model-picker.mjs` remain bash, or patch the pi bundle that Windows never
-installs (the model-picker guard reports that as "nothing to patch" rather than
-an error). Run `pi-bolt\rebuild.cmd` yourself after a pull or a submodule bump:
-`-Check` exits 1 when a bundle is stale and rebuilds nothing, `-Force` rebuilds
-all three, `-Verbose` streams each builder's log.
+rebuild matters more here than on Unix. The `pi` shim routes `pi update`
+through `after-update.cmd`, which is the Windows half of `after-update.sh`: it
+restores the `pi-web-access` build input that `npm install` prunes out of the
+extension tree, then rebuilds the bundles if they went stale, so a bumped
+pi-web-access can neither leave the old code running silently nor leave a bundle
+that cannot be rebuilt at all (`update --models` moves no packages and re-syncs
+nothing). It is silent when there is nothing to do, reports problems on stderr,
+and never changes the update's exit code. Two steps stay Unix-only, and it says so
+rather than implying otherwise: `deps-audit.sh` (the `undici` pin, then
+`npm audit fix`) is bash, and there is no compile set to re-assert.
+`patches/model-picker.mjs` patches the pi bundle Windows never installs, so the
+model-picker guard reports "nothing to patch" rather than an error. Run
+`pi-bolt\rebuild.cmd` after a pull or a submodule bump, or
+`pi-bolt\after-update.cmd` to reconcile both halves: `-Check` exits 1 when
+something is out of step and changes nothing, `-Verbose` prints every verdict.
 
 **The `pi` swap.** `pi-swap.ps1 apply` writes
 `%USERPROFILE%\.pi\agent\bin\pi.cmd` and puts that directory on the user `PATH`
@@ -247,9 +253,11 @@ byte (a wrapper to a stock pi elsewhere is simply deleted, since that pi never
 moved). With no preserved launcher, `PI_REAL=1` exits 127 instead of quietly
 running pi-bolt. `status` prints what `pi`, `pi-real` and `pi-bolt` resolve to.
 
-**Tests.** `node --test tests/*.test.mjs` covers `install.ps1`, `rebuild.ps1` and
-`pi-swap.ps1` against a disposable repo and `%USERPROFILE%`, with a `PATH` that
-holds no winget, npm or user `PATH`; those cases report as skipped off Windows.
+**Tests.** `node --test tests/*.test.mjs` covers `install.ps1`, `rebuild.ps1`,
+`after-update.ps1` and `pi-swap.ps1` against a disposable repo and
+`%USERPROFILE%`, with a `PATH` that holds no winget and no reachable npm (a
+fail-closed stub stands in for it, since npm.cmd lives beside node.exe); those
+cases report as skipped off Windows.
 The fast-search suite is green on Windows apart from two POSIX-only cases it
 reports as skipped, and
 [`probe-windows.mjs`](dot-pi/agent/extensions/fast-search/tests/probe-windows.mjs)

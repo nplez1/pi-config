@@ -21,8 +21,10 @@
       preserve. When one exists it is preserved as `pi-real.cmd` and reachable
       with `pi-real` or PI_REAL=1, exactly like the Unix version.
     * The Unix shim routes `update` and `compile` through after-update.sh and
-      rebuild.sh. Those are bash and are not ported, so the Windows shim calls
-      pi-bolt directly and says so.
+      rebuild.sh. `compile` has no Windows equivalent (`pi-bolt compile` refuses
+      every mode here), so the Windows shim routes `update` through
+      after-update.cmd: the bundle and build-input halves of after-update.sh,
+      which are the two that exist on this platform.
 
 .EXAMPLE
   .\pi-swap.ps1 apply
@@ -84,10 +86,12 @@ function Get-ShimBody {
     'if "%PI_REAL%"=="1" goto pi_swap_real',
     'where pi-bolt >nul 2>&1 || goto pi_swap_missing',
     'rem The Unix shim routes `update`/`compile` through after-update.sh and',
-    'rem rebuild.sh. `compile` has no Windows equivalent, but the bundle half of',
-    'rem after-update.sh does: `pi update --extensions` bumps pi-web-access, and',
-    'rem the prebuilt dist-bun bundle wrapping it is a snapshot, so pi-bolt keeps',
-    'rem running the old code silently until something rebuilds it.',
+    'rem rebuild.sh. `compile` has no Windows equivalent, but the bundle and',
+    'rem build-input halves of after-update.sh do: `pi update --extensions` bumps',
+    'rem pi-web-access (the prebuilt dist-bun bundle wrapping it is a snapshot) and',
+    'rem prunes anything unsaved from the extension tree (the bundle is built from',
+    'rem it), so pi-bolt keeps running the old code - or stops loading at all -',
+    'rem until after-update.cmd puts both back.',
     'if /i "%~1"=="update" goto pi_swap_update',
     'call pi-bolt %*',
     'exit /b %ERRORLEVEL%',
@@ -95,14 +99,11 @@ function Get-ShimBody {
     ':pi_swap_update',
     'call pi-bolt %*',
     'set "pi_swap_rc=%ERRORLEVEL%"',
-    'rem `update --models` only rewrites the model catalog: nothing to rebuild.',
+    'rem `update --models` only rewrites the model catalog: nothing to re-sync.',
     'for %%a in (%*) do if /i "%%a"=="--models" goto pi_swap_update_done',
     'for %%a in (%*) do if /i "%%a"=="models" goto pi_swap_update_done',
-    "if not exist `"$BoltHome\rebuild.cmd`" goto pi_swap_update_done",
-    "call `"$BoltHome\rebuild.cmd`" -Check >nul 2>&1",
-    'if not errorlevel 1 goto pi_swap_update_done',
-    'echo pi sync: a bundle is stale after the update - rebuilding',
-    "call `"$BoltHome\rebuild.cmd`"",
+    "if not exist `"$BoltHome\after-update.cmd`" goto pi_swap_update_done",
+    "call `"$BoltHome\after-update.cmd`"",
     ':pi_swap_update_done',
     'exit /b %pi_swap_rc%',
     '',

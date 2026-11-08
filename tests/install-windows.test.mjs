@@ -31,6 +31,8 @@ const scripts = [
   'install.ps1',
   'pi-bolt/rebuild.ps1',
   'pi-bolt/rebuild.cmd',
+  'pi-bolt/after-update.ps1',
+  'pi-bolt/after-update.cmd',
   'pi-bolt/pi-swap.ps1',
 ];
 
@@ -53,6 +55,17 @@ function fixture(t) {
   // rebuild.ps1 refuses to run without its entry point; the argument plumbing is
   // what these tests assert, so a stub is enough.
   fs.writeFileSync(path.join(repo, 'pi-bolt/rebuild.mjs'), '// stub for the tests\n');
+
+  // npm.cmd lives beside node.exe, so putting node's directory on PATH also puts
+  // the *real* npm on it — and after-update.ps1 repairs the pi-web-access build
+  // input with `npm install`. A stub that fails closed keeps this suite off the
+  // network; a test that needs a working npm writes its own into f.bin.
+  fs.writeFileSync(path.join(bin, 'npm.cmd'), [
+    '@echo off',
+    'if defined FAKE_NPM_LOG echo npm %* >> "%FAKE_NPM_LOG%"',
+    'exit /b 1',
+    '',
+  ].join('\r\n'));
 
   const files = {
     'dot-pi/agent/models.json': '{}\n',
@@ -89,6 +102,9 @@ function fixture(t) {
     PI_CONFIG_SKIP_BUNDLES: '1',
   };
   delete env.PIBOLT_BUN;
+  // after-update.ps1 honours PI_AGENT_DIR; a developer with it set would point
+  // these cases at a real agent dir, which is the one thing the fixture forbids.
+  delete env.PI_AGENT_DIR;
 
   const spawn = (script, args, extra = {}) => spawnSync(powershell,
     ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', path.join(repo, script), ...args],
@@ -97,6 +113,7 @@ function fixture(t) {
     root, repo, home, bin, temp, env,
     install: (args = [], extra) => spawn('install.ps1', args, extra),
     rebuild: (args = [], extra) => spawn('pi-bolt/rebuild.ps1', args, extra),
+    afterUpdate: (args = [], extra) => spawn('pi-bolt/after-update.ps1', args, extra),
     swap: (args = [], extra) => spawn('pi-bolt/pi-swap.ps1', args, extra),
     // Convenience for the happy path, where a non-zero exit is a test failure.
     ok: (result, label) => {
@@ -463,7 +480,7 @@ test('the shim propagates pi-bolt exit codes and reports a missing pi-bolt', { s
   assert.match(`${missing.stdout}${missing.stderr}`, /pi-bolt is not on PATH/);
 });
 
-test('pi update rebuilds a stale bundle, and update --models does not', { skip }, (t) => {
+test('pi update runs the post-update sync, and update --models does not', { skip }, (t) => {
   const f = fixture(t);
   const log = path.join(f.temp, 'sync.log');
   // A fake bun that reports "stale" for --check, clean otherwise, and records
@@ -477,7 +494,7 @@ test('pi update rebuilds a stale bundle, and update --models does not', { skip }
   ].join('\r\n'));
   fs.writeFileSync(path.join(f.bin, 'pi-bolt.cmd'),
     '@echo off\r\necho pi-bolt %* >> "%FAKE_BUN_LOG%"\r\nexit /b 4\r\n');
-  const env = { ...f.env, PIBOLT_BUN: path.join(f.bin, 'bun.cmd'), FAKE_BUN_LOG: log };
+  const env = { ...f.env, PIBOLT_BUN: path.join(f.bin, 'bun.cmd'), FAKE_BUN_LOG: log, FAKE_NPM_LOG: log };
   f.ok(f.swap(['apply'], { ...env, PI_SWAP_SKIP_PATH: '1' }), 'apply');
   const shim = path.join(f.home, '.pi/agent/bin/pi.cmd');
   const run = (args) => spawnSync('cmd.exe', ['/c', shim, ...args], { env, encoding: 'utf8' });
@@ -485,17 +502,111 @@ test('pi update rebuilds a stale bundle, and update --models does not', { skip }
   const updated = run(['update', '--extensions']);
   const syncLog = fs.readFileSync(log, 'utf8');
   assert.match(syncLog, /pi-bolt update --extensions/, 'the shim must still run pi-bolt update');
+  // The old shim ran `rebuild.cmd -Check` inline and nothing else, so a
+  // regression to it would still pass the bundle assertions below. Only
+  // after-update.ps1 reaches for the build input, and it is the one that runs it.
+  assert.match(syncLog, /npm install --prefix .*pi-web-access/,
+    `the shim must run the whole post-update sync, not just the bundle half:\n${syncLog}`);
   assert.match(syncLog, /rebuild\.mjs"? --check/, 'a stale bundle has to be detected');
   assert.match(syncLog, /rebuild\.mjs"?[ \t]*\r?\n/, 'and rebuilt without --force (stale only)');
   assert.equal(updated.status, 4, `pi-bolt's exit code must survive the sync:\n${updated.stdout}${updated.stderr}`);
-  assert.match(updated.stdout, /pi sync: a bundle is stale/);
+  // The sync reports problems on stderr, as after-update.sh does; the shim hands
+  // both streams through untouched. (The fixture's npm stub fails closed, so the
+  // build-input repair is reported as failed too — this test is about the bundle.)
+  assert.match(updated.stdout + updated.stderr, /pi sync: a bundle is (still )?stale/);
 
-  // `update --models` only rewrites the catalog: nothing may be rebuilt.
+  // `update --models` only rewrites the catalog: nothing may be re-synced.
   fs.writeFileSync(log, '');
   const models = run(['update', '--models']);
   assert.equal(fs.readFileSync(log, 'utf8').includes('rebuild.mjs'), false,
     '--models must not trigger a bundle rebuild');
   assert.equal(models.status, 4);
+});
+
+test('after-update.ps1 -Check reports a stale bundle and builds nothing', { skip }, (t) => {
+  const f = fixture(t);
+  const log = path.join(f.temp, 'check.log');
+  fs.writeFileSync(path.join(f.bin, 'bun.cmd'), [
+    '@echo off',
+    'echo %* >> "%FAKE_BUN_LOG%"',
+    'echo %* | findstr /c:"--check" >nul && exit /b 1',
+    'exit /b 0',
+    '',
+  ].join('\r\n'));
+
+  const result = f.afterUpdate(['-Check'], { PIBOLT_BUN: path.join(f.bin, 'bun.cmd'), FAKE_BUN_LOG: log });
+  assert.equal(result.status, 1, `-Check must gate on staleness:\n${result.stdout}${result.stderr}`);
+  assert.match(result.stderr, /pi sync: a bundle is stale/);
+  assert.match(result.stderr, /rebuild\.cmd/, 'the report must name the command that fixes it');
+  const calls = fs.readFileSync(log, 'utf8');
+  assert.equal(calls.replace(/--check/g, '').trim().split(/\r?\n/).length, 1,
+    `-Check must not rebuild anything:\n${calls}`);
+});
+
+test('after-update.ps1 is silent and exits 0 when everything is in step', { skip }, (t) => {
+  const f = fixture(t);
+  fs.writeFileSync(path.join(f.bin, 'bun.cmd'), '@echo off\r\nexit /b 0\r\n');
+  // npm on PATH with the build input present and saved: nothing to repair.
+  fs.writeFileSync(path.join(f.bin, 'npm.cmd'), '@echo off\r\nif /i "%~1"=="pkg" echo "1.2.3"\r\nexit /b 0\r\n');
+  const npmRoot = path.join(f.home, '.pi/agent/npm');
+  fs.mkdirSync(path.join(npmRoot, 'node_modules/pi-web-access/dist'), { recursive: true });
+  fs.writeFileSync(path.join(npmRoot, 'node_modules/pi-web-access/dist/index.js'), '// built\n');
+  fs.writeFileSync(path.join(npmRoot, 'package.json'), '{ "dependencies": { "pi-web-access": "1.2.3" } }\n');
+
+  const result = f.afterUpdate([], { PIBOLT_BUN: path.join(f.bin, 'bun.cmd') });
+  assert.equal(result.status, 0, `a clean machine must exit 0:\n${result.stdout}${result.stderr}`);
+  assert.equal(result.stdout.trim(), '', 'a healthy sync prints nothing');
+  assert.equal(result.stderr.trim(), '');
+});
+
+test('after-update.ps1 restores a pruned pi-web-access build input', { skip }, (t) => {
+  const f = fixture(t);
+  const log = path.join(f.temp, 'npm.log');
+  const npmRoot = path.join(f.home, '.pi/agent/npm');
+  const entry = path.join(npmRoot, 'node_modules/pi-web-access/dist/index.js');
+  const marker = path.join(f.temp, 'saved');
+  fs.mkdirSync(npmRoot, { recursive: true });
+  fs.writeFileSync(path.join(npmRoot, 'package.json'), '{ "dependencies": {} }\n');
+  // A fake npm: `pkg get` reports the key absent until `install` has run, and the
+  // install is what puts the entry point the bundle is built from back.
+  fs.writeFileSync(path.join(f.bin, 'npm.cmd'), [
+    '@echo off',
+    'echo npm %* >> "%FAKE_NPM_LOG%"',
+    'if /i "%~1"=="pkg" (',
+    '  if exist "%FAKE_NPM_MARKER%" (echo "1.2.3") else (echo {})',
+    '  exit /b 0',
+    ')',
+    'if /i "%~1"=="install" (',
+    '  mkdir "%FAKE_NPM_ENTRY_DIR%" 2>nul',
+    '  echo // restored> "%FAKE_NPM_ENTRY%"',
+    '  echo saved> "%FAKE_NPM_MARKER%"',
+    '  exit /b 0',
+    ')',
+    'exit /b 0',
+    '',
+  ].join('\r\n'));
+  fs.writeFileSync(path.join(f.bin, 'bun.cmd'), '@echo off\r\nexit /b 0\r\n');
+
+  const env = {
+    PIBOLT_BUN: path.join(f.bin, 'bun.cmd'),
+    FAKE_NPM_LOG: log,
+    FAKE_NPM_MARKER: marker,
+    FAKE_NPM_ENTRY: entry,
+    FAKE_NPM_ENTRY_DIR: path.dirname(entry),
+  };
+  const restored = f.afterUpdate([], env);
+  assert.equal(restored.status, 0, `restoring the input must exit 0:\n${restored.stdout}${restored.stderr}`);
+  assert.match(restored.stdout, /pi sync: restoring the pi-web-access build input/);
+  assert.match(restored.stdout, /pi sync: pi-web-access build input restored/);
+  assert.ok(fs.existsSync(entry), 'the build input has to be back on disk');
+  const npmCalls = fs.readFileSync(log, 'utf8');
+  assert.match(npmCalls, /npm install --prefix .*--save .*pi-web-access/,
+    `the input must be saved, not installed --no-save:\n${npmCalls}`);
+
+  // Second pass: it is saved now, so there is nothing left to do.
+  const after = f.afterUpdate(['-Check'], env);
+  assert.equal(after.status, 0, `a repaired machine must be in step:\n${after.stdout}${after.stderr}`);
+  assert.equal(after.stdout.trim(), '');
 });
 
 test('pi-swap.ps1 keeps an unexpanded user PATH and its value kind', { skip }, (t) => {
