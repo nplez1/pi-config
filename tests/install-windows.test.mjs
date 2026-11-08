@@ -463,6 +463,41 @@ test('the shim propagates pi-bolt exit codes and reports a missing pi-bolt', { s
   assert.match(`${missing.stdout}${missing.stderr}`, /pi-bolt is not on PATH/);
 });
 
+test('pi update rebuilds a stale bundle, and update --models does not', { skip }, (t) => {
+  const f = fixture(t);
+  const log = path.join(f.temp, 'sync.log');
+  // A fake bun that reports "stale" for --check, clean otherwise, and records
+  // every build it was asked for.
+  fs.writeFileSync(path.join(f.bin, 'bun.cmd'), [
+    '@echo off',
+    'echo %* >> "%FAKE_BUN_LOG%"',
+    'echo %* | findstr /c:"--check" >nul && exit /b 1',
+    'exit /b 0',
+    '',
+  ].join('\r\n'));
+  fs.writeFileSync(path.join(f.bin, 'pi-bolt.cmd'),
+    '@echo off\r\necho pi-bolt %* >> "%FAKE_BUN_LOG%"\r\nexit /b 4\r\n');
+  const env = { ...f.env, PIBOLT_BUN: path.join(f.bin, 'bun.cmd'), FAKE_BUN_LOG: log };
+  f.ok(f.swap(['apply'], { ...env, PI_SWAP_SKIP_PATH: '1' }), 'apply');
+  const shim = path.join(f.home, '.pi/agent/bin/pi.cmd');
+  const run = (args) => spawnSync('cmd.exe', ['/c', shim, ...args], { env, encoding: 'utf8' });
+
+  const updated = run(['update', '--extensions']);
+  const syncLog = fs.readFileSync(log, 'utf8');
+  assert.match(syncLog, /pi-bolt update --extensions/, 'the shim must still run pi-bolt update');
+  assert.match(syncLog, /rebuild\.mjs"? --check/, 'a stale bundle has to be detected');
+  assert.match(syncLog, /rebuild\.mjs"?[ \t]*\r?\n/, 'and rebuilt without --force (stale only)');
+  assert.equal(updated.status, 4, `pi-bolt's exit code must survive the sync:\n${updated.stdout}${updated.stderr}`);
+  assert.match(updated.stdout, /pi sync: a bundle is stale/);
+
+  // `update --models` only rewrites the catalog: nothing may be rebuilt.
+  fs.writeFileSync(log, '');
+  const models = run(['update', '--models']);
+  assert.equal(fs.readFileSync(log, 'utf8').includes('rebuild.mjs'), false,
+    '--models must not trigger a bundle rebuild');
+  assert.equal(models.status, 4);
+});
+
 test('pi-swap.ps1 keeps an unexpanded user PATH and its value kind', { skip }, (t) => {
   const f = fixture(t);
   fs.writeFileSync(path.join(f.bin, 'pi-bolt.cmd'), '@echo off\r\nexit /b 0\r\n');

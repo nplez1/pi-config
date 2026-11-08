@@ -224,13 +224,16 @@ noticing the link is gone.
 **Not ported.** `pi-bolt compile` answers "compiling extensions in is not
 available on Windows yet" for every mode, so extensions load from files and the
 prebuilt `dist-bun` bundles are the only start-up lever — which is why the bundle
-rebuild matters more here than on Unix. `pi-bolt/after-update.sh`,
-`pi-bolt/deps-audit.sh` and `patches/model-picker.mjs` are bash, or patch the pi
-bundle that Windows never installs (the model-picker guard reports that as
-"nothing to patch" rather than an error). Run `pi-bolt\rebuild.cmd` after a pull,
-a submodule bump or `pi-bolt update --extensions`: `-Check` exits 1 when a bundle
-is stale and rebuilds nothing, `-Force` rebuilds all three, `-Verbose` streams
-each builder's log.
+rebuild matters more here than on Unix. The `pi` shim does the bundle half of
+`after-update.sh`: on `pi update` it runs pi-bolt's update and then rebuilds the
+bundles if they went stale, so a bumped pi-web-access cannot leave the old code
+running silently (`update --models` only rewrites the catalog and rebuilds
+nothing). `pi-bolt/after-update.sh`, `pi-bolt/deps-audit.sh` and
+`patches/model-picker.mjs` remain bash, or patch the pi bundle that Windows never
+installs (the model-picker guard reports that as "nothing to patch" rather than
+an error). Run `pi-bolt\rebuild.cmd` yourself after a pull or a submodule bump:
+`-Check` exits 1 when a bundle is stale and rebuilds nothing, `-Force` rebuilds
+all three, `-Verbose` streams each builder's log.
 
 **The `pi` swap.** `pi-swap.ps1 apply` writes
 `%USERPROFILE%\.pi\agent\bin\pi.cmd` and puts that directory on the user `PATH`
