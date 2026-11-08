@@ -60,7 +60,11 @@
 // pi's find() returns catalog entries whose provider has no credentials and
 // aborts a request routed to one, so resolve() prefers getAvailable() and falls
 // back to hasConfiguredAuth() — the check pi itself applies — so a DeepSeek-only
-// machine stays on DeepSeek instead of erroring.
+// machine stays on DeepSeek instead of erroring. A cached verdict that says
+// "no" is repaired rather than trusted: a live `getProviderAuth()` plus a
+// re-registration put the provider back into the catalog and the credential
+// cache pi reads, which is what makes a stale registry cost one stderr line
+// instead of a dead turn.
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
@@ -121,6 +125,21 @@ interface RouteRequest {
   };
   state?: RouterState;
 }
+/**
+ * What the registry says about one side. Gathered only on the failure path, so
+ * a healthy request pays nothing for it.
+ */
+interface SideState {
+  /** The catalog still lists the model. */
+  catalog: boolean;
+  /** pi's cached credential verdict; undefined when the registry cannot say. */
+  snapshot: boolean | undefined;
+  /** Where the credential store reports the provider from, or "none". */
+  store: string;
+  /** A live credential resolution, which never reads the cached verdict. */
+  live: boolean | undefined;
+}
+
 interface RouteContext {
   modelRegistry: {
     find(provider: string, id: string): CatalogModel | undefined;
@@ -128,6 +147,15 @@ interface RouteContext {
     getAvailable?(): CatalogModel[];
     /** pi's own pre-flight check; present in pi 1.4.0. */
     hasConfiguredAuth?(model: CatalogModel): boolean;
+    /**
+     * Resolve a provider's credential the way a request would — live, without
+     * reading the cached verdict. The one check that cannot be stale.
+     */
+    getProviderAuth?(provider: string): Promise<unknown>;
+    /** Where the credential store reports a provider from, without resolving it. */
+    getProviderAuthStatus?(provider: string): { configured: boolean; source?: string } | undefined;
+    /** Composition and availability errors, for triage; present in pi 1.5.0. */
+    getError?(): string | undefined;
     /**
      * Rebuild the provider/credential snapshot, scoped by `providers` — the
      * programmatic form of `/reload`; present in pi 1.4.0.
@@ -405,7 +433,8 @@ export default function (pi: ExtensionAPI) {
   function resolve(
     ctx: RouteContext,
     ref: ModelRef | undefined,
-    available: Set<string> | undefined,
+    /** The availability snapshot, when one can answer; omitted to trust the catalog. */
+    available?: Set<string> | undefined,
   ): CatalogModel | undefined {
     if (!ref) return undefined;
     // `find()` returns catalog entries even for providers with no credentials,
@@ -447,6 +476,14 @@ export default function (pi: ExtensionAPI) {
    * in `resolveModel` as `hasConfiguredAuth(target.provider)` after the awaited
    * `route()`) — but that check reads the snapshot the refresh has just
    * rebuilt, so recovering the snapshot recovers the turn.
+   *
+   * When even that re-check leaves the snapshot saying "no", the two things pi
+   * reads are repaired instead of trusted: `getProviderAuth()` resolves the
+   * credential without consulting the cache at all, and `registerProvider()`
+   * both restores a lost registration and marks a provider configured when the
+   * credential store has it. Both are skipped unless the live resolution proved
+   * the side usable, so a genuinely missing key still fails — with a message
+   * that names which of the four facts disagreed.
    */
   async function resolveEither(ctx: RouteContext, ref: ModelRef): Promise<CatalogModel> {
     const decided = decide(ctx, ref);
@@ -457,12 +494,110 @@ export default function (pi: ExtensionAPI) {
       note(`credential snapshot was stale; re-checked live and routed to ${recovered.provider}/${recovered.id}`);
       return recovered;
     }
-    const other = otherSide(ref);
-    throw new Error(
-      `deepseek-routing: neither ${ref.provider}/${ref.id} nor ${other?.provider}/${other?.id} is usable ` +
-        `— no credentials, or missing from the catalog, even after a live re-check. The model registry ` +
-        `looks stale: run /reload, or restart, to rebuild it. If that persists, check the deepinfra ` +
-        `credential in ~/.pi/agent/auth.json`,
+
+    // Prove the side usable live, then repair what pi reads. A live credential
+    // alone is not enough: pi's post-route check reads the cache again.
+    for (const side of [ref, otherSide(ref)]) {
+      if (!side) continue;
+      const state = await probe(ctx, side);
+      if (!state.live) continue;
+      repair(ctx, side);
+      const repaired = decide(ctx, ref);
+      if (repaired) {
+        note(`repaired the registry for ${side.provider}; routed to ${repaired.provider}/${repaired.id}`);
+        return repaired;
+      }
+    }
+
+    throw new Error(await describeFailure(ctx, ref));
+  }
+
+  /** One side's state, read the four ways the registry can answer. */
+  async function probe(ctx: RouteContext, ref: ModelRef): Promise<SideState> {
+    const found = findInCatalog(ctx, ref);
+    return {
+      catalog: Boolean(found),
+      snapshot: found ? cachedVerdict(ctx, found) : undefined,
+      store: storedSource(ctx, ref.provider),
+      live: await liveAuth(ctx, ref.provider),
+    };
+  }
+
+  /** pi's cached credential verdict for one catalog entry, if it can answer. */
+  function cachedVerdict(ctx: RouteContext, model: CatalogModel): boolean | undefined {
+    try {
+      const verdict = ctx.modelRegistry.hasConfiguredAuth?.(model);
+      return typeof verdict === "boolean" ? verdict : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Where the credential store reports `provider` from; "none" when it has nothing. */
+  function storedSource(ctx: RouteContext, provider: string): string {
+    try {
+      const status = ctx.modelRegistry.getProviderAuthStatus?.(provider);
+      if (!status) return "unknown";
+      return status.configured ? (status.source ?? "configured") : "none";
+    } catch {
+      return "unknown";
+    }
+  }
+
+  /** Resolve `provider`'s credential live, bypassing the cached verdict. */
+  async function liveAuth(ctx: RouteContext, provider: string): Promise<boolean | undefined> {
+    try {
+      const resolveAuth = ctx.modelRegistry.getProviderAuth;
+      if (!resolveAuth) return undefined;
+      return (await resolveAuth.call(ctx.modelRegistry, provider)) !== undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
+   * Re-register `side` so pi's cached verdict includes it again. `registerProvider`
+   * recomposes the provider (restoring a registration this file owns — DeepInfra
+   * is not in pi's builtin catalog) and marks it provisionally configured when
+   * the credential store has it, which is what `hasConfiguredAuth()` reads.
+   */
+  function repair(ctx: RouteContext, side: ModelRef): void {
+    try {
+      if (side.provider === DEEPINFRA_FLASH.provider) registerDeepInfra(deepInfraCost);
+      else pi.registerProvider(side.provider, {});
+    } catch (error) {
+      console.error(`deepseek-routing: could not re-register ${side.provider}: ${String(error)}`);
+    }
+  }
+
+  /** The error, carrying what the registry said about each side. */
+  async function describeFailure(ctx: RouteContext, ref: ModelRef): Promise<string> {
+    const sides = [ref, otherSide(ref)].filter((side): side is ModelRef => Boolean(side));
+    const details: string[] = [];
+    for (const side of sides) {
+      const state = await probe(ctx, side);
+      const unreadable =
+        !state.catalog && state.snapshot === undefined && state.store === "unknown" && state.live === undefined;
+      details.push(
+        unreadable
+          ? `${side.provider}/${side.id}: the model registry could not be read`
+          : `${side.provider}/${side.id}: ${state.catalog ? "in the catalog" : "missing from the catalog"}, ` +
+              `credential ${state.store === "none" ? "not in the credential store" : `in the credential store (${state.store})`}, ` +
+              `cached verdict ${state.snapshot === undefined ? "unavailable" : state.snapshot ? "configured" : "no credentials"}, ` +
+              `live check ${state.live === undefined ? "unavailable" : state.live ? "found one" : "found none"}`,
+      );
+    }
+    let registry = "";
+    try {
+      const error = ctx.modelRegistry.getError?.();
+      if (error) registry = ` Registry reports: ${error.split("\n").join(" ")}.`;
+    } catch {
+      // A stale context cannot report; the per-side lines already say so.
+    }
+    return (
+      `deepseek-routing: neither ${sides.map((side) => `${side.provider}/${side.id}`).join(" nor ")} is usable. ` +
+      `${details.join("; ")}.${registry} Run /reload to rebuild the registry; if a credential is really missing, ` +
+      `check it in ~/.pi/agent/auth.json`
     );
   }
 

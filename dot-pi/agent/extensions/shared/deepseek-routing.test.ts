@@ -27,6 +27,11 @@ interface FakeRegistry {
   getAvailable?(): unknown[];
   hasConfiguredAuth?(model: unknown): boolean;
   refresh?(options?: { allowNetwork?: boolean; providers?: string[] }): Promise<unknown>;
+  getProviderAuth?(provider: string): Promise<unknown>;
+  getProviderAuthStatus?(provider: string): { configured: boolean; source?: string } | undefined;
+  getError?(): string | undefined;
+  repair?(provider: string): void;
+  setConfigured?(value: boolean): void;
 }
 
 function registry(opts: {
@@ -36,11 +41,28 @@ function registry(opts: {
   snapshot?: boolean;
   /** Whether a live re-check finds credentials, as pi's `refresh()` does. */
   recheck?: boolean;
-}): FakeRegistry & { refreshes: string[][] } {
+  /**
+   * Whether a *live* credential resolution finds one, as `getProviderAuth()`
+   * does. Undefined means the registry cannot answer that question.
+   */
+  live?: boolean;
+  /** The credential store's answer, as `getProviderAuthStatus()` reports it. */
+  store?: string;
+  /** Composition or availability errors, as `getError()` reports them. */
+  error?: string;
+  /** Simulates `registerProvider()` marking a provider configured. */
+  repair?(provider: string): void;
+}): FakeRegistry & {
+  refreshes: string[][];
+  registered: string[];
+  setConfigured(value: boolean): void;
+} {
   let configured = opts.configured;
   const refreshes: string[][] = [];
+  const registered: string[] = [];
   return {
     refreshes,
+    registered,
     find: (provider, id) =>
       opts.sides.find((side) => side.provider === provider && side.id === id),
     getAvailable: () => (opts.snapshot === false ? [] : opts.sides),
@@ -49,6 +71,21 @@ function registry(opts: {
       refreshes.push(options?.providers ?? []);
       if (opts.recheck) configured = true;
       return {};
+    },
+    getProviderAuth: async (provider) =>
+      opts.live === undefined ? undefined : opts.live && opts.sides.some((side) => side.provider === provider)
+        ? { auth: { apiKey: "live" } }
+        : undefined,
+    getProviderAuthStatus: (provider) =>
+      opts.store === undefined ? undefined : { configured: opts.store !== "none", source: opts.store },
+    getError: () => opts.error,
+    // pi's `markProvisionallyConfigured`: a re-registered provider is configured
+    // again only when the credential store has it.
+    repair: () => {
+      if (opts.store !== undefined && opts.store !== "none") configured = true;
+    },
+    setConfigured: (value: boolean) => {
+      configured = value;
     },
   };
 }
@@ -92,8 +129,12 @@ function stubPricing(response: () => Promise<Response>) {
 async function harness(reg: FakeRegistry, reason: "user" | "continuation" = "user") {
   const models: { id?: string; route?: (r: unknown, c: unknown) => Promise<{ model: { provider: string; id: string } }> }[] = [];
   const handlers: Record<string, (() => unknown)[]> = {};
+  const registered: string[] = [];
   const pi = {
-    registerProvider: () => {},
+    registerProvider: (provider: string) => {
+      registered.push(provider);
+      reg.repair?.(provider);
+    },
     registerVirtualModel: (model: unknown) => void models.push(model as never),
     on: (event: string, handler: () => unknown) => void (handlers[event] ??= []).push(handler),
   };
@@ -115,7 +156,7 @@ async function harness(reg: FakeRegistry, reason: "user" | "continuation" = "use
     }
     return result;
   };
-  return { route, routeAsPi };
+  return { route, routeAsPi, registered };
 }
 
 const previousTier = process.env.PI_DEEPSEEK_TIER;
@@ -174,10 +215,61 @@ describe("router recovery", () => {
     await expect(routeAsPi()).rejects.toThrow(/no credentials/);
   });
 
+  test("repairs a cached verdict that a live credential contradicts", async () => {
+    // The failure this file exists to stop repeating: both providers' keys are
+    // in auth.json, but the registry's cached verdict says neither has one, and
+    // the scoped re-check cannot move it. `getProviderAuth()` resolves the
+    // credential without the cache, and re-registering the provider puts it back
+    // into the cache pi re-checks after `route()` returns — so the turn survives
+    // instead of dying on a cache that /reload would have rebuilt.
+    process.env.PI_DEEPSEEK_TIER = "off-peak";
+    const poisoned = registry({
+      sides: [DEEPSEEK, DEEPINFRA],
+      configured: false,
+      snapshot: false,
+      recheck: false,
+      live: true,
+      store: "stored",
+    });
+    const { routeAsPi, registered } = await harness(poisoned);
+    // The registration the extension makes at load time marks both sides
+    // configured; a later full availability pass is what drops them, so poison
+    // it after that, exactly as the cache did.
+    poisoned.setConfigured(false);
+    registered.length = 0;
+    expect((await routeAsPi()).model.provider).toBe("deepseek");
+    expect(registered).toEqual(["deepseek"]);
+  });
+
+  test("names the credential store and the live check when nothing can be repaired", async () => {
+    // When the live resolution agrees there is no key, re-registering would only
+    // hide the problem. The error has to carry enough to fix it without
+    // reproducing it: which fact disagreed, per side.
+    process.env.PI_DEEPSEEK_TIER = "off-peak";
+    const gone = registry({
+      sides: [DEEPSEEK, DEEPINFRA],
+      configured: false,
+      snapshot: false,
+      recheck: false,
+      live: false,
+      store: "none",
+      error: 'Availability refresh: timed out',
+    });
+    const { route } = await harness(gone);
+    const error = await route().then(
+      () => undefined,
+      (reason: Error) => reason.message,
+    );
+    expect(error).toContain("not in the credential store");
+    expect(error).toContain("live check found none");
+    expect(error).toContain("Availability refresh: timed out");
+    expect(error).toContain("/reload");
+  });
+
   test("throws when the catalog itself has lost both sides", async () => {
     process.env.PI_DEEPSEEK_TIER = "off-peak";
     const { route } = await harness(emptyCatalog);
-    await expect(route()).rejects.toThrow(/no credentials, or missing from the catalog/);
+    await expect(route()).rejects.toThrow(/missing from the catalog/);
   });
   test("falls to the other side when only it is in the catalog", async () => {
     // Whichever tier is asked for, a missing side must not become a throw.

@@ -403,8 +403,17 @@ refresh that follows replaces the configured-provider set wholesale, so the firs
 request can arrive while that set is momentarily empty. pi's own send path does
 not trust it either (`hasConfiguredAuth() || await checkAuth()`), and
 `modelRegistry.refresh({ providers })` runs that live check, so the router
-rebuilds the snapshot for the two sides and re-resolves — the error, naming
-`/reload`, is only for the case where the live check agrees the key is missing.
+rebuilds the snapshot for the two sides and re-resolves. If that rebuild still
+leaves the cached verdict saying no, the router repairs what pi reads instead of
+trusting it: `getProviderAuth()` resolves the credential without the cache, and
+re-registering the provider restores a lost registration — DeepInfra is not in
+pi's builtin catalog, so its entry exists only because this extension registered
+it — and marks the provider configured again, which is the cache
+`hasConfiguredAuth()` reads. The error, naming `/reload`, is only for the case
+where the live check itself finds no key; it now names, per side, whether the
+model was in the catalog, what the credential store holds, what the cached
+verdict said, and what the live check found, so a recurrence is diagnosable from
+the message instead of by reproduction.
 
 The schedule and rate card live in
 `extensions/shared/deepseek-schedule.ts`, shared with `deepseek-pricing.ts` so
