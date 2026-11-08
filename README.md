@@ -136,6 +136,8 @@ git clone --recurse-submodules git@github.com:nplez1/pi-config.git ~/Code/pi-con
 ~/Code/pi-config/install.sh
 ```
 
+On Windows the same clone is set up by `install.cmd` — see [Windows](#windows).
+
 `install.sh` also provisions Pi-Bolt (see [pi-bolt/README.md](pi-bolt/README.md)):
 it installs it from the official installer if it is missing, materializes the
 `packages` list, rebuilds the three bundles from this clone, compiles every
@@ -176,6 +178,77 @@ target — a `<name>.pre-pi-config-*` sibling inside `~/.agents/skills` or
 agent), never touches a whole directory that can
 hold untracked user files (e.g. `~/.pi/agent/extensions`, which also has Orca
 extensions not in this repo), and supports `--dry-run` and `uninstall`.
+
+### Windows
+
+Windows runs this repo through a PowerShell port. Use the `.cmd` wrappers, not
+the `.ps1` files: Windows ships with `Set-ExecutionPolicy Restricted`, which
+refuses every script, and the wrapper passes a per-process
+`-ExecutionPolicy Bypass` — it changes nothing on the machine and needs no
+administrator.
+
+```bat
+git clone --recurse-submodules https://github.com/nplez1/pi-config.git %USERPROFILE%\Code\pi-config
+%USERPROFILE%\Code\pi-config\install.cmd            :: link + seed, plugins, Pi-Bolt, bundles
+%USERPROFILE%\Code\pi-config\install.cmd -DryRun    :: print what would happen, change nothing
+%USERPROFILE%\Code\pi-config\install.cmd capture    :: publish this machine's settings back
+%USERPROFILE%\Code\pi-config\install.cmd uninstall  :: remove the links that point into this repo
+```
+
+`install.ps1` mirrors `install.sh` — the same portable/seeded split, the same
+machine-owned files, the same `%USERPROFILE%\.pi-config-backups\<stamp>\` for
+anything it replaces — and prints each platform difference per target instead of
+assuming it:
+
+| step | Unix | Windows |
+| --- | --- | --- |
+| portable files | symlinks | symlink, else junction (dirs) / hardlink (files), else a copy that says so |
+| `fd`, `rg` | Homebrew | `winget` (`sharkdp.fd`, `BurntSushi.ripgrep.MSVC`) |
+| Pi-Bolt | `install.sh` | the official Windows installer |
+| bundles | `rebuild.sh` from the `~/.zshrc` hook | `pi-bolt\rebuild.cmd`, run by hand — Windows has no launch hook |
+| `pi` → pi-bolt | `pi-swap.sh` | `pi-bolt\pi-swap.ps1` |
+
+The env vars are the same: `PI_CONFIG_SKIP_PLUGINS`, `PI_CONFIG_SKIP_PIBOLT`,
+`PI_CONFIG_SKIP_TOOLS`, `PI_CONFIG_SKIP_BUNDLES`, `PIBOLT_BUN`. Two more are
+Windows-only: `PI_CONFIG_LINK_MODE` pins one link tier (`symlink`, `hardlink` or
+`copy`), and `PI_SWAP_SKIP_PATH=1` leaves the user `PATH` alone.
+
+The hardlink tier is worth knowing about: it is what a machine without Developer
+Mode falls back to for files, and unlike a symlink it shares the repo file's
+bytes rather than pointing at it. That survives an in-place edit but not a
+replacement — `git checkout`, `git pull` and editors that save by rename all
+write a new file — so a pull can turn the live file into a private copy. The
+installer says so when it uses that tier, and the next run repairs it by
+noticing the link is gone.
+
+**Not ported.** `pi-bolt compile` answers "compiling extensions in is not
+available on Windows yet" for every mode, so extensions load from files and the
+prebuilt `dist-bun` bundles are the only start-up lever — which is why the bundle
+rebuild matters more here than on Unix. `pi-bolt/after-update.sh`,
+`pi-bolt/deps-audit.sh` and `patches/model-picker.mjs` are bash, or patch the pi
+bundle that Windows never installs (the model-picker guard reports that as
+"nothing to patch" rather than an error). Run `pi-bolt\rebuild.cmd` after a pull,
+a submodule bump or `pi-bolt update --extensions`: `-Check` exits 1 when a bundle
+is stale and rebuilds nothing, `-Force` rebuilds all three, `-Verbose` streams
+each builder's log.
+
+**The `pi` swap.** `pi-swap.ps1 apply` writes
+`%USERPROFILE%\.pi\agent\bin\pi.cmd` and puts that directory on the user `PATH`,
+so `pi` runs pi-bolt everywhere. A real launcher is preserved as `pi-real.cmd`
+first: the one it displaces in that directory, or a stock `pi` found elsewhere on
+`PATH` (npm installs into `%APPDATA%\npm`, which the shim would otherwise
+shadow), wrapped so it still resolves its own directory. `pi-real` or `PI_REAL=1`
+reaches it, `remove` puts the original back byte for byte, and with no preserved
+launcher `PI_REAL=1` exits 127 instead of quietly running pi-bolt. `status`
+prints what `pi`, `pi-real` and `pi-bolt` resolve to.
+
+**Tests.** `node --test tests/*.test.mjs` covers `install.ps1`, `rebuild.ps1` and
+`pi-swap.ps1` against a disposable repo and `%USERPROFILE%`, with a `PATH` that
+holds no winget, npm or user `PATH`; those cases report as skipped off Windows.
+The fast-search suite is green on Windows apart from two POSIX-only cases it
+reports as skipped, and
+[`probe-windows.mjs`](dot-pi/agent/extensions/fast-search/tests/probe-windows.mjs)
+proves inside the real Pi-Bolt runtime that fd/rg run there and match native.
 
 ## GitHub Copilot Fusion Standard
 

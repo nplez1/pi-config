@@ -26,6 +26,14 @@ async function fixture(t) {
   await mkdir(home, { recursive: true });
   process.env.HOME = home;
   process.env.XDG_CONFIG_HOME = path.join(home, ".config");
+  // node:os homedir() reads USERPROFILE on Windows, so HOME alone would leave the
+  // filter reading the real user's ~/.gitconfig instead of this fixture's.
+  const previousProfile = process.env.USERPROFILE;
+  if (process.platform === "win32") process.env.USERPROFILE = home;
+  t.after(() => {
+    if (previousProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = previousProfile;
+  });
   return { base, home };
 }
 
@@ -221,9 +229,14 @@ test("unsupported complexity and bounded rule reads fail explicitly for native f
 
   const fifoRoot = path.join(base, "fifo");
   await mkdir(fifoRoot, { recursive: true });
-  execFileSync("mkfifo", [path.join(fifoRoot, ".ignore")]);
+  // A non-regular rule file. mkfifo is POSIX-only, so Windows uses a directory:
+  // the same isFile() guard has to refuse it, and opening one fails there with
+  // EPERM rather than reporting the kind — both are the explicit refusal this
+  // asserts, so either message is accepted.
+  if (process.platform === "win32") await mkdir(path.join(fifoRoot, ".ignore"), { recursive: true });
+  else execFileSync("mkfifo", [path.join(fifoRoot, ".ignore")]);
   const fifo = createNativeFilter(fifoRoot, { requireGit: true });
-  await assert.rejects(fifo("candidate.txt", "file"), (error) => error instanceof CannotProveParityError && /regular file/.test(error.message));
+  await assert.rejects(fifo("candidate.txt", "file"), (error) => error instanceof CannotProveParityError && /regular file|could not safely open/.test(error.message));
 });
 
 test.after(async () => {

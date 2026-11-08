@@ -79,12 +79,29 @@ export function mandatoryGrepLiterals(pattern, {literal=false} = {}) {
 }
 export function mandatoryGrepLiteral(pattern,options){const values=mandatoryGrepLiterals(pattern,options);return values?.length===1?values[0]:null;}
 
+function executableCandidates(base) {
+  if (process.platform !== 'win32') return [base];
+  // CreateProcess runs only .exe/.com directly. A bare `fd` never matches a
+  // WinGet-installed `fd.exe`, and an extensionless shim or a `.cmd` cannot be
+  // spawned without a shell at all — advertising one would only turn a working
+  // native fallback into a spawn that fails on every search.
+  const candidates = [];
+  if (/\.[^./\\]+$/.test(base)) candidates.push(base);
+  for (const ext of (process.env.PATHEXT || '.COM;.EXE').split(';')) {
+    const suffix = ext.trim().toLowerCase();
+    if (suffix === '.exe' || suffix === '.com') candidates.push(base + suffix);
+  }
+  return candidates;
+}
+
 export function resolveExecutable(name) {
-  if (path.isAbsolute(name)) { try {accessSync(name,constants.X_OK);return name}catch{return null} }
-  for(const directory of (process.env.PATH||'').split(path.delimiter)){
-    if(!directory)continue;
-    const candidate=path.resolve(directory,name);
-    try{accessSync(candidate,constants.X_OK);return candidate}catch{}
+  const bases = path.isAbsolute(name)
+    ? [name]
+    : (process.env.PATH || '').split(path.delimiter).filter(Boolean).map(directory => path.resolve(directory, name));
+  for (const base of bases) {
+    for (const candidate of executableCandidates(base)) {
+      try { accessSync(candidate, constants.X_OK); return candidate; } catch {}
+    }
   }
   return null;
 }

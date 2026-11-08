@@ -25,3 +25,17 @@ FAST_FUZZ_SEEDS=200 python3 ~/.pi/agent/extensions/fast-search/tests/differentia
 ```
 
 The differential test uses the installed Pi-Bolt runtime, fd and rg; it intentionally fails if the supported accelerated paths did not run. The routing test forces the external candidate path on small, Git, and broad roots and compares its output to native. The tests establish bounded evidence, not proof for every filesystem or concurrent filesystem mutation.
+
+Windows ships no python, so the two in-Pi probes have a node driver that runs the
+same `executables.mjs` and `routes.mjs` harnesses inside the real Pi-Bolt runtime:
+
+```sh
+node ~/.pi/agent/extensions/fast-search/tests/probe-windows.mjs
+```
+
+It asserts result parity with native *and* which backend ran, including that a
+missing `fd` or `rg` falls back to native instead of failing. `PI_BOLT`, `PI_FD`
+and `PI_RG` override what it resolves from `PATH`. Two cases in the node suite are
+POSIX-only and report as skipped there: the process-group abort (Windows has no
+process-group kill and no `TERM` trap — `child.kill()` is `TerminateProcess`) and
+the invalid-UTF-8 fake binary (Windows cannot spawn a shell script as `fd`).

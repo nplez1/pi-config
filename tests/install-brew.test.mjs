@@ -8,6 +8,13 @@ import { fileURLToPath } from 'node:url';
 
 const installer = fileURLToPath(new URL('../install.sh', import.meta.url));
 
+// install.sh is POSIX: it needs bash and the system utilities the fixture links.
+// Windows has neither, so those cases report as skipped instead of failing under
+// a `node --test tests/*.test.mjs` run.
+const bash = ['/bin/bash', '/usr/bin/bash'].find((candidate) => fs.existsSync(candidate));
+const posix = (name, fn) => test(name,
+  { skip: bash ? false : 'install.sh is POSIX: this test needs /bin/bash and its system utilities' }, fn);
+
 // Run the entire installer against a disposable repo and HOME. PATH contains
 // only explicitly linked system utilities and the commands each test supplies.
 function fixture(t, { brew = true, fd = false, rg = false, failure = false, noInstall = false } = {}) {
@@ -65,7 +72,7 @@ done
   };
 }
 
-test('installs both missing commands in one brew invocation and is idempotent', t => {
+posix('installs both missing commands in one brew invocation and is idempotent', t => {
   const f = fixture(t);
   assert.match(f.run(), /ok\s+fd and rg are on PATH/);
   assert.deepEqual(f.calls(), ['install fd ripgrep']);
@@ -74,20 +81,20 @@ test('installs both missing commands in one brew invocation and is idempotent', 
 });
 
 for (const [present, expected] of [['fd', 'install ripgrep'], ['rg', 'install fd']]) {
-  test(`installs only the missing formula when ${present} exists`, t => {
+  posix(`installs only the missing formula when ${present} exists`, t => {
     const f = fixture(t, { [present]: true });
     f.run();
     assert.deepEqual(f.calls(), [expected]);
   });
 }
 
-test('does not call brew when both commands already exist', t => {
+posix('does not call brew when both commands already exist', t => {
   const f = fixture(t, { fd: true, rg: true });
   assert.match(f.run(), /ok\s+fd and rg are on PATH/);
   assert.deepEqual(f.calls(), []);
 });
 
-test('missing Homebrew is nonfatal and gives actionable instructions', t => {
+posix('missing Homebrew is nonfatal and gives actionable instructions', t => {
   const f = fixture(t, { brew: false, fd: true });
   const out = f.run();
   assert.match(out, /SKIP\s+Homebrew not on PATH/);
@@ -96,7 +103,7 @@ test('missing Homebrew is nonfatal and gives actionable instructions', t => {
   assert.match(out, /Done \(/);
 });
 
-test('Homebrew failure is nonfatal and includes a retry', t => {
+posix('Homebrew failure is nonfatal and includes a retry', t => {
   const f = fixture(t, { failure: true });
   const out = f.run();
   assert.deepEqual(f.calls(), ['install fd ripgrep']);
@@ -105,13 +112,13 @@ test('Homebrew failure is nonfatal and includes a retry', t => {
   assert.match(out, /Done \(/);
 });
 
-test('reports commands still missing from PATH after brew succeeds', t => {
+posix('reports commands still missing from PATH after brew succeeds', t => {
   const f = fixture(t, { noInstall: true });
   assert.match(f.run(), /SKIP\s+fd rg still unavailable on PATH/);
   assert.deepEqual(f.calls(), ['install fd ripgrep']);
 });
 
-test('dry-run prints only missing formula without calling brew or changing HOME', t => {
+posix('dry-run prints only missing formula without calling brew or changing HOME', t => {
   const f = fixture(t, { fd: true });
   assert.match(f.run('--dry-run'), /would\s+brew install ripgrep/);
   assert.deepEqual(f.calls(), []);
@@ -119,20 +126,20 @@ test('dry-run prints only missing formula without calling brew or changing HOME'
   assert.equal(fs.existsSync(path.join(f.bin, 'rg')), false);
 });
 
-test('dry-run without Homebrew reports how to install without changes', t => {
+posix('dry-run without Homebrew reports how to install without changes', t => {
   const f = fixture(t, { brew: false });
   assert.match(f.run('--dry-run'), /SKIP\s+Homebrew not on PATH.*brew install fd ripgrep/);
   assert.deepEqual(fs.readdirSync(f.home), []);
 });
 
-test('offline brew skip prevents installation', t => {
+posix('offline brew skip prevents installation', t => {
   const f = fixture(t);
   f.env.PI_CONFIG_SKIP_BREW = '1';
   assert.match(f.run(), /skip\s+PI_CONFIG_SKIP_BREW=1/);
   assert.deepEqual(f.calls(), []);
 });
 
-test('migrates the goal package while preserving filters and machine settings', t => {
+posix('migrates the goal package while preserving filters and machine settings', t => {
   const f = fixture(t, { fd: true, rg: true });
   const seed = path.join(f.repo, 'dot-pi/agent/settings.json');
   const live = path.join(f.home, '.pi/agent/settings.json');
@@ -157,7 +164,7 @@ test('migrates the goal package while preserving filters and machine settings', 
   assert.deepEqual(JSON.parse(fs.readFileSync(live)), result);
 });
 
-test('removes an old npm goal entry when the local package already exists', t => {
+posix('removes an old npm goal entry when the local package already exists', t => {
   const f = fixture(t, { fd: true, rg: true });
   fs.writeFileSync(path.join(f.repo, 'dot-pi/agent/settings.json'), JSON.stringify({ packages: ['plugins/pi-codex-goal'] }));
   const live = path.join(f.home, '.pi/agent/settings.json');
@@ -167,7 +174,7 @@ test('removes an old npm goal entry when the local package already exists', t =>
   assert.deepEqual(JSON.parse(fs.readFileSync(live)).packages, ['plugins/pi-codex-goal']);
 });
 
-test('capture and uninstall never invoke brew, even with missing commands', t => {
+posix('capture and uninstall never invoke brew, even with missing commands', t => {
   const f = fixture(t);
   assert.match(f.run('capture'), /Publishing shared settings/);
   assert.deepEqual(f.calls(), []);

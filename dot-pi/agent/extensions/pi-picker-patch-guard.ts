@@ -66,11 +66,48 @@ interface Result {
   stderr: string;
 }
 
+/** Compiled builds (Pi-Bolt) have no dist/bundle/chunks for the applier to patch. */
+const NO_PATCHABLE_INSTALL = /could not find an installed pi/i;
+
+/** No runtime could be found to run the applier at all: nothing was verified. */
+const CANNOT_CHECK = -1;
+
+function isBunRuntime(): boolean {
+  return typeof (process.versions as { bun?: string }).bun === "string";
+}
+
+function noPatchableInstall(result: Result): boolean {
+  return NO_PATCHABLE_INSTALL.test(result.stderr);
+}
+
+/**
+ * Runtime for running the standalone `.mjs` applier. On a node-based pi install
+ * `process.execPath` *is* node, so spawning it runs the applier. On a compiled
+ * build (Pi-Bolt runs Bun) `process.execPath` is pi's own binary, which parses
+ * the applier's `--check`/`--quiet` as its own flags and dies with
+ * "Unknown option". Reach for a real `node`/`bun` on PATH in that case, and
+ * report that there is none rather than spawning the wrong thing.
+ */
+function applierRuntime(): string | null {
+  if (!isBunRuntime()) return process.execPath;
+  for (const candidate of ["node", "bun"]) {
+    try {
+      execFileSync(candidate, ["--version"], { stdio: "ignore", timeout: 10_000 });
+      return candidate;
+    } catch {
+      // not on PATH; try the next candidate
+    }
+  }
+  return null;
+}
+
 function runApplier(args: string[]): Result {
   const applier = findApplier();
   if (!applier) return { code: 127, stdout: "", stderr: "patches/model-picker.mjs not found" };
+  const runtime = applierRuntime();
+  if (!runtime) return { code: CANNOT_CHECK, stdout: "", stderr: "no node or bun on PATH to run the applier" };
   try {
-    const stdout = execFileSync(process.execPath, [applier, ...args], {
+    const stdout = execFileSync(runtime, [applier, ...args], {
       encoding: "utf8",
       timeout: 120_000,
     });
@@ -90,7 +127,11 @@ export default function (pi: ExtensionAPI) {
   // never let that child run this guard.
   if (process.env.PI_MODEL_PICKER_VERIFY === "1") return;
 
-  const check = (): number => runApplier(["--check", "--quiet"]).code;
+  const check = (): Result => runApplier(["--check", "--quiet"]);
+  // Set once this process has established that there is nothing to patch (or no
+  // runtime to check with), so later TUI starts in the same session do not each
+  // pay for two 10 s probes plus the applier.
+  let settled = false;
 
   const debug = (event: string, data: Record<string, unknown> = {}) => {
     if (process.env.PI_PICKER_PATCH_DEBUG !== "1") return;
@@ -114,8 +155,24 @@ export default function (pi: ExtensionAPI) {
     if (process.env.PI_PICKER_PATCH === "off") return;
     if (ctx.mode !== "tui") return;
     if (stateIsCurrent()) return;
+    // Once this process knows there is nothing to patch (or nothing to run the
+    // check with), stop paying for it on every TUI start in the same session.
+    if (settled) return;
     debug("checking", { applier: findApplier() });
-    if (check() === 0) return;
+    const checked = check();
+    if (checked.code === 0) return;
+    if (checked.code === CANNOT_CHECK) {
+      settled = true;
+      debug("cannot check", { stderr: checked.stderr });
+      return;
+    }
+    // Only a compiled build legitimately has no bundle to patch. A node-based pi
+    // whose layout moved is a real failure and must keep notifying, so the skip
+    // is gated on the runtime rather than on the message alone.
+    if (isBunRuntime() && noPatchableInstall(checked)) {
+      settled = true;
+      return;
+    }
 
     const result = runApplier(["--quiet"]);
     debug("applied", { code: result.code, stderr: result.stderr.slice(0, 300) });
@@ -132,13 +189,21 @@ export default function (pi: ExtensionAPI) {
   pi.registerCommand("picker-patch", {
     description: "Check and re-apply the local model-picker patch to installed pi",
     handler: async (_args, ctx) => {
-      if (stateIsCurrent() && check() === 0) {
+      if (stateIsCurrent() && check().code === 0) {
         ctx.ui.notify("Model-picker patch is applied and current.", "info");
         return;
       }
       const result = runApplier(["--quiet"]);
       if (result.code === 0) {
         ctx.ui.notify("Model-picker patch applied — restart pi to activate it.", "warning");
+        return;
+      }
+      if (result.code === CANNOT_CHECK) {
+        ctx.ui.notify("Cannot check the model-picker patch: no node or bun on PATH.", "warning");
+        return;
+      }
+      if (isBunRuntime() && noPatchableInstall(result)) {
+        ctx.ui.notify("No patchable pi install found (compiled build?) — nothing to patch.", "info");
         return;
       }
       ctx.ui.notify(`Model-picker patch failed: ${result.stderr.trim()}`, "error");
