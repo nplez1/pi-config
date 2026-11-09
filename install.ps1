@@ -1,7 +1,7 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 <#
 .SYNOPSIS
-  install.ps1 — Windows port of install.sh: put this repo's pi config into $HOME.
+  install.ps1 - Windows port of install.sh: put this repo's pi config into $HOME.
 
 .DESCRIPTION
   Mirrors install.sh's two kinds of file:
@@ -143,7 +143,7 @@ function Test-LinkPointsAt([string]$path, [string]$src) {
 
 # Create a link. Symlink needs privilege (Developer Mode or elevated); a
 # directory junction and a file hardlink do not, and a copy always works.
-# PI_CONFIG_LINK_MODE pins one tier — for tests, and for a machine whose policy
+# PI_CONFIG_LINK_MODE pins one tier - for tests, and for a machine whose policy
 # forbids one of them: symlink | hardlink | copy. Directories use a junction on
 # the hardlink tier, since a directory cannot be hardlinked.
 function New-ConfigLink([string]$src, [string]$dst) {
@@ -226,8 +226,8 @@ function Invoke-Seed([string]$rel, [string]$dst) {
       $script:Changed++
     }
   } elseif (Test-IsLink $dst) {
-    # A link to something else — including a hardlink to a file outside this
-    # repo — is the machine's own file. Converting it would delete the values it
+    # A link to something else - including a hardlink to a file outside this
+    # repo - is the machine's own file. Converting it would delete the values it
     # holds, so leave it alone.
     Write-Line 'keep' "$dst (link to $(Get-LinkTarget $dst); use 'capture' to publish changes)"
   } elseif (Test-Path -LiteralPath $dst) {
@@ -349,7 +349,7 @@ for (const job of jobs) {
 
 # ------------------------------------------------------------- submodules ----
 # `git submodule update --init --recursive` populates an *empty* submodule, but
-# it will not touch one whose index has the tracked files staged as deleted —
+# it will not touch one whose index has the tracked files staged as deleted -
 # which is the state a half-finished submodule checkout leaves behind. The
 # directory then holds nothing but a `.git` file, its `package.json` is missing,
 # so the npm step below silently skips it and pi-bolt loads no plugin at all.
@@ -414,7 +414,7 @@ if ($script:LinkMode -and $script:LinkMode -notin @('symlink', 'hardlink', 'copy
   $script:LinkMode = $null
 }
 
-Write-Output "pi-config (Windows port) — repo: $Repo"
+Write-Output "pi-config (Windows port) - repo: $Repo"
 Write-Output "home: $HomeDir"
 Write-Output "mode: $Mode"
 Write-Output ''
@@ -474,7 +474,7 @@ if ($Mode -eq 'install' -and $env:PI_CONFIG_SKIP_PLUGINS -ne '1') {
   Write-Output ''
   Write-Output 'Fetching plugin submodules:'
   & git -C $Repo submodule update --init --recursive
-  if ($LASTEXITCODE -ne 0) { Write-Line 'WARN' 'submodule update failed — a plugin source may be missing; continuing' }
+  if ($LASTEXITCODE -ne 0) { Write-Line 'WARN' 'submodule update failed - a plugin source may be missing; continuing' }
   # A submodule can survive the update above with an empty worktree (see
   # Repair-Submodule). Check every plugin, not only the submodules: the forks
   # are gitlinks here, and one left empty costs its whole plugin at load time.
@@ -490,7 +490,7 @@ if ($Mode -eq 'install' -and $env:PI_CONFIG_SKIP_PLUGINS -ne '1') {
       & npm install --omit=dev --legacy-peer-deps --no-audit --no-fund --no-package-lock 2>&1 | Out-Null
       Pop-Location
     } else {
-      Write-Line 'WARN' "$($_.Name) has no package.json — plugin source missing; skipping its dependencies"
+      Write-Line 'WARN' "$($_.Name) has no package.json - plugin source missing; skipping its dependencies"
     }
   }
 } elseif ($Mode -eq 'dry-run') {
@@ -634,7 +634,7 @@ if ($env:PI_CONFIG_SKIP_PIBOLT -eq '1') {
         $rebuild = Join-Path $Repo 'pi-bolt\rebuild.ps1'
         # Hand the bun we resolved to the child. On a fresh machine winget has
         # just installed it, so this process's inherited PATH does not have it
-        # yet and rebuild.ps1 would answer "bun is required" — on the one run
+        # yet and rebuild.ps1 would answer "bun is required" - on the one run
         # where the bundles are guaranteed to be missing.
         $env:PIBOLT_BUN = $bun
         # The exit code is not proof: rebuild.mjs deliberately exits 0 when a
@@ -682,21 +682,21 @@ if ($env:PI_CONFIG_SKIP_PIBOLT -eq '1') {
 Write-Output ''
 Write-Output 'Unix-only steps (not ported to Windows):'
 foreach ($item in @(
-    'pi-bolt compile — unavailable: this build answers "compiling extensions in is not available on Windows yet"',
-    'pi-bolt/deps-audit.sh — bash; pins undici and runs npm audit fix',
-    'patches/model-picker.mjs — patches the pi bundle, which Windows does not install'
+    'pi-bolt compile - unavailable: this build answers "compiling extensions in is not available on Windows yet"',
+    'pi-bolt/deps-audit.sh - bash; pins undici and runs npm audit fix',
+    'patches/model-picker.mjs - patches the pi bundle, which Windows does not install'
   )) { Write-Line 'skip' $item }
 
 # The half of after-update.sh that does exist here, said out loud because a shim
-# written before pi-bolt/after-update.cmd existed does nothing after an update —
+# written before pi-bolt/after-update.cmd existed does nothing after an update -
 # and `apply` above is what rewrites that shim.
 Write-Line 'note' '`pi update` runs pi-bolt\after-update.cmd afterwards (bundles + the web-access build input)'
 
-# `pi-bolt compile` is not merely unported — the Windows build refuses every
+# `pi-bolt compile` is not merely unported - the Windows build refuses every
 # mode, including --list and --status, and it exits 0 while doing so. A future
 # edit that wired it in here would read as "ok" and change nothing, so the check
 # is stated rather than implied. What it costs: extensions load from files, which
-# is why the prebuilt dist-bun bundles above matter more here than on Unix — they
+# is why the prebuilt dist-bun bundles above matter more here than on Unix - they
 # are the only start-up lever this platform has.
 #
 # Guarded: this runs even when PI_CONFIG_SKIP_PIBOLT=1 or the install failed, and
@@ -715,7 +715,7 @@ if ($script:Hardlinks -gt 0) {
   # next run notices and repairs it, but until then the live file is a private
   # copy, so say so instead of leaving it to be discovered.
   Write-Output "$($script:Hardlinks) file(s) are hardlinked because this process cannot create symlinks:"
-  Write-Output '  a git checkout/pull replaces the repo file and breaks the link — re-run install.cmd after a pull.'
+  Write-Output '  a git checkout/pull replaces the repo file and breaks the link - re-run install.cmd after a pull.'
 }
 if ($Mode -ne 'dry-run' -and $script:Changed -gt 0) {
   Write-Output 'Restart Pi-Bolt (or run /reload) to pick up the config.'

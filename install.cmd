@@ -1,5 +1,5 @@
 @echo off
-rem install.cmd — run install.ps1 without depending on this machine's execution
+rem install.cmd - run install.ps1 without depending on this machine's execution
 rem policy.
 rem
 rem Windows ships with `Set-ExecutionPolicy Restricted`, so a bare

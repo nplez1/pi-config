@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 <#
 .SYNOPSIS
   pi-swap.ps1 - Windows port of pi-swap.sh: make `pi` run Pi-Bolt, or put it back.
@@ -125,7 +125,7 @@ function Get-ShimBody {
 
 # Set-ItemProperty writes the value but announces nothing, where
 # [Environment]::SetEnvironmentVariable used to broadcast WM_SETTINGCHANGE:
-# Explorer, and everything started from it (Start menu, VS Code, Orca — the very
+# Explorer, and everything started from it (Start menu, VS Code, Orca - the very
 # reason this swap exists), would keep the old PATH until logoff.
 function Send-EnvironmentChange {
   try {
@@ -169,7 +169,7 @@ function Test-PathHasAgentBin {
   return ($userPath -split ';' | Where-Object { $_.TrimEnd('\') -ieq $AgentBin.TrimEnd('\') }).Count -gt 0
 }
 
-# added | present | failed — the caller must not report "already on PATH" for a
+# added | present | failed - the caller must not report "already on PATH" for a
 # write it could not perform.
 function Add-AgentBinToPath {
   if (Test-PathHasAgentBin) { return 'present' }
@@ -203,7 +203,7 @@ function Remove-AgentBinFromPath {
 # machine really has a pi to go back to.
 #
 # npm also drops pi.ps1 and an extensionless sh script beside pi.cmd, and
-# PowerShell resolves the .ps1 first — a wrapper around that opens in Notepad.
+# PowerShell resolves the .ps1 first - a wrapper around that opens in Notepad.
 # Only an application (.exe/.cmd/.bat) can be wrapped, and -All is what finds it
 # when AgentBin is already first on PATH.
 function Find-RealPi {
@@ -285,7 +285,7 @@ function Invoke-Remove {
   if (Test-IsShim $PiShim) {
     if (Test-IsRealWrapper $PiReal) {
       # The wrapper only pointed at a stock pi that never moved, so there is
-      # nothing to put back — and turning the wrapper into `pi` would leave a
+      # nothing to put back - and turning the wrapper into `pi` would leave a
       # file Test-IsShim recognises, which the next apply would then skip.
       Remove-Item -LiteralPath $PiShim -Force
       Remove-Item -LiteralPath $PiReal -Force

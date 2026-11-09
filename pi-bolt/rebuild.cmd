@@ -1,5 +1,5 @@
 @echo off
-rem rebuild.cmd — run rebuild.ps1 without depending on this machine's execution
+rem rebuild.cmd - run rebuild.ps1 without depending on this machine's execution
 rem policy.
 rem
 rem Windows ships with `Set-ExecutionPolicy Restricted`, which refuses to run any

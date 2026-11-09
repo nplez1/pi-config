@@ -1,12 +1,12 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-  rebuild.ps1 — Windows counterpart of rebuild.sh: keep the prebuilt pi-bolt
+  rebuild.ps1 - Windows counterpart of rebuild.sh: keep the prebuilt pi-bolt
   bundles in step with the sources they were built from.
 
 .DESCRIPTION
   pi-bolt loads the forks as prebuilt `dist-bun/` bundles, and that build output
-  is gitignored — every machine generates its own. On Unix the ~/.zshrc hook runs
+  is gitignored - every machine generates its own. On Unix the ~/.zshrc hook runs
   rebuild.sh before each launch; Windows has no such hook, so run this after a
   `git pull`, a submodule bump, or `pi-bolt update --extensions`.
 
@@ -62,7 +62,7 @@ if (-not (Test-Path -LiteralPath $Rebuilder)) {
 }
 
 # rebuild.mjs is bun, not node: it imports ../../lib/bundle-info.mjs and drives
-# Bun.build. Resolve bun the way rebuild.sh does — PIBOLT_BUN wins, then PATH.
+# Bun.build. Resolve bun the way rebuild.sh does - PIBOLT_BUN wins, then PATH.
 $bun = $null
 if ($env:PIBOLT_BUN) {
   if (Test-Path -LiteralPath $env:PIBOLT_BUN) { $bun = $env:PIBOLT_BUN }

@@ -139,6 +139,27 @@ function linkedTo(target, src) {
   return fs.realpathSync(target).toLowerCase() === fs.realpathSync(src).toLowerCase();
 }
 
+test('every Windows script is pure ASCII', () => {
+  // cmd parses a .cmd byte-wise against the console codepage, so one UTF-8
+  // em-dash desyncs the parser under any codepage but the ANSI one and the tail
+  // of a `rem` line then runs as a command: `'m' is not recognized as an
+  // internal or external command`. A BOM breaks the first line outright.
+  // PowerShell 5.1 reads a BOM-less file as ANSI too, so keep all of them ASCII
+  // rather than depending on the BOM or on this machine's codepage.
+  const files = [
+    'install.cmd', 'install.ps1',
+    'pi-bolt/rebuild.cmd', 'pi-bolt/rebuild.ps1',
+    'pi-bolt/after-update.cmd', 'pi-bolt/after-update.ps1',
+    'pi-bolt/pi-swap.ps1',
+  ];
+  for (const rel of files) {
+    const bytes = fs.readFileSync(path.join(source, rel));
+    const offending = [...bytes].filter((byte) => byte >= 0x80);
+    assert.equal(offending.length, 0,
+      `${rel} has ${offending.length} non-ASCII byte(s); a non-ANSI console codepage will desync cmd`);
+  }
+});
+
 test('install.ps1 -DryRun reports every action and writes nothing', { skip }, (t) => {
   const f = fixture(t);
   const out = f.ok(f.install(['-DryRun']), 'dry run');

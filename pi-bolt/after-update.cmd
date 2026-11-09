@@ -1,5 +1,5 @@
 @echo off
-rem after-update.cmd — run after-update.ps1 without depending on this machine's
+rem after-update.cmd - run after-update.ps1 without depending on this machine's
 rem execution policy.
 rem
 rem Windows ships with `Set-ExecutionPolicy Restricted`, which refuses to run any
