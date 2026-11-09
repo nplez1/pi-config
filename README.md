@@ -242,13 +242,18 @@ model-picker guard reports "nothing to patch" rather than an error. Run
 `pi-bolt\after-update.cmd` to reconcile both halves: `-Check` exits 1 when
 something is out of step and changes nothing, `-Verbose` prints every verdict.
 
-**The `pi` swap.** `pi-swap.ps1 apply` writes
-`%USERPROFILE%\.pi\agent\bin\pi.cmd` and puts that directory on the user `PATH`
-(broadcasting the change, so Explorer and what it launches see it without a
-logoff), so `pi` runs pi-bolt everywhere. A real launcher is preserved as
-`pi-real.cmd` first: the one it displaces in that directory, or a stock `pi`
-found elsewhere on `PATH` — npm installs `pi.ps1`, `pi.cmd` and an extensionless
-script side by side, and only the `.cmd` is a launcher worth wrapping. `pi-real`
+**The `pi` swap.** `pi-swap.ps1 apply` puts `%USERPROFILE%\.pi\agent\bin` on the
+user `PATH` (broadcasting the change, so Explorer and what it launches see it
+without a logoff) and writes the shim there **twice**, because the shells resolve
+commands differently: `pi.cmd` for cmd and PowerShell, and an extensionless `pi`
+POSIX script for git-bash/MSYS, which does not use `PATHEXT` and so cannot see a
+bare name resolved to `.cmd`. Both route `update` the same way, and both honour
+`PI_REAL=1`.
+
+A real launcher is preserved as `pi-real.cmd` first: the one it displaces in that
+directory, or a stock `pi` found elsewhere on `PATH` — npm installs `pi.ps1`,
+`pi.cmd` and an extensionless script side by side, and only the `.cmd` is a
+launcher worth wrapping. A POSIX `pi-real` sits beside it for git-bash. `pi-real`
 or `PI_REAL=1` reaches it, and `remove` puts a displaced launcher back byte for
 byte (a wrapper to a stock pi elsewhere is simply deleted, since that pi never
 moved). With no preserved launcher, `PI_REAL=1` exits 127 instead of quietly

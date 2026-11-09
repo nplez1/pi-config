@@ -429,6 +429,65 @@ test('pi-swap.ps1 apply writes the shim and remove takes it away', { skip }, (t)
   assert.equal(fs.existsSync(path.join(f.home, '.pi/agent/bin/pi.cmd')), false);
 });
 
+test('pi-swap.ps1 writes a POSIX shim for git-bash', { skip }, (t) => {
+  const f = fixture(t);
+  fs.writeFileSync(path.join(f.bin, 'pi-bolt.cmd'), '@echo off\r\nexit /b 0\r\n');
+  const extra = { PI_SWAP_SKIP_PATH: '1' };
+  f.ok(f.swap(['apply'], extra), 'apply');
+
+  const posixPath = path.join(f.home, '.pi/agent/bin/pi');
+  const bytes = fs.readFileSync(posixPath);
+  assert.equal(bytes.subarray(0, 10).toString('latin1'), '#!/bin/sh\n', 'a POSIX shim needs a LF shebang');
+  assert.equal(bytes.includes(13), false, 'a CR in the file makes the shebang a bad interpreter');
+  const text = bytes.toString('utf8');
+  assert.match(text, /pi-swap-shim/, 'the POSIX shim must be identifiable too');
+  assert.match(text, /command -v pi-bolt/);
+  assert.match(text, /after-update\.ps1/, 'update must route through the sync from bash as well');
+
+  const real = fs.readFileSync(path.join(f.home, '.pi/agent/bin/pi-real'), 'utf8');
+  assert.match(real, /pi-swap-real-wrapper/);
+  assert.match(real, /pi-real\.cmd/, 'the POSIX pi-real runs the preserved .cmd');
+
+  f.ok(f.swap(['remove'], extra), 'remove');
+  assert.equal(fs.existsSync(posixPath), false, 'remove must take the POSIX shim too');
+  assert.equal(fs.existsSync(path.join(f.home, '.pi/agent/bin/pi-real')), false);
+});
+
+test('the POSIX shim runs under git-bash and routes update through the sync', { skip }, (t) => {
+  // Resolve bash once, by absolute path: Node searches the *child's* PATH for the
+  // executable, and an MSYS-style PATH is meaningless to CreateProcess.
+  const which = spawnSync('where', ['bash'], { encoding: 'utf8' });
+  const bash = which.status === 0 ? which.stdout.split(/\r?\n/).map((line) => line.trim()).find(Boolean) : null;
+  if (!bash) return t.skip('git-bash/MSYS is not installed');
+
+  const f = fixture(t);
+  const marker = path.join(f.temp, 'synced.txt');
+  // An extensionless POSIX stub: git-bash resolves `pi-bolt` to a script or an
+  // .exe, never to a .cmd (the real one is pi-bolt.exe).
+  fs.writeFileSync(path.join(f.bin, 'pi-bolt'), '#!/bin/sh\necho STUB-PI-BOLT "$@"\n');
+  // A stub sync that only records being run: the real one would npm/rebuild.
+  fs.writeFileSync(path.join(f.repo, 'pi-bolt/after-update.ps1'),
+    `Set-Content -LiteralPath '${marker.replace(/\\/g, '\\\\')}' -Value synced\n`);
+  f.ok(f.swap(['apply'], { PI_SWAP_SKIP_PATH: '1' }), 'apply');
+
+  // A Windows PATH is what bash expects to inherit: MSYS converts it to its own
+  // form on startup, which is also how a real git-bash session sees AgentBin.
+  const env = {
+    ...f.env,
+    PATH: [path.join(f.home, '.pi/agent/bin'), f.env.PATH].join(';'),
+  };
+
+  // A bare `pi`, resolved through PATH, which is what git-bash could not do before.
+  const version = spawnSync(bash, ['-c', 'pi --version'], { env, encoding: 'utf8' });
+  assert.equal(version.status, 0, `pi was not found or failed in bash:\n${version.stdout}${version.stderr}`);
+  assert.match(version.stdout, /STUB-PI-BOLT --version/);
+
+  const updated = spawnSync(bash, ['-c', 'pi update'], { env, encoding: 'utf8' });
+  assert.match(updated.stdout, /STUB-PI-BOLT update/);
+  assert.ok(fs.existsSync(marker),
+    `update from bash must run after-update.ps1 too:\n${updated.stdout}${updated.stderr}`);
+});
+
 test('pi-swap.ps1 keeps an existing launcher and restores it byte for byte', { skip }, (t) => {
   const f = fixture(t);
   const binDir = path.join(f.home, '.pi/agent/bin');

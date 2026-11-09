@@ -15,11 +15,14 @@
 
   Windows differences from pi-swap.sh, which this script prints at run time:
 
-    * A shim is a `.cmd`, not a POSIX script, and the second location is
-      %USERPROFILE%\.pi\agent\bin on PATH rather than ~/.local/bin.
+    * A shim is a `.cmd` plus an extensionless POSIX script beside it. cmd and
+      PowerShell use the `.cmd`; git-bash/MSYS does not use PATHEXT, so a bare
+      `pi` there needs the POSIX one. Both live in %USERPROFILE%\.pi\agent\bin
+      rather than ~/.local/bin, and both route `update` the same way.
     * Windows installs Pi-Bolt directly, so there is usually no stock `pi` to
-      preserve. When one exists it is preserved as `pi-real.cmd` and reachable
-      with `pi-real` or PI_REAL=1, exactly like the Unix version.
+      preserve. When one exists it is preserved as `pi-real.cmd` (and a POSIX
+      `pi-real` for git-bash) and reachable with `pi-real` or PI_REAL=1, exactly
+      like the Unix version.
     * The Unix shim routes `update` and `compile` through after-update.sh and
       rebuild.sh. `compile` has no Windows equivalent (`pi-bolt compile` refuses
       every mode here), so the Windows shim routes `update` through
@@ -50,6 +53,10 @@ $BoltHome = $PSScriptRoot
 $AgentBin = Join-Path $env:USERPROFILE '.pi\agent\bin'
 $PiShim   = Join-Path $AgentBin 'pi.cmd'
 $PiReal   = Join-Path $AgentBin 'pi-real.cmd'
+# The same pair for git-bash/MSYS, which resolves a bare name only to a file that
+# exists exactly as written (no PATHEXT), so `pi` needs its own script there.
+$PiPosix  = Join-Path $AgentBin 'pi'
+$PiRealPosix = Join-Path $AgentBin 'pi-real'
 $State    = Join-Path $BoltHome '.pi-swap-state'
 $Marker   = 'pi-swap-shim'
 # The pi-real wrapper needs its own marker: with the shim's marker it would be
@@ -121,6 +128,77 @@ function Get-ShimBody {
     'exit /b 127'
   )
   return $body
+}
+
+# The same shim for git-bash/MSYS. Paths are forward-slashed because MSYS
+# understands drive letters, and every line is literal: no PowerShell expansion
+# inside the single quotes.
+function Get-PosixShimBody {
+  $real = $PiReal -replace '\\', '/'
+  $boltHome = $BoltHome -replace '\\', '/'
+  return @(
+    '#!/bin/sh',
+    "# $Marker (posix) - installed by pi-swap.ps1; pi runs Pi-Bolt.",
+    "# Revert:  $boltHome/pi-swap.ps1 remove",
+    '# Bypass:  PI_REAL=1 pi   (or: pi-real)',
+    '# cmd and PowerShell use pi.cmd beside this file; git-bash/MSYS does not use',
+    '# PATHEXT, so a bare `pi` needs this script to exist at all.',
+    'if [ "${PI_REAL:-}" = "1" ]; then',
+    "  if [ ! -f `"$real`" ]; then",
+    "    echo `"pi-swap: PI_REAL=1 but there is no preserved launcher at $real. Revert with $boltHome/pi-swap.ps1 remove`" >&2",
+    '    exit 127',
+    '  fi',
+    "  exec `"$real`" `"`$@`"",
+    'fi',
+    'command -v pi-bolt >/dev/null 2>&1 || {',
+    "  echo `"pi-swap: pi-bolt is not on PATH. Revert with $boltHome/pi-swap.ps1 remove`" >&2",
+    '  exit 127',
+    '}',
+    'case " ${1:-} " in',
+    '  " update ")',
+    '    case " $* " in',
+    '      *" --models "*|*" models "*) exec pi-bolt "$@" ;;',
+    '    esac',
+    '    pi-bolt "$@"',
+    '    rc=$?',
+    "    sync=`"$boltHome/after-update.ps1`"",
+    '    if [ -f "$sync" ]; then',
+    '      powershell -NoProfile -ExecutionPolicy Bypass -File "$sync"',
+    '    fi',
+    '    exit $rc',
+    '    ;;',
+    'esac',
+    'exec pi-bolt "$@"'
+  )
+}
+
+# git-bash cannot run the .cmd that holds the preserved launcher, so `pi-real`
+# there is a two-line wrapper around it.
+function Get-PosixRealBody {
+  $real = $PiReal -replace '\\', '/'
+  $boltHome = $BoltHome -replace '\\', '/'
+  return @(
+    '#!/bin/sh',
+    "# $RealMarker (posix) - the preserved launcher, for git-bash/MSYS",
+    "target=`"$real`"",
+    'if [ ! -f "$target" ]; then',
+    "  echo `"pi-swap: there is no preserved launcher at $target. Revert with $boltHome/pi-swap.ps1 remove`" >&2",
+    '  exit 127',
+    'fi',
+    'exec "$target" "$@"'
+  )
+}
+
+# LF endings, no BOM: a CRLF shebang line is "bad interpreter". git-bash mounts
+# are noacl (everything looks executable), but an acl mount needs the bit, and
+# only a POSIX shell can set it.
+function Write-PosixScript([string]$path, [string[]]$lines) {
+  [IO.File]::WriteAllText($path, (($lines -join "`n") + "`n"), (New-Object System.Text.UTF8Encoding($false)))
+  $bash = Get-Command bash -ErrorAction SilentlyContinue
+  if ($bash) {
+    $posixPath = $path -replace '\\', '/'
+    try { & $bash.Source -c "chmod +x '$posixPath'" 2>$null | Out-Null } catch { }
+  }
 }
 
 # Set-ItemProperty writes the value but announces nothing, where
@@ -264,6 +342,23 @@ function Invoke-Apply {
   Set-Content -LiteralPath $PiShim -Value (Get-ShimBody) -Encoding Default
   Write-Output "pi-swap: wrote $PiShim"
 
+  # The same pair for git-bash/MSYS. A POSIX `pi` that is not ours is the
+  # machine's own launcher: keep it as `pi-real` rather than overwriting it.
+  $posixPreserved = $false
+  if ((Test-Path -LiteralPath $PiPosix) -and -not (Test-IsShim $PiPosix) -and
+      (Get-Item -LiteralPath $PiPosix).Length -gt 0 -and
+      -not (Test-Path -LiteralPath $PiRealPosix)) {
+    Copy-Item -LiteralPath $PiPosix -Destination $PiRealPosix -Force
+    Write-Output "pi-swap: preserved the existing POSIX launcher as $PiRealPosix"
+    $posixPreserved = $true
+  }
+  Write-PosixScript $PiPosix (Get-PosixShimBody)
+  Write-Output "pi-swap: wrote $PiPosix (git-bash/MSYS)"
+  if (-not $posixPreserved -and -not (Test-Path -LiteralPath $PiRealPosix)) {
+    Write-PosixScript $PiRealPosix (Get-PosixRealBody)
+    Write-Output "pi-swap: wrote $PiRealPosix (git-bash/MSYS)"
+  }
+
   if ($SkipPath) {
     Write-Output "pi-swap: PI_SWAP_SKIP_PATH=1 - left your user PATH alone (add $AgentBin yourself)"
   } else {
@@ -303,6 +398,20 @@ function Invoke-Remove {
     Write-Output "pi-swap: no shim at $PiShim"
   }
 
+  # The git-bash pair goes with it.
+  if (Test-IsShim $PiPosix) {
+    if ((Test-Path -LiteralPath $PiRealPosix) -and -not (Test-IsRealWrapper $PiRealPosix)) {
+      Move-Item -LiteralPath $PiRealPosix -Destination $PiPosix -Force
+      Write-Output "pi-swap: restored $PiPosix from $PiRealPosix"
+    } else {
+      Remove-Item -LiteralPath $PiPosix -Force
+      if (Test-Path -LiteralPath $PiRealPosix) { Remove-Item -LiteralPath $PiRealPosix -Force }
+      Write-Output "pi-swap: removed the git-bash shim"
+    }
+  } elseif (Test-Path -LiteralPath $PiPosix) {
+    Write-Output "pi-swap: $PiPosix is not the shim - leaving it"
+  }
+
   if (Test-Path -LiteralPath $State) {
     if ($SkipPath) {
       # The PATH entry is still there, so the record of it has to stay too.
@@ -324,6 +433,7 @@ function Invoke-Status {
   '{0,-30} {1}' -f 'pi resolves to:', ($(if ($resolved) { $resolved.Source } else { '(not found)' }))
   '{0,-30} {1}' -f 'swap:', ($(if (Test-IsShim $PiShim) { "APPLIED ($PiShim is the shim)" } else { "not applied ($PiShim is not the shim)" }))
   '{0,-30} {1}' -f 'previous launcher preserved:', ($(if (Test-Path -LiteralPath $PiReal) { $PiReal } else { 'no - nothing to restore' }))
+  '{0,-30} {1}' -f 'git-bash shim:', ($(if (Test-IsShim $PiPosix) { "APPLIED ($PiPosix)" } else { "not applied ($PiPosix is not the shim)" }))
   '{0,-30} {1}' -f "$AgentBin on user PATH:", ($(if ($SkipPath) { 'skipped (PI_SWAP_SKIP_PATH=1)' } elseif (Test-PathHasAgentBin) { 'yes' } else { 'no' }))
   Write-Output ''
   $piOut = & cmd /c "pi --version 2>&1" 2>$null | Select-Object -First 1
