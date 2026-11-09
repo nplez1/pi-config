@@ -19,7 +19,7 @@ uses GitHub Copilot Enterprise), and pi writes the chosen model back into
 | --- | --- | --- |
 | `~/.pi/agent/settings.json` | `defaultProvider`, `defaultModel`, `enabledModels` | which providers/models this machine actually has |
 | `~/.pi/agent/subagents.json` | `agentOverrides.*.model`, `agentOverrides.*.thinking` | the model each subagent type runs on is an account fact, not a shared one |
-| `~/.config/pi-config/model-roles.json` | every ID | the provider IDs `AGENTS.md`'s shorthand (Explore/Fast, Deep/Pro, Opus/Sonnet, workhorse) resolves to |
+| `~/.config/pi-config/model-roles.json` | every ID | the provider IDs `AGENTS.md`'s shorthand (Explore/Fast, Deep/Pro, Opus/Sonnet/Fable, workhorse) resolves to |
 | `~/.config/rpiv-advisor/advisor.json` | `disabledForModels` | which executor models the advisor refuses to escalate from |
 
 Everything else — the plugin/package list, theme, tui mode, agent `.md`

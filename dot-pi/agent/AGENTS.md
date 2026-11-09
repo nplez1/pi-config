@@ -10,7 +10,7 @@
   request, inherit the session model — that is the configured answer. When I *did*
   ask for that shorthand, a `null` role is not an answer: say the role is unset on
   this machine and ask me which model to use.
-- Shorthand → role: **Explore**/**Fast** → `exploration` (`thinking: "medium"` for agents; `effort: "medium"` for workflows), **Deep**/**Pro** → `heavy`, **Opus** → `opus`, **Sonnet** → `sonnet`. The last two name the Claude Code CLI backend on the seeding machine (`claude/opus`, `claude/sonnet`); a machine without that CLI retargets them in its own file.
+- Shorthand → role: **Explore**/**Fast** → `exploration` (`thinking: "medium"` for agents; `effort: "medium"` for workflows), **Deep**/**Pro** → `heavy`, **Opus** → `opus`, **Sonnet** → `sonnet`, **Fable** → `fable`. The last three name the Claude Code CLI backend on the seeding machine (`claude/opus`, `claude/sonnet`, `claude/fable`); a machine without that CLI retargets them in its own file.
 - Those names are shorthand, not model IDs. Pass the explicit provider/model
   ID from the roles file; an agent type's default does not satisfy the request.
 - **Precedence:** an explicit model request in my prompt beats an agent type's
@@ -34,7 +34,7 @@
 
 - Treat every `claude/*` model as expensive: it bills my Claude subscription, so ration it deliberately.
 - **Workhorse** (exploration, implementation, mechanical edits): every ID in `workhorse` and `exploration`. Named exactly as the roles file writes it, never as a provider glob (`xiaomi/*`, `deepseek/*`) — the globs also cover the more expensive pro tiers, which is what put v4-pro into subagent spawns.
-- **Expensive, planning and review only**: the `opus` and `sonnet` roles (the Claude Code backend by default).
+- **Expensive, planning and review only**: the `opus`, `sonnet` and `fable` roles (the Claude Code backend by default).
 - Advisor escalations run on the advisor's own configured model; never pay for a peer-model escalation when the session is already on an expensive one.
 
 ## Bash tool timeouts — the unit is seconds
