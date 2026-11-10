@@ -29,6 +29,18 @@ run on is deliberately *not* in that list: a work machine on a different account
 has to be able to retarget them without editing this repo, which is also why no
 plugin here pins a model in its source.
 
+### Which model plans and reviews
+
+`AGENTS.md` puts judgment work on the `opus` role — `claude/opus` at
+`thinking`/`effort` **high** — because that is where the judgment lives: the
+agent-driver's planner, the adversarial PR reviewer, the unblock pass, and any
+Orca task that says "Opus review" or "plan". `sonnet` is the cheaper expensive
+tier for work that does not need Opus.
+
+`fable` is **manual-only**. The role, the alias, the picker row and the docs all
+keep `claude/fable` one request away, but it is never a default for planning,
+review, unblock or any automated task — ask for it by name.
+
 `install.sh` **seeds** the four machine-owned files (copy only if absent) instead
 of symlinking them, so a `/subagents` or `/model` change on one machine can never
 rewrite the other's config. When you change something *shared* inside those

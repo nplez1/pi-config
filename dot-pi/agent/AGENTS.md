@@ -10,7 +10,7 @@
   request, inherit the session model — that is the configured answer. When I *did*
   ask for that shorthand, a `null` role is not an answer: say the role is unset on
   this machine and ask me which model to use.
-- Shorthand → role: **Explore**/**Fast** → `exploration` (`thinking: "medium"` for agents; `effort: "medium"` for workflows), **Deep**/**Pro** → `heavy`, **Opus** → `opus`, **Sonnet** → `sonnet`, **Fable** → `fable`. The last three name the Claude Code CLI backend on the seeding machine (`claude/opus`, `claude/sonnet`, `claude/fable`); a machine without that CLI retargets them in its own file.
+- Shorthand → role: **Explore**/**Fast** → `exploration` (`thinking: "medium"` for agents; `effort: "medium"` for workflows), **Deep**/**Pro** → `heavy`, **Opus** → `opus`, **Sonnet** → `sonnet`, **Fable** → `fable`. The last three name the Claude Code CLI backend on the seeding machine (`claude/opus`, `claude/sonnet`, `claude/fable`); a machine without that CLI retargets them in its own file. **Opus is the default for review and planning; Fable is manual-only** — the cost policy below spells that out.
 - Those names are shorthand, not model IDs. Pass the explicit provider/model
   ID from the roles file; an agent type's default does not satisfy the request.
 - **Precedence:** an explicit model request in my prompt beats an agent type's
@@ -21,6 +21,15 @@
   than continuing on the pinned model. A spawn with no model request keeps the
   agent's configuration.
 - Never silently substitute another model. If the requested model override is rejected or resolves to a different model, stop, report the mismatch, and ask before using a fallback. Do not rely on a failed or zero-tool agent run as exploration.
+- **Review, planning, verification and unblock passes default to Opus.** Any
+  automated step whose job is judgment — the agent-driver's planner, the
+  adversarial PR reviewer, the unblock pass, an Orca task that says "Opus review"
+  or "plan" — runs on the `opus` role at `thinking`/`effort` **high**. That is the
+  default whenever I did not name a model; a model I name still wins.
+- **Fable is manual-only.** The `fable` role (`claude/fable`) stays fully
+  available — role, alias, picker row and docs all keep it — but it is never the
+  default for planning, review, unblock or any automated task. Use it only when I
+  ask for it by name.
 
 ### Resolving IDs
 
@@ -34,7 +43,7 @@
 
 - Treat every `claude/*` model as expensive: it bills my Claude subscription, so ration it deliberately.
 - **Workhorse** (exploration, implementation, mechanical edits): every ID in `workhorse` and `exploration`. Named exactly as the roles file writes it, never as a provider glob (`xiaomi/*`, `deepseek/*`) — the globs also cover the more expensive pro tiers, which is what put v4-pro into subagent spawns.
-- **Expensive, planning and review only**: the `opus`, `sonnet` and `fable` roles (the Claude Code backend by default).
+- **Expensive, planning and review only**: the `opus`, `sonnet` and `fable` roles (the Claude Code backend by default). **Review, planning, verification and unblock work defaults to `opus` at `thinking`/`effort` high** — that tier is where the judgment lives. `sonnet` is the cheaper expensive tier for work that does not need Opus. `fable` is **manual-only**: kept available for when I ask for it by name, never a default for planning, review, unblock or any automated task.
 - Advisor escalations run on the advisor's own configured model; never pay for a peer-model escalation when the session is already on an expensive one.
 
 ## Bash tool timeouts — the unit is seconds
