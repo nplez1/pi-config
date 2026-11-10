@@ -100,10 +100,12 @@ export const DEEPSEEK_FLASH: ModelRef = { provider: "deepseek", id: "deepseek-fl
 
 /**
  * Same checkpoint (DeepSeek-V4.1-Flash-1017) resold by DeepInfra at a flat
- * rate. Which tier it wins is not declared anywhere — `cheaperOnMyMix` decides
- * it per request. On the 2026-11-01 cards its list price is 13% cheaper than
- * DeepSeek's peak card on this machine's mix and 74% dearer than the off-peak
- * one; the 51% promo is 57% cheaper than peak and 15% cheaper than off-peak.
+ * rate. Which tier it wins is not declared anywhere — `cheaperAtPrompt` decides
+ * it per request. On the 2026-11-01 cards its list price is 25% cheaper than
+ * DeepSeek's peak card on a short prompt and 49% dearer than the off-peak one;
+ * the 51% promo is 64% cheaper than peak and 27% cheaper than off-peak. Those
+ * figures are for a short prompt — see `CACHE_BANDS` for why the off-peak margin
+ * shrinks as the context grows and reverses past 524K.
  */
 export const DEEPINFRA_FLASH: ModelRef = {
   provider: "deepinfra",
@@ -136,75 +138,156 @@ export function deepseekCost(tier: Tier): RateSet {
  * How this machine actually spends tokens, as shares of one turn's total token
  * count — the weighting every provider comparison below uses.
  *
- * Measured over 38,556 assistant messages on deepseek-flash, 2026-10-14 until
- * 2026-11-01 09:00 UTC — the DeepSeek-only period, before the router took over,
- * so DeepInfra's cache behaviour cannot contaminate the baseline. Reproduce with
- *   measure-token-mix.mjs --since 2026-10-14 --until 2026-11-01T09:00Z
- * which prints 29,452,209 input misses, 8,485,449,080 cache reads and
- * 22,644,163 output. Cache reads are 99.4% of every prompt, because a long
- * agent session replays its whole history each turn.
+ * Measured over 40,374 assistant messages on deepseek-flash across this
+ * machine's whole history, with every turn that followed a provider switch
+ * dropped — that miss belongs to the router, not to the provider. Reproduce with
+ *   measure-token-mix.mjs --provider deepseek
+ * which prints 33,303,992 input misses, 9,153,055,326 cache reads and 25,870,415
+ * output. Cache reads are 99.4% of every prompt, because a long agent session
+ * replays its whole history each turn.
+ *
+ * This is deliberately the DEEPSEEK baseline, not the mix of the routed
+ * workload. DeepInfra re-reads more of the prompt than DeepSeek does, and that
+ * difference is priced by `CACHE_BANDS` scaling DeepInfra's input
+ * axis. Measuring the mix on DeepInfra traffic instead would put its extra
+ * misses in the weighting AND in the multiplier, counting the same penalty
+ * twice; the DeepInfra-only figure is 0.0080/0.9890/0.0030, a 2.2x larger input
+ * share for exactly that reason.
  *
  * Token shares and SPEND shares are wildly different, and only the token
  * shares belong in a price comparison. On DeepSeek's off-peak card these
- * tokens spend 10.2% on input, 58.6% on cache reads, 31.2% on output — and
+ * tokens spend 10.4% on input, 57.2% on cache reads, 32.4% on output — and
  * cache reads are both the heaviest axis and the one the two cards differ most
  * on (DeepInfra list is 2x DeepSeek off-peak there, 1.33x on input and 1.0x on
  * output), so the decision is essentially a cache-read comparison.
  *
  * The old `cheaperOnEveryAxis` rule tested dominance instead: DeepInfra had to
  * be at least as cheap on all three axes. That test is never *wrong*, it is
- * just far too conservative — it demands a 50% DeepInfra discount where this
- * mix's break-even is 42.5%.
+ * just far too conservative — it demanded a 50% DeepInfra discount where a
+ * short prompt's break-even is 37.8%.
  */
 export const TOKEN_MIX: RateSet = {
-  input: 0.00345,
-  cacheRead: 0.9939,
-  output: 0.00265,
+  input: 0.003615,
+  cacheRead: 0.993578,
+  output: 0.002808,
 };
 
 /**
- * DeepInfra re-reads more of the prompt as cache misses than DeepSeek does:
- * median 1 miss per 136 cache reads over 23 sessions of >=60 assistant
- * messages, against 1 per 254 over 135 DeepSeek sessions (re-derive both with
- * `measure-token-mix.mjs`). Scales the input axis of a DeepInfra card in
- * `blendedPrice` so the comparison prices the tokens DeepInfra would actually
- * bill, not the ones DeepSeek bills.
- *
- * An estimate, not a measurement with an interval. A narrower filter — sessions
- * served entirely by one provider — gives 1.61, so the two filters bracket
- * 1.6-1.9; that is a choice of sampling, not a confidence range, and the ratio
- * of two per-session medians is not exactly the ratio to apply to an aggregate
- * mix (taken literally, the implied per-session figure is ~2.1). It moves the
- * off-peak break-even from 38% to 42.5%, so it only decides that band, and it
- * is small next to the 2x that separates the two cards on cache reads.
+ * One band of `CACHE_BANDS`.
  */
-export const DEEPINFRA_INPUT_MULTIPLIER = 1.87;
+export interface CacheBand {
+  /** Largest prompt this band covers, in tokens. */
+  upTo: number;
+  /**
+   * DeepSeek's cache-miss share of the prompt, measured in this band. This has
+   * to be band-local: it falls 55x from 3.3% at short prompts to 0.06% past
+   * 524K, because a long prompt is mostly one fixed prefix being replayed.
+   * Substituting the aggregate `TOKEN_MIX.input` here is what makes an earlier
+   * version of this table price both sides wrongly at the top.
+   */
+  deepseekMiss: number;
+  /** DeepInfra's miss share ÷ DeepSeek's, measured in this band. */
+  ratio: number;
+}
 
 /**
- * Price of 1M tokens of *this* usage at `rates`, in USD — the single number to
- * compare two cards by. `inputMultiplier` scales the input axis for a provider
- * that re-reads more of the prompt as cache misses (see
- * `DEEPINFRA_INPUT_MULTIPLIER`); pass 1 for the baseline side.
+ * Both sides' cache behaviour as a function of CONTEXT SIZE — the measurement
+ * the router's provider choice rests on.
  *
- * The absolute values look small because 1M tokens of this usage is mostly
- * cache reads; read them as the ratio. Per *billion* tokens (x1e3):
+ * DeepSeek caches KV state on disk, which is what makes a huge prefix cheap to
+ * keep resident; DeepInfra's cache is best-effort and memory-resident, so a long
+ * context is what it evicts first. Measured over every same-provider turn pair
+ * whose previous turn was under 60 seconds away, so elapsed time cannot explain
+ * the difference:
  *
- *   DeepSeek off-peak  $5.09      DeepInfra list      $8.84
- *   DeepSeek peak      $10.18     DeepInfra @51% off  $4.33
+ *   prompt size    DeepSeek      DeepInfra     ratio
+ *   0-65K          1 per 30      1 per 30      1.02x
+ *   65K-131K       1 per 116     1 per 98      1.18x
+ *   131K-262K      1 per 386     1 per 173     2.23x
+ *   262K-524K      1 per 841     1 per 316     2.66x
+ *   524K-1M        1 per 1675    1 per 85      19.8x
+ *
+ * Read the direction, not just the size: DeepSeek's cache gets *better* as the
+ * prompt grows. DeepInfra's gets worse. The old single 1.87 scalar was a fair
+ * average over a workload that lives around 160K tokens, and wrong by 2x at
+ * short prompts and by 9x at the top.
+ *
+ * Reproduce with `measure-token-mix.mjs --penalty`, which prints the turn counts
+ * so a thin band is visible. The 524K-1M row rests on ONE DeepInfra session (91
+ * turns) against DeepSeek's 11, so its ratio is indicative; that band lands near
+ * parity either way, which is why the router stops preferring DeepInfra there.
  */
-export function blendedPrice(rates: RateSet, inputMultiplier = 1): number {
+export const CACHE_BANDS: readonly CacheBand[] = [
+  { upTo: 65_000, deepseekMiss: 0.032846, ratio: 1.02 },
+  { upTo: 131_000, deepseekMiss: 0.008615, ratio: 1.18 },
+  { upTo: 262_000, deepseekMiss: 0.002587, ratio: 2.23 },
+  { upTo: 524_000, deepseekMiss: 0.001189, ratio: 2.66 },
+  { upTo: Number.POSITIVE_INFINITY, deepseekMiss: 0.000597, ratio: 19.82 },
+];
+
+/**
+ * The band that covers a prompt of `promptTokens`, or the smallest one when the
+ * size is unknown. Unknown means "the first request of a session", which really
+ * is short, so this never invents a penalty for a context that does not exist.
+ */
+export function cacheBandAt(promptTokens?: number): CacheBand {
+  const first = CACHE_BANDS[0];
+  // Only a missing or unreadable size is "unknown". Infinity is a real answer —
+  // the last band covers it — and falls through the loop below.
+  if (promptTokens === undefined || Number.isNaN(promptTokens)) return first;
+  for (const band of CACHE_BANDS) {
+    if (promptTokens <= band.upTo) return band;
+  }
+  return CACHE_BANDS[CACHE_BANDS.length - 1];
+}
+
+/**
+ * DeepInfra's cache-miss share at `promptTokens`, from the measured ratio — the
+ * share its card is actually billed on. Replaces the input-axis multiplier an
+ * earlier version applied to the aggregate mix.
+ */
+export function deepinfraMissAt(promptTokens?: number): number {
+  const band = cacheBandAt(promptTokens);
+  return band.deepseekMiss * band.ratio;
+}
+
+/** Share of a turn's tokens that is prompt rather than output. */
+const PROMPT_SHARE = 1 - TOKEN_MIX.output;
+
+/**
+ * Price of 1M tokens of this usage at `rates`, given the share of the prompt
+ * that is a cache MISS, in USD. Miss share and cache-read share are
+ * complements, so a provider that re-reads more of the prompt also collects
+ * less cache-read revenue on the same turn.
+ */
+export function priceAtMissShare(rates: RateSet, missShare: number): number {
   return (
-    TOKEN_MIX.input * inputMultiplier * rates.input +
-    TOKEN_MIX.cacheRead * rates.cacheRead +
+    PROMPT_SHARE * missShare * rates.input +
+    PROMPT_SHARE * (1 - missShare) * rates.cacheRead +
     TOKEN_MIX.output * rates.output
   );
 }
 
 /**
- * Whether `candidate` costs less than `baseline` for this machine's token mix,
- * with `candidate`'s extra cache misses accounted for. Replaces the old
- * every-axis test, which is 8 points of discount too conservative: 50% against
- * this mix's 42.5% break-even.
+ * Price of 1M tokens of this usage at `rates`, at this machine's AGGREGATE mix —
+ * the number to quote when no prompt size is in play. `inputMultiplier` scales
+ * the aggregate miss share, which is how the DeepInfra side is priced when the
+ * size is unknown. Per *billion* tokens (x1e3):
+ *
+ *   DeepSeek off-peak   $5.19     DeepInfra list  (aggregate)  $8.35
+ *   DeepSeek peak      $10.38     DeepInfra @51%  (aggregate)  $4.09
+ *
+ * A summary, not a substitute for `cheaperAtPrompt`: it holds DeepSeek's miss
+ * share at 0.36% when a 524K prompt's is 0.06% and a 30K prompt's is 3.3%.
+ */
+export function blendedPrice(rates: RateSet, inputMultiplier = 1): number {
+  return priceAtMissShare(rates, TOKEN_MIX.input * inputMultiplier);
+}
+
+/**
+ * Whether `candidate` costs less than `baseline` at this machine's aggregate
+ * mix. Replaces the old every-axis test, which demanded a 50% discount against
+ * a 37.8% break-even for a short prompt.
  */
 export function cheaperOnMyMix(
   candidate: RateSet,
@@ -212,6 +295,27 @@ export function cheaperOnMyMix(
   candidateInputMultiplier = 1,
 ): boolean {
   return blendedPrice(candidate, candidateInputMultiplier) < blendedPrice(baseline);
+}
+
+/**
+ * Whether `candidate` costs less than `baseline` at a prompt of `promptTokens` —
+ * the comparison the router makes, with each side priced at the cache behaviour
+ * measured for that context size. This is the one that decides a request.
+ *
+ * The off-peak break-even discount it implies moves with the prompt, and past
+ * 524K no plausible discount makes DeepInfra the better buy: that band lands
+ * near parity, and the router stops preferring it there.
+ */
+export function cheaperAtPrompt(
+  candidate: RateSet,
+  baseline: RateSet,
+  promptTokens?: number,
+): boolean {
+  const band = cacheBandAt(promptTokens);
+  return (
+    priceAtMissShare(candidate, band.deepseekMiss * band.ratio) <
+    priceAtMissShare(baseline, band.deepseekMiss)
+  );
 }
 
 /** The virtual model that routes between the two. */

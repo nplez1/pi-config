@@ -336,27 +336,46 @@ the measured split of a turn's tokens is:
 
 | axis | share of tokens | share of spend, DeepSeek off-peak |
 | --- | --- | --- |
-| input (cache miss) | 0.35% | 10% |
-| cache read (cache hit) | 99.4% | 59% |
-| output | 0.27% | 31% |
+| input (cache miss) | 0.36% | 10.4% |
+| cache read (cache hit) | 99.4% | 57.2% |
+| output | 0.28% | 32.4% |
 
 Cache reads are therefore both the heaviest axis and the one the two cards
 differ most on — DeepInfra's list price is 2x DeepSeek's off-peak there, 1.33x
 on input and exactly equal on output — so the decision is essentially a
-cache-read comparison. `TOKEN_MIX` in the shared module holds that measurement
-and `cheaperOnMyMix` compares the two cards at it, after scaling DeepInfra's
-input axis by `DEEPINFRA_INPUT_MULTIPLIER` (1.87) for the cache misses it
-re-reads that DeepSeek does not. Blended over a billion tokens of this usage:
+cache-read comparison. `TOKEN_MIX` in the shared module holds that measurement.
 
-| | DeepSeek | DeepInfra list | DeepInfra @51% |
+**The mix alone is not enough, because the two caches age differently as the
+context grows.** DeepSeek caches KV state on disk; DeepInfra's cache is
+best-effort and memory-resident. Holding the gap under 60 seconds — so elapsed
+time cannot explain it — the miss rates are identical up to ~65K tokens and then
+diverge, while DeepSeek's *improves*:
+
+| prompt size | DeepSeek | DeepInfra | ratio |
 | --- | --- | --- | --- |
-| off-peak | $5.09 | $8.84 | $4.33 |
-| peak | $10.18 | $8.84 | $4.33 |
+| 0–65K | 1 per 29 | 1 per 29 | 1.02x |
+| 65K–131K | 1 per 115 | 1 per 97 | 1.19x |
+| 131K–262K | 1 per 386 | 1 per 172 | 2.24x |
+| 262K–524K | 1 per 840 | 1 per 316 | 2.66x |
+| 524K–1M | 1 per 1675 | 1 per 85 | 19.8x |
+
+`CACHE_BANDS` holds that table, and `cheaperAtPrompt` prices **both** sides at
+the band the current prompt falls in, using the latest turn's `input +
+cacheRead` as the size. A single scalar was wrong in both directions: the old
+1.87 was tuned for the ~160K band this machine happens to live in, and it kept
+choosing DeepInfra at 524K+ where the two cards reach parity. Blended over a
+billion tokens:
+
+| prompt size | DeepSeek off-peak | DeepInfra @51% |
+| --- | --- | --- |
+| 30K | $9.56 | $6.98 |
+| 200K | $5.06 | $4.31 |
+| 600K | $4.76 | $4.88 |
 
 The old rule required DeepInfra to beat DeepSeek on *all three* axes. That test
-is never wrong, just far too conservative: it demands a 50% discount where this
-mix's break-even is **42%** (38% without the cache-miss penalty). At 51% the
-promo wins at every hour; at 30% — what DeepInfra's un-suffixed
+is never wrong, just far too conservative: it demands a 50% discount where the
+break-even is **~33% at a short prompt** and **~42% at 200K**. At 51% the promo
+wins off-peak up to ~400K; at 30% — what DeepInfra's un-suffixed
 `DeepSeek-V4.1-Flash` lists — it loses off-peak and wins at peak.
 
 **No tier is hardcoded, and no price is assumed.** The peak branch runs the same
@@ -419,6 +438,23 @@ where the live check itself finds no key; it now names, per side, whether the
 model was in the catalog, what the credential store holds, what the cached
 verdict said, and what the live check found, so a recurrence is diagnosable from
 the message instead of by reproduction.
+
+**A dead context is a different failure, and it used to be misreported as this
+one.** Every field of the context `route()` is handed is a getter that begins
+with the extension runner's staleness check, so once pi replaces or reloads the
+session behind the registration — `/new`, `/fork`, `/resume`, `/reload`, or
+another session's runner in the same process — *every* registry read throws at
+once. That produces exactly the same four facts on both sides as two missing
+credentials, with nothing wrong with either key, and none of the recovery above
+can help because each step re-reads the same dead context. So the router checks
+for that state first and answers with the last physical model it saw this session
+use — seeded at `session_start`, refreshed on every decision, topped up from the
+`previous` / `failed` model pi supplies — noting the stale context once on stderr.
+A guard around the whole of `route()` does the same for any failure the file has
+not anticipated, so the router can no longer end a turn at all except on a verdict
+it means to report: a readable registry that positively says no key exists. pi
+re-checks credentials on what `route()` returns, so the worst case is pi's own
+accurate error rather than a dead turn.
 
 The schedule and rate card live in
 `extensions/shared/deepseek-schedule.ts`, shared with `deepseek-pricing.ts` so

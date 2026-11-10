@@ -4,8 +4,8 @@
   "widgetMode": "all",
   "agentOverrides": {
     "Explore": {
-      "model": "xiaomi/mimo-v2.6-flash",
-      "thinking": "medium"
+      "model": "deepseek/deepseek-flash-auto",
+      "thinking": "low"
     },
     "rpiv-advisor": {
       "model": "claude/opus",
@@ -13,10 +13,12 @@
       "enabled": true
     },
     "rpiv-compressor": {
-      "model": "xiaomi/mimo-v2.6-flash",
+      "model": "deepseek/deepseek-flash-auto",
       "thinking": "high"
     },
     "general-purpose": {
+      "model": "deepseek/deepseek-flash-auto",
+      "thinking": "high",
       "enabled": true
     }
   }

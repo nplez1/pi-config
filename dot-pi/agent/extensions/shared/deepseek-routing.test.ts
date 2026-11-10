@@ -97,7 +97,13 @@ const staleCredentials = registry({ sides: [DEEPSEEK, DEEPINFRA], configured: fa
 const recoverable = registry({ sides: [DEEPSEEK, DEEPINFRA], configured: false, snapshot: false, recheck: true });
 /** The availability cache says both are usable; pi's credential check says no. */
 const staleAvailability = registry({ sides: [DEEPSEEK, DEEPINFRA], configured: false });
-const emptyCatalog = registry({ sides: [], configured: false });
+/**
+ * A catalog that lost both sides while the credential store still answers. A
+ * real registry cannot be silent on all four questions at once, so the fixture
+ * has to answer `getProviderAuthStatus()` — otherwise it is the dead-context
+ * shape, not an empty catalog.
+ */
+const emptyCatalog = registry({ sides: [], configured: false, store: "none", live: false });
 
 /** DeepInfra's public catalog, as the router reads it. */
 function pricingResponse(input: number, output: number, cacheRead: number, discount: number) {
@@ -122,11 +128,37 @@ function stubPricing(response: () => Promise<Response>) {
     String(url).includes("api.deepinfra.com") ? response() : realFetch(url as never)) as never;
 }
 
+/** The failure an invalidated extension runner produces on every context read. */
+const STALE = "This extension ctx is stale after session replacement or reload.";
+
+/**
+ * A registry whose every read throws, the way a context does once pi has
+ * replaced or reloaded the session behind the extension registration.
+ */
+function staleRegistry(): FakeRegistry {
+  const boom = (): never => {
+    throw new Error(STALE);
+  };
+  return {
+    find: boom,
+    getAvailable: boom,
+    hasConfiguredAuth: boom,
+    refresh: (async () => boom()) as never,
+    getProviderAuth: (async () => boom()) as never,
+    getProviderAuthStatus: boom,
+    getError: boom,
+  };
+}
+
 /**
  * The virtual model the extension registers, wrapped in a `route()` that also
  * applies pi's post-route credential check and fires `session_start` once.
  */
-async function harness(reg: FakeRegistry, reason: "user" | "continuation" = "user") {
+async function harness(
+  reg: FakeRegistry,
+  reason: "user" | "continuation" = "user",
+  options: { previous?: typeof DEEPSEEK } = {},
+) {
   const models: { id?: string; route?: (r: unknown, c: unknown) => Promise<{ model: { provider: string; id: string } }> }[] = [];
   const handlers: Record<string, (() => unknown)[]> = {};
   const registered: string[] = [];
@@ -147,7 +179,11 @@ async function harness(reg: FakeRegistry, reason: "user" | "continuation" = "use
   for (const handler of handlers["session_start"] ?? []) {
     await (handler as (e: unknown, c: unknown) => unknown)(undefined, ctx);
   }
-  const route = () => router.route!({ reason, thinkingLevel: "high" }, ctx);
+  const route = () =>
+    router.route!(
+      { reason, thinkingLevel: "high", previous: options.previous ? { model: options.previous } : undefined },
+      ctx,
+    );
   /** `route()`, then pi's own check — the request pi would actually make. */
   const routeAsPi = async () => {
     const result = await route();
@@ -156,7 +192,7 @@ async function harness(reg: FakeRegistry, reason: "user" | "continuation" = "use
     }
     return result;
   };
-  return { route, routeAsPi, registered };
+  return { route, routeAsPi, registered, handlers, ctx };
 }
 
 const previousTier = process.env.PI_DEEPSEEK_TIER;
@@ -271,6 +307,45 @@ describe("router recovery", () => {
     const { route } = await harness(emptyCatalog);
     await expect(route()).rejects.toThrow(/missing from the catalog/);
   });
+
+  test("keeps the turn alive when pi invalidates the extension context", async () => {
+    // The recurring failure: `/reload`, `/new`, `/fork`, `/resume`, or another
+    // session's runner in this process invalidates the runner behind the
+    // registration, and every field of the route context is a getter that
+    // throws from then on. The router used to read that as "neither side has a
+    // credential" and end the turn, over keys that were never the problem.
+    process.env.PI_DEEPSEEK_TIER = "off-peak";
+    const reg = registry({ sides: [DEEPSEEK, DEEPINFRA], configured: true });
+    const { route, ctx } = await harness(reg);
+    // session_start saw a live catalog, so both sides are known; now it dies.
+    ctx.modelRegistry = staleRegistry();
+    const result = await route();
+    expect(SIDES).toContain(result.model.provider);
+  });
+
+  test("keeps the model that just answered when the context dies with nothing cached", async () => {
+    // A context that is already dead at `session_start` cannot seed the cache,
+    // so the only thing left is the model pi hands over for a continuation.
+    process.env.PI_DEEPSEEK_TIER = "off-peak";
+    const { route } = await harness(staleRegistry() as FakeRegistry, "continuation", {
+      previous: DEEPINFRA,
+    });
+    expect((await route()).model.provider).toBe("deepinfra");
+  });
+
+  test("says the context is stale rather than blaming a credential", async () => {
+    // The old message sent the reader to auth.json, which is why this took
+    // several sessions to diagnose. A dead context and a missing key are
+    // different failures and must not read the same.
+    process.env.PI_DEEPSEEK_TIER = "off-peak";
+    const { route } = await harness(staleRegistry() as FakeRegistry, "user");
+    const error = await route().then(
+      () => undefined,
+      (reason: Error) => reason.message,
+    );
+    expect(error).toContain("extension context is stale");
+    expect(error).toContain("neither credential is at fault");
+  });
   test("falls to the other side when only it is in the catalog", async () => {
     // Whichever tier is asked for, a missing side must not become a throw.
     for (const tier of ["peak", "off-peak"] as const) {
@@ -332,5 +407,48 @@ describe("router follows the price, not the clock", () => {
       json: async () => ({ data: [{ id: DEEPINFRA.id, metadata: { pricing: { input_tokens: 0.01, output_tokens: 0.01 } } }] }),
     }) as unknown as Response);
     expect((await (await harness(healthy)).routeAsPi()).model.provider).toBe("deepseek");
+  });
+});
+
+describe("router prices the context size the last turn reported", () => {
+  /** Report an assistant turn of `promptTokens` so the gate has a size to price. */
+  function reportPrompt(handlers: Record<string, (() => unknown)[]>, promptTokens: number): void {
+    const fire = handlers["message_end"]?.[0] as ((event: unknown) => unknown) | undefined;
+    if (!fire) throw new Error("the extension does not listen for message_end");
+    fire({
+      message: {
+        role: "assistant",
+        provider: "deepinfra",
+        usage: { input: promptTokens * 0.01, cacheRead: promptTokens * 0.99, output: 500 },
+      },
+    });
+  }
+
+  test("takes the 51% promo at 200K, where DeepInfra still wins off-peak", async () => {
+    process.env.PI_DEEPSEEK_TIER = "off-peak";
+    stubPricing(async () => pricingResponse(0.098, 0.294, 0.00294, 0));
+    const { routeAsPi, handlers } = await harness(healthy);
+    reportPrompt(handlers, 200_000);
+    expect((await routeAsPi()).model.provider).toBe("deepinfra");
+  });
+
+  test("falls back to DeepSeek past 524K, where the two cards reach parity", async () => {
+    // The regression the size-aware bands exist to catch: the same live promo
+    // that wins at 200K stops winning off-peak at 600K, because DeepInfra's
+    // cache cannot hold a context that large. A single scalar never flipped.
+    process.env.PI_DEEPSEEK_TIER = "off-peak";
+    stubPricing(async () => pricingResponse(0.098, 0.294, 0.00294, 0));
+    const { routeAsPi, handlers } = await harness(healthy);
+    reportPrompt(handlers, 600_000);
+    expect((await routeAsPi()).model.provider).toBe("deepseek");
+  });
+
+  test("still takes DeepInfra at peak on the same huge context", async () => {
+    // Peak is a separate question and the answer does not follow the off-peak one.
+    process.env.PI_DEEPSEEK_TIER = "peak";
+    stubPricing(async () => pricingResponse(0.098, 0.294, 0.00294, 0));
+    const { routeAsPi, handlers } = await harness(healthy);
+    reportPrompt(handlers, 600_000);
+    expect((await routeAsPi()).model.provider).toBe("deepinfra");
   });
 });

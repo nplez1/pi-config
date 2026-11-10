@@ -1,12 +1,11 @@
 {
-  "exploration": "xiaomi/mimo-v2.6-flash",
+  "exploration": "deepseek/deepseek-flash-auto",
   "heavy": "xiaomi/mimo-v2.6-pro",
   "opus": "claude/opus",
   "sonnet": "claude/sonnet",
   "fable": "claude/fable",
   "workhorse": [
-    "deepseek/deepseek-flash",
-    "xiaomi/mimo-v2.6-flash"
+    "deepseek/deepseek-flash-auto"
   ],
   "never": [
     "deepseek/deepseek-v4-pro"

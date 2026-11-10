@@ -19,16 +19,25 @@
 //
 // "Cheaper" is measured, not asserted axis by axis. `TOKEN_MIX` in
 // shared/deepseek-schedule.ts records how this machine actually spends tokens
-// (99.4% of every prompt is a cache read), and `cheaperOnMyMix` compares the
-// two cards at that mix. The old every-axis test treated the three prices as
-// equally important, which is wrong by a factor of ~290 — it demanded a 50%
-// DeepInfra discount where the mix-weighted break-even is 42%.
+// on DeepSeek (99.4% of every prompt is a cache read), and `cheaperAtPrompt`
+// compares the two cards at that mix. The old every-axis test treated the three
+// prices as equally important, which is wrong by a factor of ~290 — it demanded
+// a 50% DeepInfra discount where the mix-weighted break-even is ~37%.
+//
+// The comparison also has to price the tokens DeepInfra would actually bill, and
+// that is not a constant: DeepInfra's cache degrades with CONTEXT SIZE while
+// DeepSeek's improves, so `cheaperAtPrompt` prices BOTH sides at the miss share
+// measured for this session's latest prompt size. A single scalar here was right
+// only for the ~160K band this machine happens to live in; at 524K+ it kept
+// choosing DeepInfra for a context where the two cards reach parity.
 //
 //  - Promos. DeepInfra discounts its list price from time to time (51% off on
 //    2026-11-01, so $0.098/$0.294/$0.00294). On those cards its list price is
 //    already ahead at peak and far behind off-peak, so the promo is what makes
-//    it the cheaper side at every hour — but that is a reading of the numbers,
-//    not a rule the code encodes. DeepInfra publishes its rates publicly at
+//    it the cheaper side at every hour for a short prompt — but that is a
+//    reading of the numbers, not a rule the code encodes, and it stops being
+//    true past 524K tokens where DeepInfra's cache penalty outweighs it.
+//    DeepInfra publishes its rates publicly at
 //    /v1/openai/models, so the extension refetches them each session instead of
 //    trusting a hardcoded number.
 //
@@ -65,18 +74,31 @@
 // re-registration put the provider back into the catalog and the credential
 // cache pi reads, which is what makes a stale registry cost one stderr line
 // instead of a dead turn.
+//
+//  - A dead context is not a credential problem, and conflating the two is what
+//    made one failure recur. Every field of the context `route()` is handed is a
+//    getter that begins with the extension runner's staleness check, so once pi
+//    replaces or reloads the session behind this registration — `/new`, `/fork`,
+//    `/resume`, `/reload`, or another session's runner in the same process —
+//    *every* registry read throws at once. That reads exactly like "neither side
+//    has a credential": same shape, both sides, with nothing wrong with either
+//    key, and the recovery chain above cannot help because it re-checks the same
+//    dead context. So `route()` recognises that state and answers with the last
+//    physical model it knows to be good instead of ending the turn, and a guard
+//    around the whole of `route()` does the same for anything this file has not
+//    anticipated. pi re-checks credentials on what `route()` returns, so the
+//    worst case becomes pi's own accurate error rather than a dead turn.
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   CACHE_WRITE_RATE,
   DEEPINFRA_FLASH,
-  DEEPINFRA_INPUT_MULTIPLIER,
   DEEPINFRA_LIST,
   DEEPSEEK_FLASH,
   PROVIDER_LABEL,
   RATES,
   ROUTER,
-  cheaperOnMyMix,
+  cheaperAtPrompt,
   currentTier,
   deepseekCost,
   effectiveCost,
@@ -163,6 +185,14 @@ interface RouteContext {
     refresh?(options?: { allowNetwork?: boolean; providers?: string[] }): Promise<unknown>;
   };
 }
+
+/**
+ * A verdict this file means to report: the registry is readable and positively
+ * says no request can be served. A distinct class so the guard around `route()`
+ * can tell a deliberate verdict from an unexpected failure and only rescue the
+ * latter — a real missing credential deserves the message, not a retry.
+ */
+class RouteFailure extends Error {}
 
 /** Session-context surface used by the footer label (ExtensionContext fits). */
 interface LabelContext {
@@ -324,11 +354,63 @@ export default function (pi: ExtensionAPI) {
   /** One stderr note per streak of requests routed without the snapshot. */
   let warnedStaleSnapshot = false;
 
-  /** Which side to use for `tier`, given the current DeepInfra price. */
+  /**
+   * The largest prompt this session has sent, in tokens — the size
+   * `cheaperAtPrompt` prices both cards at. `route()` is handed no token count,
+   * so the last turn's usage is the estimate: the next prompt is that plus the
+   * new content, which cannot move it across a band by itself. Assistant
+   * messages on either side count, because the prompt is the same conversation
+   * either way.
+   */
+  let promptTokens: number | undefined;
+
+  /** Which side to use for `tier`, at this session's prompt size and price. */
   function chooseSide(tier: Tier): ModelRef {
-    return cheaperOnMyMix(deepInfraCost, deepseekCost(tier), DEEPINFRA_INPUT_MULTIPLIER)
+    return cheaperAtPrompt(deepInfraCost, deepseekCost(tier), promptTokens)
       ? DEEPINFRA_FLASH
       : DEEPSEEK_FLASH;
+  }
+
+  /**
+   * The physical model objects this session has actually seen, by provider.
+   *
+   * A dead context cannot read the catalog at all, and pi needs a model *object*
+   * rather than an id, so the last good object is the only thing that can keep
+   * the turn alive. Seeded at `session_start`, refreshed on every decision, and
+   * topped up from `request.previous` / `request.failed`, which pi supplies for
+   * the two reasons the context has been observed to die on.
+   */
+  const known = new Map<string, CatalogModel>();
+
+  function remember(model: CatalogModel | undefined): void {
+    if (!model) return;
+    if (model.provider !== DEEPSEEK_FLASH.provider && model.provider !== DEEPINFRA_FLASH.provider) return;
+    known.set(model.provider, model);
+  }
+
+  /** The last model this session used from `ref`'s provider, if any. */
+  function knownSide(ref: ModelRef | undefined): CatalogModel | undefined {
+    return ref ? known.get(ref.provider) : undefined;
+  }
+
+  /**
+   * The physical model to keep the turn alive on, best first: the one that just
+   * answered, the one that just failed, then anything this session has routed to.
+   * Undefined only for a session that has never routed at all.
+   */
+  function lastKnown(request: RouteRequest): CatalogModel | undefined {
+    const preferred = chooseSide(currentTier());
+    return (
+      request.previous?.model ??
+      request.failed?.model ??
+      knownSide(preferred) ??
+      knownSide(otherSide(preferred))
+    );
+  }
+
+  /** The first line of an error, for a one-line stderr note. */
+  function firstLine(error: unknown): string {
+    return (error instanceof Error ? error.message : String(error)).split("\n")[0];
   }
 
   // ---- footer indicator ---------------------------------------------------
@@ -390,11 +472,28 @@ export default function (pi: ExtensionAPI) {
   // Show the label before the first request of a session (startup, resume, fork).
   pi.on("session_start", (_event, ctx) => {
     updateLabel(ctx, ctx.model, true);
+    // The context is fresh here, so this is the one moment the catalog can be
+    // read for free. Whatever dies later, both sides now have a model object.
+    for (const side of [DEEPSEEK_FLASH, DEEPINFRA_FLASH]) remember(findInCatalog(ctx, side));
   });
 
   // React to /model, Ctrl+P cycling, and session restore.
   pi.on("model_select", (event, ctx) => {
     updateLabel(ctx, event.model);
+  });
+
+  // Track the prompt size that `cheaperAtPrompt` prices, so the DeepInfra cache
+  // penalty follows the context instead of a constant. Only the two routed
+  // sides matter; a virtual-model or unrelated-provider message says nothing
+  // about the prompt these cards would be billed for.
+  pi.on("message_end", (event) => {
+    const msg = event.message;
+    if (msg.role !== "assistant") return;
+    if (msg.provider !== DEEPSEEK_FLASH.provider && msg.provider !== DEEPINFRA_FLASH.provider) return;
+    const usage = msg.usage;
+    if (!usage) return;
+    const tokens = (usage.input ?? 0) + (usage.cacheRead ?? 0);
+    if (tokens > 0) promptTokens = tokens;
   });
 
   // Extensions are rebound per session; drop session-scoped state and timer.
@@ -405,6 +504,8 @@ export default function (pi: ExtensionAPI) {
     appliedText = undefined;
     warnedStaleSnapshot = false;
     pricing = undefined;
+    promptTokens = undefined;
+    known.clear();
     // Back to list price, so a later session whose fetch fails does not inherit
     // this one's discount.
     deepInfraCost = DEEPINFRA_LIST;
@@ -484,10 +585,32 @@ export default function (pi: ExtensionAPI) {
    * credential store has it. Both are skipped unless the live resolution proved
    * the side usable, so a genuinely missing key still fails — with a message
    * that names which of the four facts disagreed.
+   *
+   * A dead *context* is checked for first, because it is the one failure the
+   * chain above cannot fix and the one it used to misreport: once pi has replaced
+   * or reloaded the session, every registry read throws, which is indistinguishable
+   * from "neither side has a key" to a reader of the four facts. There the router
+   * answers with the last model it saw work and says so.
    */
   async function resolveEither(ctx: RouteContext, ref: ModelRef): Promise<CatalogModel> {
     const decided = decide(ctx, ref);
     if (decided) return decided;
+
+    // A dead context cannot be re-checked, probed or repaired — every one of
+    // those reads the same invalidated runner, so the chain below would report
+    // "no credentials" about keys that are perfectly fine. Answer from what this
+    // session has already used instead.
+    if (await contextIsStale(ctx, ref)) {
+      const kept = knownSide(ref) ?? knownSide(otherSide(ref));
+      if (kept) {
+        note(`the extension context is stale, so the registry cannot be read; kept ${kept.provider}/${kept.id}`);
+        return kept;
+      }
+      // Nothing cached yet: not deliberate, so the guard around `route()` gets a
+      // chance to answer with the model that just handled the turn.
+      throw new Error(await describeFailure(ctx, ref));
+    }
+
     await recheckCredentials(ctx, ref);
     const recovered = decide(ctx, ref);
     if (recovered) {
@@ -509,7 +632,30 @@ export default function (pi: ExtensionAPI) {
       }
     }
 
-    throw new Error(await describeFailure(ctx, ref));
+    throw new RouteFailure(await describeFailure(ctx, ref));
+  }
+
+  /**
+   * Whether the registry is *unreadable* rather than merely unhelpful.
+   *
+   * A real `ModelRegistry` always answers `getProviderAuthStatus()` with an
+   * object, and resolves `getProviderAuth()` to a value or to `undefined` — only
+   * a thrown staleness check makes either unavailable. So "no catalog entry, no
+   * cached verdict, nothing in the store, no live answer" is the one combination
+   * a live registry cannot produce, and it means the context itself is dead.
+   */
+  function registryUnreadable(state: SideState): boolean {
+    return !state.catalog && state.snapshot === undefined && state.store === "unknown" && state.live === undefined;
+  }
+
+  /** Whether both sides of the registry are unreadable — a dead context, not a credential. */
+  async function contextIsStale(ctx: RouteContext, ref: ModelRef): Promise<boolean> {
+    const sides = [ref, otherSide(ref)].filter((side): side is ModelRef => Boolean(side));
+    if (sides.length === 0) return false;
+    for (const side of sides) {
+      if (!registryUnreadable(await probe(ctx, side))) return false;
+    }
+    return true;
   }
 
   /** One side's state, read the four ways the registry can answer. */
@@ -573,20 +719,19 @@ export default function (pi: ExtensionAPI) {
   /** The error, carrying what the registry said about each side. */
   async function describeFailure(ctx: RouteContext, ref: ModelRef): Promise<string> {
     const sides = [ref, otherSide(ref)].filter((side): side is ModelRef => Boolean(side));
-    const details: string[] = [];
-    for (const side of sides) {
-      const state = await probe(ctx, side);
-      const unreadable =
-        !state.catalog && state.snapshot === undefined && state.store === "unknown" && state.live === undefined;
-      details.push(
-        unreadable
-          ? `${side.provider}/${side.id}: the model registry could not be read`
-          : `${side.provider}/${side.id}: ${state.catalog ? "in the catalog" : "missing from the catalog"}, ` +
-              `credential ${state.store === "none" ? "not in the credential store" : `in the credential store (${state.store})`}, ` +
-              `cached verdict ${state.snapshot === undefined ? "unavailable" : state.snapshot ? "configured" : "no credentials"}, ` +
-              `live check ${state.live === undefined ? "unavailable" : state.live ? "found one" : "found none"}`,
-      );
-    }
+    const states: { side: ModelRef; state: SideState }[] = [];
+    for (const side of sides) states.push({ side, state: await probe(ctx, side) });
+    const details = states.map(({ side, state }) =>
+      registryUnreadable(state)
+        ? `${side.provider}/${side.id}: the model registry could not be read`
+        : `${side.provider}/${side.id}: ${state.catalog ? "in the catalog" : "missing from the catalog"}, ` +
+            `credential ${state.store === "none" ? "not in the credential store" : `in the credential store (${state.store})`}, ` +
+            `cached verdict ${state.snapshot === undefined ? "unavailable" : state.snapshot ? "configured" : "no credentials"}, ` +
+            `live check ${state.live === undefined ? "unavailable" : state.live ? "found one" : "found none"}`,
+    );
+    // Name the real cause. "Check auth.json" is actively misleading here: the
+    // credentials are fine, the context that would read them is not.
+    const dead = states.length > 0 && states.every(({ state }) => registryUnreadable(state));
     let registry = "";
     try {
       const error = ctx.modelRegistry.getError?.();
@@ -596,7 +741,12 @@ export default function (pi: ExtensionAPI) {
     }
     return (
       `deepseek-routing: neither ${sides.map((side) => `${side.provider}/${side.id}`).join(" nor ")} is usable. ` +
-      `${details.join("; ")}.${registry} Run /reload to rebuild the registry; if a credential is really missing, ` +
+      `${details.join("; ")}.${registry} ` +
+      (dead
+        ? `The extension context is stale — pi replaced or reloaded the session under this router — so no ` +
+          `registry read can succeed and neither credential is at fault. `
+        : "") +
+      `Run /reload to rebuild the registry; if a credential is really missing, ` +
       `check it in ~/.pi/agent/auth.json`
     );
   }
@@ -606,6 +756,7 @@ export default function (pi: ExtensionAPI) {
     const available = availableIds(ctx);
     const wanted = resolve(ctx, ref, available) ?? resolve(ctx, otherSide(ref), available);
     if (wanted) {
+      remember(wanted);
       if (available === undefined) {
         note(`availability snapshot is empty; routed to ${wanted.provider}/${wanted.id} without it`);
       } else {
@@ -615,6 +766,7 @@ export default function (pi: ExtensionAPI) {
     }
     const fallback = pickConfigured(ctx, [ref, otherSide(ref)]);
     if (fallback) {
+      remember(fallback);
       note(`availability snapshot omitted ${fallback.provider}/${fallback.id}; using the catalog entry`);
       return fallback;
     }
@@ -650,6 +802,58 @@ export default function (pi: ExtensionAPI) {
     return undefined;
   }
 
+  /**
+   * `route()`'s decision, extracted so the guard below covers every path out of
+   * it — including the ones that throw.
+   */
+  async function decideRoute(
+    request: RouteRequest,
+    ctx: RouteContext,
+  ): Promise<{ model: CatalogModel; thinkingLevel: string; state?: RouterState }> {
+    // Tool follow-ups and steering mid-turn: stay where the turn started, so
+    // the prompt cache survives. Crossing a peak boundary mid-turn would cost
+    // more than the per-token difference it saves.
+    if (request.reason === "continuation") {
+      const previous = request.previous?.model;
+      if (previous && (previous.provider === DEEPSEEK_FLASH.provider || previous.provider === DEEPINFRA_FLASH.provider)) {
+        return { model: await resolveEither(ctx, previous), thinkingLevel: request.thinkingLevel };
+      }
+    }
+
+    // A retry: cross to the other side once, for provider-side failures only.
+    if (request.reason === "retry") {
+      const failed = request.failed;
+      if (failed?.model && !request.state?.failedOver && looksLikeProviderFailure(failed.message)) {
+        const other = otherSide(failed.model);
+        const target = resolve(ctx, other);
+        if (other && target) {
+          return {
+            model: target,
+            thinkingLevel: request.thinkingLevel,
+            state: { failedOver: true },
+          };
+        }
+      }
+      if (failed?.model) {
+        return { model: await resolveEither(ctx, failed.model), thinkingLevel: request.thinkingLevel };
+      }
+    }
+
+    // A fresh user message (or a direct request such as a compaction summary)
+    // starts a new decision. Wait for the live price first, so the decision is
+    // never made on the seeded list price when the real one is a request away;
+    // pi awaits `route()`, and the wait is bounded by the fetch timeout.
+    // Continuations and retries above deliberately skip it — they must not
+    // spend latency mid-turn.
+    await refreshPricing();
+    const target = await resolveEither(ctx, chooseSide(currentTier()));
+    return {
+      model: target,
+      thinkingLevel: request.thinkingLevel,
+      state: request.state?.failedOver ? {} : undefined,
+    };
+  }
+
   pi.registerVirtualModel<RouterState>({
     provider: ROUTER.provider,
     id: ROUTER.id,
@@ -660,48 +864,23 @@ export default function (pi: ExtensionAPI) {
     maxTokens: MAX_TOKENS,
     input: ["text", "image"],
     async route(request: RouteRequest, ctx: RouteContext) {
-      // Tool follow-ups and steering mid-turn: stay where the turn started, so
-      // the prompt cache survives. Crossing a peak boundary mid-turn would cost
-      // more than the per-token difference it saves.
-      if (request.reason === "continuation") {
-        const previous = request.previous?.model;
-        if (previous && (previous.provider === DEEPSEEK_FLASH.provider || previous.provider === DEEPINFRA_FLASH.provider)) {
-          return { model: await resolveEither(ctx, previous), thinkingLevel: request.thinkingLevel };
-        }
+      // pi hands over the model that just answered for exactly the two reasons a
+      // dead context has been seen on, so record it before anything can fail.
+      remember(request.previous?.model);
+      remember(request.failed?.model);
+      try {
+        return await decideRoute(request, ctx);
+      } catch (error) {
+        // A deliberate verdict is the one thing worth ending a turn for: it names
+        // a fact the user has to act on, and pi would only replace it with a
+        // vaguer one. Anything else keeps the session on the model it last used,
+        // which pi then checks for credentials itself.
+        if (error instanceof RouteFailure) throw error;
+        const kept = lastKnown(request);
+        if (!kept) throw error;
+        note(`routing failed (${firstLine(error)}); kept ${kept.provider}/${kept.id} instead of ending the turn`);
+        return { model: kept, thinkingLevel: request.thinkingLevel };
       }
-
-      // A retry: cross to the other side once, for provider-side failures only.
-      if (request.reason === "retry") {
-        const failed = request.failed;
-        if (failed?.model && !request.state?.failedOver && looksLikeProviderFailure(failed.message)) {
-          const other = otherSide(failed.model);
-          const target = resolve(ctx, other);
-          if (other && target) {
-            return {
-              model: target,
-              thinkingLevel: request.thinkingLevel,
-              state: { failedOver: true },
-            };
-          }
-        }
-        if (failed?.model) {
-          return { model: await resolveEither(ctx, failed.model), thinkingLevel: request.thinkingLevel };
-        }
-      }
-
-      // A fresh user message (or a direct request such as a compaction summary)
-      // starts a new decision. Wait for the live price first, so the decision is
-      // never made on the seeded list price when the real one is a request away;
-      // pi awaits `route()`, and the wait is bounded by the fetch timeout.
-      // Continuations and retries above deliberately skip it — they must not
-      // spend latency mid-turn.
-      await refreshPricing();
-      const target = await resolveEither(ctx, chooseSide(currentTier()));
-      return {
-        model: target,
-        thinkingLevel: request.thinkingLevel,
-        state: request.state?.failedOver ? {} : undefined,
-      };
     },
   });
 
