@@ -1,5 +1,28 @@
 {
   "providers": {
+    "github-copilot": {
+      "models": [
+        {
+          "id": "claude-fable-5.2",
+          "name": "Claude Fable 5.2",
+          "api": "anthropic-messages",
+          "baseUrl": "https://api.githubcopilot.com",
+          "reasoning": true,
+          "input": ["text", "image"],
+          "cost": { "input": 8, "output": 40, "cacheRead": 0.2, "cacheWrite": 10 },
+          "contextWindow": 1000000,
+          "maxTokens": 128000,
+          "headers": {
+            "User-Agent": "GitHubCopilotChat/0.35.0",
+            "Editor-Version": "vscode/1.107.0",
+            "Editor-Plugin-Version": "copilot-chat/0.35.0",
+            "Copilot-Integration-Id": "vscode-chat"
+          },
+          "thinkingLevelMap": { "off": null, "xhigh": "xhigh", "max": "max" },
+          "compat": { "forceAdaptiveThinking": true }
+        }
+      ]
+    },
     "deepseek": {
       "modelOverrides": {
         "deepseek-flash": {
@@ -272,6 +295,30 @@
               "top_p": 0.8
             }
           }
+        },
+        {
+          "id": "Qwen3.8-27B-oQ4e-mtp",
+          "name": "Qwen3.8-27B oQ4e + MTP (M5 Max)",
+          "reasoning": true,
+          "input": ["text", "image"],
+          "thinkingLevelMap": {
+            "minimal": "low",
+            "low": "low",
+            "medium": "medium",
+            "high": "xhigh",
+            "xhigh": "xhigh",
+            "max": "xhigh"
+          },
+          "compat": {
+            "thinkingFormat": "chat-template",
+            "maxTokensField": "max_tokens",
+            "chatTemplateKwargs": {
+              "enable_thinking": {"$var": "thinking.enabled"},
+              "preserve_thinking": true,
+              "reasoning_effort": {"$var": "thinking.effort", "omitWhenOff": true}
+            }
+          },
+          "contextWindow": 262144
         }
       ]
     }

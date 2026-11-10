@@ -73,7 +73,7 @@ const MODEL_ABBREVIATIONS: Record<string, string> = {
 	"fireworks/accounts/fireworks/models/ember-1": "Ember1",
 	"fireworks/accounts/fireworks/models/glm-5p3": "GLM5.3",
 	"fireworks/accounts/fireworks/models/glm-5p3-flash": "GLM5.3Flash",
-	"fireworks/accounts/fireworks/models/gpt-oss-120b": "GPTOSS120B",
+	"fireworks/accounts/fireworks/models/gpt-oss-120b": "OSS-120B",
 	"fireworks/accounts/fireworks/models/inkling": "Inkling",
 	"fireworks/accounts/fireworks/models/kimi-k3": "KimiK3",
 	"fireworks/accounts/fireworks/models/minimax-m3": "MiniMaxM3",
@@ -118,8 +118,30 @@ const VENDOR_ACRONYMS: Record<string, string> = {
 /** Quantization/runtime tails an id can lose, e.g. "-oQ4e-fp16-mtp". */
 const QUANT_TAIL = /-(?:mtp|fp\d+|oq\d+[a-z]?|nvfp4)$/i;
 
+/** Reorder vendor-prefixed Claude/GPT names to put the model family first. */
+function formatClaudeOrGptName(name: string): string | undefined {
+	const normalized = name.trim().replace(/\s+\(latest\)$/i, "");
+	const claude = normalized.match(/^claude[-\s]+(.+)$/i);
+	const gpt = normalized.match(/^gpt[-\s]+(.+)$/i);
+	const vendor = claude ? "Claude" : gpt ? "GPT" : undefined;
+	const descriptor = claude?.[1] ?? gpt?.[1];
+	if (!vendor || !descriptor) return undefined;
+
+	const version = descriptor.match(/(?:^|[-\s])(\d+(?:\.\d+)*(?:[a-z])?)(?=$|[-\s])/i)?.[1];
+	if (!version) return undefined;
+	const family = descriptor.replace(version, "").replace(/[-\s]+/g, " ").trim();
+	const familyLabel = family
+		.split(/[-\s]+/)
+		.filter(Boolean)
+		.map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+		.join("");
+	return `${familyLabel || vendor}-${version}`;
+}
+
 /** "Deepseek v4.1 Flash" -> "DSv4.1Flash"; keeps dots, drops spaces and dashes. */
 function abbreviateModelName(name: string): string {
+	const vendorLabel = formatClaudeOrGptName(name);
+	if (vendorLabel) return vendorLabel;
 	let short = name.trim();
 	for (let i = 0; i < 8; i++) {
 		const next = short.replace(QUANT_TAIL, "");
@@ -146,7 +168,8 @@ function footerModelLabel(model: { provider: string; id: string; name?: string }
  * name, which is long; because it also drops the provider words, the provider
  * goes back in parentheses so the footer still says which side answered — that
  * reported provider is what lets the caller drop a duplicate elsewhere on the
- * line. Uncurated models keep their full name and report no provider.
+ * line. Uncurated models keep their full name (except Claude/GPT family-version
+ * shorthand) and report no provider.
  */
 function routedModelLabel(
 	registry: { getProviderDisplayName?: (provider: string) => string },
@@ -155,7 +178,10 @@ function routedModelLabel(
 ): { text: string; provider?: string } {
 	if (!physical) return { text: fallbackId };
 	const mapped = MODEL_ABBREVIATIONS[`${physical.provider}/${physical.id}`];
-	if (!mapped) return { text: physical.name ?? fallbackId };
+	if (!mapped) {
+		const name = physical.name ?? fallbackId;
+		return { text: formatClaudeOrGptName(name) ?? name };
+	}
 	let provider: string | undefined;
 	try {
 		provider = registry.getProviderDisplayName?.(physical.provider);
