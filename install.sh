@@ -6,20 +6,28 @@
 #
 #   portable  symlinked into place. Editing the live file edits this repo.
 #   seeded    copied only if the target does not exist, then owned by the
-#             machine. `settings.json` and `advisor.json` are seeded because
-#             they hold account-specific values (which models you have, the
-#             default model, the advisor's model) that legitimately differ per
-#             machine. Run `./install.sh capture` to publish the non-account
-#             parts of those files back into the repo.
+#             machine. Five files are seeded: `settings.json`,
+#             `subagents.json`, `model-roles.json`, `advisor.json` and
+#             `pi-system-one.json`. The first four hold account-specific values
+#             (which models you have, the default model, the model each agent
+#             and the advisor run on) that legitimately differ per machine;
+#             `pi-system-one.json` is seeded because `/so` rewrites it with an
+#             atomic rename, which would replace a symlink with a real file and
+#             silently drop the edit. Run `./install.sh capture` to publish the
+#             non-account parts of those files back into the repo.
 #
-# Nothing is deleted: an existing real file is moved to
-# `<target>.pre-pi-config-<timestamp>`.
+# Nothing is deleted: an existing real file is moved into its own tree,
+# `~/.pi-config-backups/<timestamp>/<flattened path>` — never next to the
+# target, because `~/.agents/skills` and `~/.pi/agent/agents` are scanned for
+# `*/SKILL.md` and `*.md`, so a `<name>.pre-pi-config-*` sibling there would be
+# re-discovered as a duplicate skill or agent. BACKUP_ROOT/backup_slot below are
+# the implementation.
 #
 # Usage:
 #   ./install.sh              link + seed, fetch submodules, npm install plugins,
 #                             then install/compile Pi-Bolt and swap `pi` to it
 #   ./install.sh --dry-run    print what would happen, change nothing
-#   ./install.sh capture      copy the live settings/advisor back, minus account keys
+#   ./install.sh capture      copy the live seeded files back, minus account keys
 #   ./install.sh uninstall    remove symlinks that point into this repo
 #
 # Env: PI_CONFIG_SKIP_PLUGINS=1  skip submodule fetch + npm install (offline test)

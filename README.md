@@ -41,10 +41,11 @@ tier for work that does not need Opus.
 keep `claude/fable` one request away, but it is never a default for planning,
 review, unblock or any automated task — ask for it by name.
 
-`install.sh` **seeds** the four machine-owned files (copy only if absent) instead
-of symlinking them, so a `/subagents` or `/model` change on one machine can never
-rewrite the other's config. When you change something *shared* inside those
-files, run:
+`install.sh` **seeds** five files (copy only if absent) instead of symlinking
+them — the four above, plus `~/.pi/agent/pi-system-one.json`, which is seeded
+because `/so` rewrites its own config — so a `/subagents` or `/model` change on
+one machine can never rewrite the other's config. When you change something
+*shared* inside those files, run:
 
 The advisor and compressor models are **not** in `advisor.json`. They are the
 `rpiv-advisor` / `rpiv-compressor` entries in `subagents.json`'s
@@ -110,7 +111,8 @@ dot-pi/
     subagents.json                SEEDED   agent enable flags; per-agent models local
     subagents.machine.example.json example of the per-agent model overrides
     auth.json.example             template only — auth.json is NOT tracked
-    agents/                       -> ~/.pi/agent/agents/
+    agents/                       -> ~/.pi/agent/agents/    (per file, not the directory;
+                                     dotfiles such as .glla-subagent-sync.json skipped)
     extensions/                   -> ~/.pi/agent/extensions/    (per file)
 dot-config/
   pi-config/model-roles.json      SEEDED   which ID each AGENTS.md role means
@@ -182,7 +184,8 @@ had compiled in.
 
 Then: `export` any env var `models.json` references (e.g. `OMLX_API_KEY`), run
 `pi` and `/login` for the providers that machine has, and pick a default model
-with `/model`. Restart pi; `pi list` should show the three plugins, and
+with `/model`. Restart pi; `pi list` should show the five plugin forks
+(`plugins/…`) and the three `pi-bolt-bundles/…` entries, and
 `pi-bolt compile --status` the compiled set.
 
 `install.sh` is idempotent, moves any file it would replace into

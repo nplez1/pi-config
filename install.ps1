@@ -402,7 +402,7 @@ function Invoke-Uninstall {
     } else { Write-Line 'keep' "$dst (points elsewhere: $cur)" }
   }
   Write-Output ''
-  Write-Output 'Machine-owned files (settings.json, subagents.json, model-roles.json, advisor.json) are left in place.'
+  Write-Output 'Machine-owned files (settings.json, pi-system-one.json, subagents.json, model-roles.json, advisor.json) are left in place.'
 }
 
 # ------------------------------------------------------------------ main -----
