@@ -6,22 +6,25 @@
 #
 #   portable  symlinked into place. Editing the live file edits this repo.
 #   seeded    copied only if the target does not exist, then owned by the
-#             machine. Five files are seeded: `settings.json`,
-#             `subagents.json`, `model-roles.json`, `advisor.json` and
-#             `pi-system-one.json`. The first four hold account-specific values
-#             (which models you have, the default model, the model each agent
-#             and the advisor run on) that legitimately differ per machine;
-#             `pi-system-one.json` is seeded because `/so` rewrites it with an
-#             atomic rename, which would replace a symlink with a real file and
-#             silently drop the edit. Run `./install.sh capture` to publish the
-#             non-account parts of those files back into the repo.
+#             machine. Five files are seeded, each because it holds something
+#             that legitimately differs per machine: `settings.json` (which
+#             models you have, the default model), `subagents.json` (the model
+#             and thinking level each agent runs on — the advisor's included),
+#             `model-roles.json` (the role -> provider/model ID map),
+#             `advisor.json` (`disabledForModels`) and `pi-system-one.json`
+#             (`/so` rewrites it with an atomic rename, which would replace a
+#             symlink with a real file and silently drop the edit). Run
+#             `./install.sh capture` to publish the non-account parts of those
+#             files back into the repo.
 #
-# Nothing is deleted: an existing real file is moved into its own tree,
+# No real file is deleted: an existing real file is moved into its own tree,
 # `~/.pi-config-backups/<timestamp>/<flattened path>` — never next to the
 # target, because `~/.agents/skills` and `~/.pi/agent/agents` are scanned for
 # `*/SKILL.md` and `*.md`, so a `<name>.pre-pi-config-*` sibling there would be
-# re-discovered as a duplicate skill or agent. BACKUP_ROOT/backup_slot below are
-# the implementation.
+# re-discovered as a duplicate skill or agent. A symlink that points elsewhere is
+# replaced rather than backed up (its old target is printed first), and a seeded
+# target that is still a symlink is converted into a local copy. BACKUP_ROOT and
+# backup_slot below are the implementation.
 #
 # Usage:
 #   ./install.sh              link + seed, fetch submodules, npm install plugins,

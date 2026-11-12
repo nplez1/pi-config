@@ -47,6 +47,10 @@ because `/so` rewrites its own config — so a `/subagents` or `/model` change o
 one machine can never rewrite the other's config. When you change something
 *shared* inside those files, run:
 
+```sh
+~/Code/pi-config/install.sh capture   # copies them back, stripping account keys
+```
+
 The advisor and compressor models are **not** in `advisor.json`. They are the
 `rpiv-advisor` / `rpiv-compressor` entries in `subagents.json`'s
 `agentOverrides`, so `/subagents` is the only writer and `/advisor` only reports
@@ -56,10 +60,6 @@ precedence rule or a sync step eventually do. `install.sh` migrates any legacy
 `advisor.json` into those entries once (never overwriting a value `/subagents`
 already set), then deletes them; what remains in `advisor.json` is `guidance`
 (shared) and `disabledForModels` (machine-owned).
-
-```sh
-~/Code/pi-config/install.sh capture   # copies them back, stripping account keys
-```
 
 `capture` always deletes the account keys listed above before writing the seed,
 so they cannot leak into the repo. The shared keys travel back the other way
@@ -111,8 +111,7 @@ dot-pi/
     subagents.json                SEEDED   agent enable flags; per-agent models local
     subagents.machine.example.json example of the per-agent model overrides
     auth.json.example             template only — auth.json is NOT tracked
-    agents/                       -> ~/.pi/agent/agents/    (per file, not the directory;
-                                     dotfiles such as .glla-subagent-sync.json skipped)
+    agents/                       -> ~/.pi/agent/agents/        (per file, not the directory)
     extensions/                   -> ~/.pi/agent/extensions/    (per file)
 dot-config/
   pi-config/model-roles.json      SEEDED   which ID each AGENTS.md role means
@@ -138,7 +137,11 @@ pi-bolt/                          -> ~/.pi/agent/pi-bolt-bundles
 
 `settings.json` refers to the forks as `plugins/<name>`, which pi resolves
 relative to `~/.pi/agent`; the `~/.pi/agent/plugins` symlink makes that path
-clone-location-independent. Every plugin is a fork under `nplez1/` with its
+clone-location-independent. `agents/` and `extensions/` are linked one entry at
+a time rather than as a whole directory, so a local agent or extension added
+under `~/.pi/agent` is never moved aside; `install.sh`'s shell glob also skips
+dotfiles such as `.glla-subagent-sync.json`, while `install.ps1` links every
+entry. Every plugin is a fork under `nplez1/` with its
 divergence written down in that repo's `FORK.md`; `plugins/pi-codex-goal` keeps
 upstream history so it can be merged rather than re-forked.
 The installer replaces the old npm package entry on existing machines, preserving
@@ -184,9 +187,13 @@ had compiled in.
 
 Then: `export` any env var `models.json` references (e.g. `OMLX_API_KEY`), run
 `pi` and `/login` for the providers that machine has, and pick a default model
-with `/model`. Restart pi; `pi list` should show the five plugin forks
-(`plugins/…`) and the three `pi-bolt-bundles/…` entries, and
-`pi-bolt compile --status` the compiled set.
+with `/model`. Restart pi; `pi list` should show this repo's packages — under
+Pi-Bolt that is the npm entries, `plugins/pi-codex-goal`,
+`plugins/pi-smart-compaction` and the three `pi-bolt-bundles/…` entries, because
+`piBolt.packages` swaps `pi-subagents`, `pi-advisor-subagent` and
+`npm:pi-web-access` for their bundles and `pi-todo` for `npm:opensec-pi-todo`;
+stock pi (`PI_CONFIG_SKIP_PIBOLT=1`) lists all five `plugins/…` forks and no
+bundles. `pi-bolt compile --status` reports the compiled set.
 
 `install.sh` is idempotent, moves any file it would replace into
 `~/.pi-config-backups/<timestamp>/` (flattened, deliberately **not** next to the
