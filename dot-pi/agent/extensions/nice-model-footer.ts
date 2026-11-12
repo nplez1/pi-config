@@ -411,7 +411,7 @@ export default function (pi: ExtensionAPI) {
 								: `${modelName} • ${thinkingLevel}`;
 					}
 					// A virtual model routes each request; show where the latest response
-					// went, e.g. "Fusion/Standard → GPT-6 Luna". The transcript records
+					// went, e.g. "Fusion/Standard → Luna-6". The transcript records
 					// the physical model on each assistant message.
 					let routedProvider: string | undefined;
 					if (ctx.model?.api === "pi-virtual") {

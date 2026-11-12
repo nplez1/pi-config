@@ -6,20 +6,31 @@
 #
 #   portable  symlinked into place. Editing the live file edits this repo.
 #   seeded    copied only if the target does not exist, then owned by the
-#             machine. `settings.json` and `advisor.json` are seeded because
-#             they hold account-specific values (which models you have, the
-#             default model, the advisor's model) that legitimately differ per
-#             machine. Run `./install.sh capture` to publish the non-account
-#             parts of those files back into the repo.
+#             machine. Five files are seeded, each because it holds something
+#             that legitimately differs per machine: `settings.json` (which
+#             models you have, the default model), `subagents.json` (the model
+#             and thinking level each agent runs on — the advisor's included),
+#             `model-roles.json` (the role -> provider/model ID map),
+#             `advisor.json` (`disabledForModels`) and `pi-system-one.json`
+#             (`/so` rewrites it with an atomic rename, which would replace a
+#             symlink with a real file and silently drop the edit). Run
+#             `./install.sh capture` to publish the non-account parts of those
+#             files back into the repo.
 #
-# Nothing is deleted: an existing real file is moved to
-# `<target>.pre-pi-config-<timestamp>`.
+# No real file is deleted: an existing real file is moved into its own tree,
+# `~/.pi-config-backups/<timestamp>/<flattened path>` — never next to the
+# target, because `~/.agents/skills` and `~/.pi/agent/agents` are scanned for
+# `*/SKILL.md` and `*.md`, so a `<name>.pre-pi-config-*` sibling there would be
+# re-discovered as a duplicate skill or agent. A symlink that points elsewhere is
+# replaced rather than backed up (its old target is printed first), and a seeded
+# target that is still a symlink is converted into a local copy. BACKUP_ROOT and
+# backup_slot below are the implementation.
 #
 # Usage:
 #   ./install.sh              link + seed, fetch submodules, npm install plugins,
 #                             then install/compile Pi-Bolt and swap `pi` to it
 #   ./install.sh --dry-run    print what would happen, change nothing
-#   ./install.sh capture      copy the live settings/advisor back, minus account keys
+#   ./install.sh capture      copy the live seeded files back, minus account keys
 #   ./install.sh uninstall    remove symlinks that point into this repo
 #
 # Env: PI_CONFIG_SKIP_PLUGINS=1  skip submodule fetch + npm install (offline test)
@@ -768,7 +779,9 @@ Next steps:
        • run `pi` and /login for the providers THIS machine has
   2. Pick a default model for this machine: `pi`, then /model.
      settings.json is machine-owned, so that choice stays local.
-  3. Restart pi; `pi list` should show the plugins under ~/.pi/agent/plugins.
+  3. Restart pi; `pi list` should show this repo's packages (Pi-Bolt lists
+     pi-subagents, pi-advisor-subagent and pi-web-access as pi-bolt-bundles/
+     entries, and pi-todo as npm:opensec-pi-todo).
   4. `pi` now runs Pi-Bolt (pi-config/pi-bolt/README.md). `pi-real` or
      `PI_REAL=1 pi` reaches the stock launcher; revert with
      pi-config/pi-bolt/pi-swap.sh remove. Credentials are shared.

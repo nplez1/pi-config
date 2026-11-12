@@ -8,11 +8,17 @@
 
     portable  linked into place. Editing the live file edits this repo.
     seeded    copied only if the target does not exist, then owned by the
-              machine (settings.json, subagents.json, model-roles.json,
-              advisor.json, pi-system-one.json hold account-specific values).
+              machine. Five files are seeded, each because it holds something
+              that differs per machine: settings.json (which models you have,
+              the default model), subagents.json (the model and thinking level
+              each agent runs on, the advisor's included), model-roles.json
+              (the role -> provider/model ID map), advisor.json
+              (disabledForModels) and pi-system-one.json (/so rewrites it with
+              an atomic rename, which would drop the edit if it were a link).
 
-  Nothing is deleted: an existing real file is moved to
-  %USERPROFILE%\.pi-config-backups\<stamp>\<flattened path>.
+  No real file is deleted: an existing real file is moved to
+  %USERPROFILE%\.pi-config-backups\<stamp>\<flattened path>, and a foreign
+  symlink is replaced rather than backed up (its old target is printed first).
 
   Windows differences from install.sh, all printed as SKIP/note at run time:
     * Links are real symlinks when the process can make them (Developer Mode or
@@ -402,7 +408,7 @@ function Invoke-Uninstall {
     } else { Write-Line 'keep' "$dst (points elsewhere: $cur)" }
   }
   Write-Output ''
-  Write-Output 'Machine-owned files (settings.json, subagents.json, model-roles.json, advisor.json) are left in place.'
+  Write-Output 'Machine-owned files (settings.json, pi-system-one.json, subagents.json, model-roles.json, advisor.json) are left in place.'
 }
 
 # ------------------------------------------------------------------ main -----

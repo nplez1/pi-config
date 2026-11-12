@@ -179,7 +179,8 @@ test('a multi-line status is flattened before it reaches the path line', () => {
 
 test('a virtual selection shows where the latest response routed', () => {
   const out = render({ model: FUSION, branch: [assistant('github-copilot', 'gpt-6-luna')] });
-  assert.ok(out.includes('(copilot-fusion) Fusion/Standard → GPT-6 Luna'), out);
+  // Family-first since b60f4a5: "GPT-6 Luna" renders as "Luna-6".
+  assert.ok(out.includes('(copilot-fusion) Fusion/Standard → Luna-6'), out);
 });
 
 test('a virtual selection with no response yet shows no arrow', () => {
@@ -190,7 +191,7 @@ test('a virtual selection with no response yet shows no arrow', () => {
 
 test('a physical selection never gets an arrow', () => {
   const out = render({ model: LUNA, branch: [assistant('github-copilot', 'gpt-6-luna')] });
-  assert.ok(out.includes('GPT6Luna • thinking off'), out);
+  assert.ok(out.includes('Luna-6 • thinking off'), out);
   assert.ok(!out.includes('→'), out);
 });
 
@@ -201,7 +202,7 @@ test('an unknown routed model falls back to its raw id', () => {
 
 test('a single provider drops the parenthesized prefix but keeps the arrow', () => {
   const out = render({ model: FUSION, branch: [assistant('github-copilot', 'gpt-6-luna')], providers: 1 });
-  assert.ok(out.includes('Fusion/Standard → GPT-6 Luna'), out);
+  assert.ok(out.includes('Fusion/Standard → Luna-6'), out);
   assert.ok(!out.includes('(copilot-fusion)'), out);
 });
 

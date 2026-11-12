@@ -18,6 +18,13 @@ HELPER = ROOT / "dot-pi/agent/extensions/shared/copilot-fusion-router.ts"
 AUTH_HELPER = ROOT / "dot-pi/agent/extensions/shared/copilot-fusion-auth.ts"
 FIXTURE = ROOT / "tests/fusion-compaction-fixture.ts"
 SMART = ROOT / "plugins/pi-smart-compaction/index.ts"
+# plugins/* are git submodules, and a linked worktree starts with them empty even
+# when the main clone has them populated (that is how an agent's gate checkout is
+# made). The two smart-compaction scenarios below need that source; the other
+# eleven do not. Skip them by name so a bare worktree reports them as skipped,
+# with the command that fixes it, instead of dying on a missing file.
+SMART_MISSING = ("plugins/pi-smart-compaction is an uninitialized submodule "
+                 "(run: git submodule update --init)")
 
 
 class Rpc:
@@ -258,12 +265,14 @@ class FusionCompactionIntegration(unittest.TestCase):
         self.assertEqual(result["compactions"], 0)
         self.assertEqual(result["manualCompactions"], 1)
 
+    @unittest.skipIf(not SMART.exists(), SMART_MISSING)
     def test_smart_compaction_does_not_pre_compact_fusion(self):
         result = self.run_scenario(with_guard=True, smart=True)
         self.assertNotIn("FIXTURE_COMPACTION:manual", self.logs)
         self.assertEqual(result["compactions"], 0)
         self.assertEqual(result["originals"], 3)
 
+    @unittest.skipIf(not SMART.exists(), SMART_MISSING)
     def test_unpatched_smart_compaction_would_pre_compact(self):
         result = self.run_scenario(with_guard=True, smart=True, old_smart=True)
         self.assertIn("FIXTURE_COMPACTION:manual", self.logs)
