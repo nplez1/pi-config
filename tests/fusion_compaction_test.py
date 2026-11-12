@@ -21,8 +21,8 @@ SMART = ROOT / "plugins/pi-smart-compaction/index.ts"
 # plugins/* are git submodules, and a linked worktree starts with them empty even
 # when the main clone has them populated (that is how an agent's gate checkout is
 # made). The two smart-compaction scenarios below need that source; the other
-# eleven do not. Skip them by name so a bare worktree reports "2 skipped" instead
-# of dying on a missing file, and never let the skip pass for coverage.
+# eleven do not. Skip them by name so a bare worktree reports them as skipped,
+# with the command that fixes it, instead of dying on a missing file.
 SMART_MISSING = ("plugins/pi-smart-compaction is an uninitialized submodule "
                  "(run: git submodule update --init)")
 
