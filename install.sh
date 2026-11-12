@@ -779,7 +779,9 @@ Next steps:
        • run `pi` and /login for the providers THIS machine has
   2. Pick a default model for this machine: `pi`, then /model.
      settings.json is machine-owned, so that choice stays local.
-  3. Restart pi; `pi list` should show the plugins under ~/.pi/agent/plugins.
+  3. Restart pi; `pi list` should show this repo's packages (Pi-Bolt lists
+     pi-subagents, pi-advisor-subagent and pi-web-access as pi-bolt-bundles/
+     entries, and pi-todo as npm:opensec-pi-todo).
   4. `pi` now runs Pi-Bolt (pi-config/pi-bolt/README.md). `pi-real` or
      `PI_REAL=1 pi` reaches the stock launcher; revert with
      pi-config/pi-bolt/pi-swap.sh remove. Credentials are shared.
