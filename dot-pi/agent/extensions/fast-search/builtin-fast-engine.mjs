@@ -1,22 +1,20 @@
 // Same-contract Pi-Bolt search backend for Pi 1.4 and 1.5.
 // fd/rg only generate conservative candidates; native Pi formats results and
 // handles cases we cannot prove compatible. No shell command is rewritten.
-import { createFindToolDefinition,createGrepToolDefinition,DEFAULT_MAX_BYTES,truncateHead,formatSize,VERSION } from '@earendil-works/pi-coding-agent';
+import { createFindToolDefinition,createGrepToolDefinition,DEFAULT_MAX_BYTES,truncateHead,formatSize } from '@earendil-works/pi-coding-agent';
 import {stat} from 'node:fs/promises';import path from 'node:path';import {homedir} from 'node:os';
-import {createNativeFilter,createNativeFindMatcher,nativeGrepGlobFilter,CannotProveParityError,assertNativeVersion} from './builtin-native-compat.mjs';
+import {createNativeFilter,createNativeFindMatcher,nativeGrepGlobFilter,CannotProveParityError} from './builtin-native-compat.mjs';
 import {collectFdCandidates,collectRgCandidateFiles,mandatoryGrepLiterals,resolveExecutable,NativeFallback} from './builtin-fast-candidates.mjs';
 import {raceSearch} from './builtin-race.mjs';
 
-// The ignore and glob compatibility code mirrors the native walker shared by
-// Pi-Bolt's Pi 1.4.0 and 1.5.0 builds; other versions remain native until verified.
+// The compatibility rules mirror the native walker in Pi 1.4.0 and later. No
+// version gate: every call re-checks the native shapes it reads and falls back.
 function searchExecutable(name){
  const found=resolveExecutable(name);if(!found)throw new NativeFallback(`${name} unavailable`);
  return found;
 }
-export async function supportedRuntime(){
- if(process.env.PI_FAST_SEARCH_BACKEND==='native')return false;
- try{assertNativeVersion(VERSION)}catch{return false}
- return true;
+export function fastSearchEnabled(){
+ return process.env.PI_FAST_SEARCH_BACKEND!=='native';
 }
 function fallback(error){return error instanceof NativeFallback||error instanceof CannotProveParityError}
 function note(observer,backend,reason){try{observer?.({backend,reason})}catch{}}
@@ -49,16 +47,12 @@ export function createFastFindTool(cwd,{onDecision,onAttempt,forceExternal=false
  const native=createFindToolDefinition(cwd);
  return {...native,async execute(id,args,signal,onUpdate,ctx){
    if(signal?.aborted)throw new Error('Operation aborted');
-   const supported=await supportedRuntime();if(signal?.aborted)throw new Error('Operation aborted');
-   if(!supported){
-     if(process.env.PI_FAST_SEARCH_BACKEND!=='native')warnOnce(ctx,'runtime','Fast search: this Pi search version is unsupported; using the native backend.');
-     note(onDecision,'native','version or opt-out');return native.execute(id,args,signal,onUpdate,ctx);
-   }
+   if(!fastSearchEnabled()){note(onDecision,'native','opt-out');return native.execute(id,args,signal,onUpdate,ctx)}
    return competitive({forceExternal,signal,onDecision,onAttempt,ctx,backend:'fd',native:s=>native.execute(id,args,s,onUpdate,ctx),fast:async signal=>{
      const limit=normalLimit(args.limit,1000);const fdPath=searchExecutable('fd');
      const custom=createFindToolDefinition(cwd,{operations:{
        async exists(root){try{const st=await stat(root);if(!st.isDirectory())throw new NativeFallback('not a directory');return true}catch(e){if(fallback(e))throw e;throw new NativeFallback('path unavailable')}},
-       async glob(pattern,root){
+       async glob(pattern,root,{limit:cap}={}){
          // Compile even for empty roots: invalid/over-complex globs must not
          // become successful empty results merely because fd found no entries.
          const matches=createNativeFindMatcher(pattern);
@@ -68,7 +62,8 @@ export function createFastFindTool(cwd,{onDecision,onAttempt,forceExternal=false
            if(++checked%256===0)await new Promise(resolve=>setImmediate(resolve));
            if(matches(entry.rel)&&await include(entry.rel,entry.kind))filtered.push(entry);}
          filtered.sort((a,b)=>a.rel<b.rel?-1:a.rel>b.rel?1:0);
-         return filtered.slice(0,limit).map(x=>x.rel+(x.kind==='dir'?'/':''));
+         // Native asks for limit+1 and reports truncation from the extra entry.
+         return filtered.slice(0,cap??limit).map(x=>x.rel+(x.kind==='dir'?'/':''));
        },
      }});
      return patchFindLimitNotice(await custom.execute(id,args,signal,undefined,ctx),limit);
@@ -107,11 +102,7 @@ export function createFastGrepTool(cwd,{onDecision,onAttempt,forceExternal=false
    if(!literals||(args.glob!==undefined&&typeof args.glob!=='string')||(args.context!==undefined&&(!Number.isSafeInteger(args.context)||args.context<0))||(!args.literal&&!regexIsValid(args.pattern))){
      note(onDecision,'native','unsupported search');return native.execute(id,args,signal,onUpdate,ctx);
    }
-   const supported=await supportedRuntime();if(signal?.aborted)throw new Error('Operation aborted');
-   if(!supported){
-     if(process.env.PI_FAST_SEARCH_BACKEND!=='native')warnOnce(ctx,'runtime','Fast search: this Pi search version is unsupported; using the native backend.');
-     note(onDecision,'native','version or opt-out');return native.execute(id,args,signal,onUpdate,ctx);
-   }
+   if(!fastSearchEnabled()){note(onDecision,'native','opt-out');return native.execute(id,args,signal,onUpdate,ctx)}
    return competitive({forceExternal,signal,onDecision,onAttempt,ctx,backend:'rg',native:s=>native.execute(id,args,s,onUpdate,ctx),fast:async signal=>{
      const limit=normalLimit(args.limit,100);const root=safeGrepRoot(ctx?.cwd||cwd,args);const fdPath=searchExecutable('fd'),rgPath=searchExecutable('rg');
      const st=await stat(root).catch(()=>null);if(!st?.isDirectory())throw new NativeFallback('root not a directory');

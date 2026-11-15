@@ -5,12 +5,12 @@ import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
-  assertNativeVersion,
   CannotProveParityError,
   createNativeFilter,
+  isVerifiedNativeVersion,
   MAX_RULE_FILE_BYTES,
   nativeGlobMatches,
-  NATIVE_COMPAT_VERSIONS,
+  VERIFIED_NATIVE_VERSIONS,
 } from "../builtin-native-compat.mjs";
 
 const roots = [];
@@ -63,13 +63,11 @@ test("nativeGlobMatches preserves native basename, prefix, anchor, braces and gl
   assert.equal(nativeGlobMatches("*.txt", "folder/.hidden.txt"), true);
 });
 
-test("assertNativeVersion is an explicit conservative version gate", () => {
-  assert.deepEqual(NATIVE_COMPAT_VERSIONS, ["1.4.0", "1.5.0"]);
-  assert.equal(assertNativeVersion("1.4.0"), true);
-  assert.equal(assertNativeVersion("1.5.0"), true);
-  assert.throws(() => assertNativeVersion("1.5"), (error) => error instanceof CannotProveParityError && /cannot prove parity/.test(error.message));
-  assert.throws(() => assertNativeVersion("1.5.1"), /cannot prove parity/);
-  assert.throws(() => assertNativeVersion(undefined), /cannot prove parity/);
+test("native versions are recorded, not gated: an unlisted version still runs", () => {
+  assert.deepEqual(VERIFIED_NATIVE_VERSIONS, ["1.4.0", "1.5.0", "1.5.2"]);
+  for (const version of VERIFIED_NATIVE_VERSIONS) assert.equal(isVerifiedNativeVersion(version), true);
+  assert.equal(isVerifiedNativeVersion("1.5.1"), false);
+  assert.equal(isVerifiedNativeVersion(undefined), false);
 });
 
 test("filter inherits nested git/non-git rules, honors native negation, skips .git and ignores .fdignore", async (t) => {
