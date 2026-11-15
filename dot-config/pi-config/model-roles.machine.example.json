@@ -1,6 +1,6 @@
 {
   "exploration": "deepseek/deepseek-flash-auto",
-  "heavy": "xiaomi/mimo-v2.6-pro",
+  "heavy": "deepseek/deepseek-flash-auto",
   "opus": "claude/opus",
   "sonnet": "claude/sonnet",
   "fable": "claude/fable",

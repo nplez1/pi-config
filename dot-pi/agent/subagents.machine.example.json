@@ -14,7 +14,7 @@
     },
     "rpiv-compressor": {
       "model": "deepseek/deepseek-flash-auto",
-      "thinking": "high"
+      "thinking": "low"
     },
     "general-purpose": {
       "model": "deepseek/deepseek-flash-auto",

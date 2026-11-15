@@ -10,7 +10,7 @@
   request, inherit the session model — that is the configured answer. When I *did*
   ask for that shorthand, a `null` role is not an answer: say the role is unset on
   this machine and ask me which model to use.
-- Shorthand → role: **Explore**/**Fast** → `exploration` (`thinking: "medium"` for agents; `effort: "medium"` for workflows), **Deep**/**Pro** → `heavy`, **Opus** → `opus`, **Sonnet** → `sonnet`, **Fable** → `fable`. The last three name the Claude Code CLI backend on the seeding machine (`claude/opus`, `claude/sonnet`, `claude/fable`); a machine without that CLI retargets them in its own file. **Opus is the default for review and planning; Fable is manual-only** — the cost policy below spells that out.
+- Shorthand → role: **Explore**/**Fast** → `exploration` (`thinking: "low"` for agents; `effort: "low"` for workflows), **Deep**/**Pro** → `heavy` (`thinking: "max"` for agents; `effort: "max"` for workflows), **Opus** → `opus`, **Sonnet** → `sonnet`, **Fable** → `fable`. The last three name the Claude Code CLI backend on the seeding machine (`claude/opus`, `claude/sonnet`, `claude/fable`); a machine without that CLI retargets them in its own file. **Opus is the default for review and planning; Fable is manual-only** — the cost policy below spells that out.
 - Those names are shorthand, not model IDs. Pass the explicit provider/model
   ID from the roles file; an agent type's default does not satisfy the request.
 - **Precedence:** an explicit model request in my prompt beats an agent type's
