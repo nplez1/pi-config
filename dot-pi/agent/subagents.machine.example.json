@@ -7,6 +7,10 @@
       "model": "deepseek/deepseek-flash-auto",
       "thinking": "low"
     },
+    "Plan": {
+      "model": "claude/opus",
+      "thinking": "high"
+    },
     "rpiv-advisor": {
       "model": "claude/opus",
       "thinking": "high",
