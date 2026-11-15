@@ -1,11 +1,21 @@
 {
   "searchRouting": {
     "providers": ["firecrawl", "exa"],
-    "fallbackOn": ["network", "transient", "quota", "invalid-response"]
+    "fallbackOn": ["transient", "quota", "invalid-response"]
   },
   "firecrawlBaseUrl": "http://192.168.1.78:3002",
   "firecrawlApiVersion": "v2",
   "firecrawlFreshScrape": true,
+  "firecrawlPdfMaxPages": 50,
+  "pdf": {
+    "maxSizeMB": 40
+  },
+  "githubClone": {
+    "maxRepoSizeMB": 600
+  },
+  "maxInlineContentChars": 60000,
+  "summaryModel": "deepseek/deepseek-flash-auto",
+  "queryRewriteModel": "deepseek/deepseek-flash-auto",
   "ssrf": {
     "allowRanges": ["192.168.1.78/32"]
   }
