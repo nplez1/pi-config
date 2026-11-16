@@ -366,11 +366,35 @@ export default function (pi: ExtensionAPI) {
 
   const dynamicJob = (): Job | undefined => [...jobs.values()].find((job) => job.mode === "dynamic");
 
+  /**
+   * Publish every armed next fire, live and cold, so cache-keepalive can hold the
+   * prompt cache across a settled wait. Cold fires count too: a cold run's result
+   * is delivered as a steer message that triggers a turn in this session, so it
+   * needs the cache just as a live tick does. Emitted only when the set changes,
+   * because the ticker calls this every second.
+   */
+  let publishedLoopState = "";
+  function publishLoopState(): void {
+    if (!bus?.emit) return;
+    const live = [...jobs.values()]
+      .filter((job) => !job.stopped && job.nextAt !== undefined)
+      .map((job) => ({ id: job.id, nextAt: job.nextAt }));
+    const cold = [...coldJobs.values()]
+      .filter((job) => job.enabled && coldNextAt(job) !== undefined)
+      .map((job) => ({ id: job.id, nextAt: coldNextAt(job) }));
+    const all = [...live, ...cold];
+    const key = JSON.stringify(all);
+    if (key === publishedLoopState) return;
+    publishedLoopState = key;
+    bus.emit("loop:state", { jobs: all });
+  }
+
   function updateFooter(): void {
     // Every path that changes what is armed lands here, so this is the one place
     // that keeps the ticker in step with both backends — including the cold
     // events that never touch `jobs`.
     syncTicker();
+    publishLoopState();
     if (!uiCtx?.hasUI) return;
     const views: LoopFooterView[] = [
       ...[...jobs.values()].map((job) => ({
@@ -1028,6 +1052,8 @@ export default function (pi: ExtensionAPI) {
     // session, which is why there is no durable flag to set here.
     wireColdBackend();
     wireLiveBackend();
+    // A fresh session must republish its loop state, even when it matches the last one.
+    publishedLoopState = "";
     loadLoops(ctx);
     // The scheduler emits `subagents:scheduler_ready` from its own session_start
     // handler, which may run before this one. Asking once here covers the other
