@@ -550,33 +550,68 @@ mis-pricing).
 
 ## Compaction
 
-Two plugins share this job, and they are deliberately on different halves of it:
+Four things touch compaction, and they are deliberately on different halves of it:
 
-| Plugin | Decides | How |
+| Component | Decides | Hook |
 | --- | --- | --- |
-| `plugins/pi-smart-compaction` | **when** an idle session is worth compacting on resume | gate on idle time past the provider's cache lifetime + a context floor, then calls `ctx.compact()` |
-| `plugins/pi-vcc` | **how** every compaction is summarized | answers Pi's `session_before_compact` hook with an algorithmic, LLM-free summary, and adds `vcc_recall` over the raw session file |
+| `plugins/pi-vcc` | **how** every compaction is summarized | returns a compaction from `session_before_compact`; adds `vcc_recall` over the raw session file |
+| `plugins/pi-smart-compaction` | **when** an idle session is worth compacting on resume | `input` gate + `ctx.compact()`; no summarizer of its own |
+| `dot-pi/agent/extensions/copilot-fusion.ts` | whether a pre-route check may compact at all | returns `{cancel}` on a `fusion/standard` session before a model was routed; manual `/compact` passes through |
+| `plugins/pi-codex-goal` | what a goal loop's control messages look like | filters `preparation` in the same hook, returns no compaction |
+
+`plugins/pi-todo` / `npm:opensec-pi-todo` replays its task list from the branch
+on `session_compact` and never summarizes; pi-subagents, pi-advisor-subagent,
+pi-web-access, pi-system-one, rpiv-ask-user-question, `deepseek-*`, `loop` and
+`orca-*` register no compaction hook at all. The one other request-time
+`context` transform is `cache-keepalive`'s `context_with_system` hook, which Pi
+runs in a second phase after every `context` handler, so it sees pi-vcc's
+filtered messages rather than competing with them.
 
 They compose rather than fight. Pi's `ctx.compact()` — which is all
-pi-smart-compaction calls, it has no summarizer of its own — emits
-`session_before_compact`, so a resume-time compaction gets a pi-vcc summary and
-the same 15 % floor / cache-lifetime gate as before. pi-vcc's own hook stays the
-single handler that returns a compaction; nothing else does, so Pi's
-"last handler wins" rule on that event has one candidate. No provider is listed
-in pi-vcc's `skipForProviders`, so it also compacts the automatic
-threshold/overflow case that Copilot Fusion's pre-route check hands back to Pi.
+pi-smart-compaction calls — emits `session_before_compact`, so a resume-time
+compaction gets a pi-vcc summary and the same 15 % floor / cache-lifetime gate
+as before. Of the two other handlers on that event, one only cancels (a cancel
+short-circuits the runner, so `copilot-fusion`'s answer wins whichever order it
+runs in) and one returns `undefined` (goal bookkeeping), so pi-vcc is the single
+handler that returns a compaction and Pi's "last handler wins" rule has one
+candidate. No provider is listed in pi-vcc's `skipForProviders`, so it also
+compacts the automatic threshold/overflow case that Copilot Fusion's pre-route
+check hands back to Pi, and it compacts the `deepseek/deepseek-flash-auto`
+router model the same way — pi-vcc reads the transcript, never the provider, so
+there is no model call to fail or skip.
 
 Per-compaction cost falls out of this: smart-compaction still chooses *not* to
 compact a warm cache or a small context, and when it does compact, the summary
 costs no model call.
 
+**`skipCustomTypes` must name `pi-codex-goal`.** pi-vcc builds its own cut from
+`branchEntries`, so it never reads `preparation.messagesToSummarize` — which is
+what `pi-codex-goal` filters goal control messages out of
+(`src/goal-compaction.ts:filterGoalCompactionInput`) so the summarizer does not
+see "Continue pursuing the goal" boilerplate. That filter is inert under
+pi-vcc, and its documented lever is `skipCustomTypes`. Measured on a real
+session with 22 spliced continuations: without the key the summary carries the
+boilerplate (2 transcript lines, 13,585 chars), with it zero (13,320 chars).
+The objective itself is unaffected either way — it rides on the system prompt,
+not on the summary.
+
+```json
+"skipCustomTypes": ["pi-codex-goal"]
+```
+
 `~/.pi/agent/pi-vcc-config.json` is **machine-owned** and not tracked here. It
 is created by the extension with its defaults (`overrideDefaultCompaction: true`,
-`smartKeepTail: true`, `continueAfterThresholdCompact: true`) on first load, and
-a later release only fills in keys it is missing — so a machine keeps its own
-`skipForProviders` / `trackCommands` choices across installs. Tracked config
-stays on the smart-compaction side (`dot-config/pi-smart-compaction/config.json`,
-the 15 % context floor).
+`smartKeepTail: true`, `continueAfterThresholdCompact: true`, empty
+`skipCustomTypes`) on first load, and a later release only fills in keys it is
+missing — so a machine keeps its own `skipForProviders` / `trackCommands`
+choices across installs. The `pi-codex-goal` entry above is the one value a
+machine running this repo has to set; it is not shipped as a seed because the
+extension writes the file itself. Tracked config stays on the smart-compaction
+side (`dot-config/pi-smart-compaction/config.json`, the 15 % context floor).
+
+On Pi ≥ 0.84.4 pi-vcc sends no continue of its own after an automatic
+compaction (Pi resumes the run itself), so `pi-codex-goal` stays the single
+source of post-compaction continuation.
 
 Commands: `/pi-vcc` compacts now (keeping the last user turn, `keep:N [prompt]`
 to choose), `/pi-vcc-recall <query>` runs the recall search as a command, and
