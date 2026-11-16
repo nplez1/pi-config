@@ -634,6 +634,9 @@ of 2026-10-24 is ten: `orca-prefill`, `orca-agent-status`,
 `orca-titlebar-spinner`, `deepseek-pricing`, `pi-codex-goal`,
 `pi-smart-compaction`, `pi-system-one`. Excluded:
 `juicesharp-rpiv-ask-user-question` (11 ms from its files instead).
+`plugins/pi-vcc` joined the set the same way `plugins/pi-smart-compaction` did
+(a plain path, not a `git:` spec), and appears in `--status` under its
+`package.json` name — `sting8k-pi-vcc` — rather than its path.
 
 The seven globals cost 0–1 ms each at run time, so compiling them buys nothing
 measurable — it buys not having to re-pass a flag, and a fresh machine and a
