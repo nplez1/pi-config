@@ -71,6 +71,19 @@
 //    on the next user message. Router state remembers the failover, so a broken
 //    side cannot be retried in a loop and three sides still cannot ping-pong.
 //
+//  - A side can also fail without erroring, and that case reached `route()` as
+//    no failure at all. On 2026-11-16 DeepInfra returned HTTP 200 and a complete
+//    stream while producing nothing usable six times in nine hours: five `length`
+//    stops that spent the whole output budget, arriving as a tool call cut
+//    mid-argument so it never ran, and a 22-minute stream that produced one short
+//    thinking block and ended when the operator killed the session.
+//    There is no error to retry on, so `looksLikeProviderFailure` and the
+//    crossing above both stayed silent while the router kept choosing the side
+//    producing nothing. A side whose answer degenerates is now demoted to last
+//    for 30 minutes — relearned from the branch at session start, so a resume
+//    inherits it — and DeepInfra's output budget is capped at 128K so one costs
+//    ~8 minutes instead of 24. The other two sides keep their catalog caps.
+//
 // Provider selection is per *turn*, not per request: tool follow-ups stay on
 // the provider that handled the turn (`request.previous`), which keeps the
 // prompt cache warm. Only crossing a peak boundary or a failover costs a cache
@@ -138,6 +151,7 @@ import {
   type ModelRef,
   type Quote,
   type RateSet,
+  type Side,
   type Tier,
 } from "./shared/deepseek-schedule";
 
@@ -145,9 +159,27 @@ import {
 const MODELS_URL = "https://api.deepinfra.com/v1/openai/models";
 const PRICING_TIMEOUT_MS = 5_000;
 
-/** Both sides declare the same limits; the catalog agrees (1M ctx, 384K out). */
+/** The catalog agrees on 1M of context; DeepInfra's output cap below is ours. */
 const CONTEXT_WINDOW = 1_000_000;
-const MAX_TOKENS = 384_000;
+/**
+ * DeepInfra's output budget, deliberately under the catalog's 384K.
+ *
+ * Only its own registration uses this, and only a physical model's cap bounds a
+ * request: the virtual model's declared `maxTokens` is the figure pi shows before
+ * the first answer, not what it sends. DeepSeek direct keeps the catalog's
+ * 384,000 and IsoQuant declares its own, so this bounds the side that misbehaved
+ * rather than every side.
+ *
+ * A degenerate stream spends the whole budget before it stops, so the cap is the
+ * only thing that bounds one: on 2026-11-16 DeepInfra streamed at ~262 tok/s, so
+ * 384K is 24 minutes of producing nothing. The largest legitimate generation in
+ * this machine's history is 56,499 tokens (no turn at all between 64K and 189K),
+ * so 128K is 2.3x headroom over anything real while cutting the worst case to
+ * ~8 minutes. What a hit produces is a tool call truncated mid-argument, which
+ * pi refuses to run — recoverable, unlike the unbounded turn that cost a whole
+ * session. `degeneratedResponse` reads this same number as its threshold.
+ */
+const MAX_TOKENS = 131_072;
 
 /** Mirrors deepseek-flash in pi's catalog: off / low / high / max. */
 const THINKING_LEVEL_MAP = {
@@ -219,6 +251,21 @@ interface RouteContext {
   };
 }
 
+/** The parts of a session entry the re-arm walk reads. */
+interface BranchEntry {
+  type?: string;
+  message?: {
+    role?: string;
+    provider?: string;
+    /** Unix milliseconds, per session-format.md. */
+    timestamp?: number;
+    durationMs?: number;
+    stopReason?: string;
+    content?: unknown;
+    usage?: { output?: number };
+  };
+}
+
 /**
  * A verdict this file means to report: the registry is readable and positively
  * says no request can be served. A distinct class so the guard around `route()`
@@ -256,6 +303,66 @@ function looksLikeProviderFailure(message: { errorMessage?: string; stopReason?:
   if (!text.trim()) return false;
   if (NOT_A_PROVIDER_FAILURE.test(text)) return false;
   return PROVIDER_FAILURE.test(text);
+}
+
+/** How long a side whose answer degenerated is passed over. */
+const DEGRADED_COOLDOWN_MS = 30 * 60_000;
+/** Below this many characters per second, an aborted answer produced nothing. */
+const DEGENERATE_ABORT_RATE = 5;
+/** An abort shorter than this is someone pressing Escape, whatever it produced. */
+const DEGENERATE_ABORT_MS = 5 * 60_000;
+
+/**
+ * A response that failed without failing. pi received HTTP 200 and a complete
+ * stream, so there was no error and no retry — which is why neither
+ * `looksLikeProviderFailure` above nor the retry path in `decideRoute` ever sees
+ * one. A provider can serve nothing but garbage for hours and still be the
+ * router's cheapest side.
+ *
+ * Two shapes were observed on 2026-11-16, both from DeepInfra serving this
+ * checkpoint, six times across two worktrees inside nine hours. Five were
+ * `length` after spending the entire output budget: it arrives as a tool call cut
+ * mid-argument (pi: "the response hit the output token limit, so its arguments
+ * may be truncated") and so never runs. The sixth was a 1,334s stream that
+ * produced one 533-character thinking block and then nothing at all.
+ */
+function degeneratedResponse(message: {
+  stopReason?: string;
+  durationMs?: number;
+  content?: unknown;
+  usage?: { output?: number };
+}): boolean {
+  if (message.stopReason === "length") return (message.usage?.output ?? 0) >= MAX_TOKENS * 0.9;
+  if (message.stopReason !== "aborted") return false;
+  const millis = message.durationMs ?? 0;
+  if (millis < DEGENERATE_ABORT_MS) return false;
+  // `usage` cannot answer here: an aborted assistant message reports all zeros
+  // however much it produced, because the figures arrive in the stream's last
+  // chunk and an abort never receives one. Every abort in this machine's history
+  // reports output 0, so what is left is what actually came out. The stall runs at
+  // 0.40 chars/s and the slowest healthy abort at 59, so the threshold is an
+  // order of magnitude clear of both.
+  return producedChars(message.content) / (millis / 1000) < DEGENERATE_ABORT_RATE;
+}
+
+/**
+ * Characters a message produced: text, thinking and tool arguments. Approximate
+ * by design — it only has to separate "produced something" from "produced
+ * nothing", and both sides of that line are orders of magnitude apart.
+ */
+function producedChars(content: unknown): number {
+  if (typeof content === "string") return content.length;
+  if (!Array.isArray(content)) return 0;
+  let chars = 0;
+  for (const block of content) {
+    if (!block || typeof block !== "object") continue;
+    const parts = block as Record<string, unknown>;
+    for (const key of ["text", "thinking", "arguments"] as const) {
+      if (typeof parts[key] === "string") chars += parts[key].length;
+    }
+    if (parts.input && typeof parts.input === "object") chars += JSON.stringify(parts.input).length;
+  }
+  return chars;
 }
 
 /** Read DeepInfra's current effective rate for our checkpoint, if reachable. */
@@ -401,6 +508,18 @@ export default function (pi: ExtensionAPI) {
    * because the prompt is the same conversation whichever side answers it.
    */
   let promptTokens: number | undefined;
+  /**
+   * Each side whose last answer degenerated, and when it may be tried again.
+   *
+   * Keyed by side rather than held as one entry: a second side degenerating inside
+   * the window used to overwrite the first and release it early, which is the
+   * opposite of what a bad night needs.
+   *
+   * Session-scoped like the rest of this state, but `rearmFromBranch` reads the
+   * branch back at session start, so resuming a killed session inherits what the
+   * killed session saw.
+   */
+  const degraded = new Map<Side, number>();
 
   /** Every side's current card, as pairs of side and rate for the ranking. */
   function quotesAt(tier: Tier): Quote[] {
@@ -411,19 +530,39 @@ export default function (pi: ExtensionAPI) {
     ];
   }
 
+  /** Whether `side` is being passed over right now, expiring a lapsed cooldown. */
+  function demoted(side: Side | undefined): boolean {
+    if (!side) return false;
+    const until = degraded.get(side);
+    if (until === undefined) return false;
+    if (Date.now() < until) return true;
+    degraded.delete(side);
+    return false;
+  }
+
   /**
    * All three sides, cheapest first at this session's prompt size and the cards
    * in force. This is the router's whole policy: the first entry is the answer
    * when pi can reach it, and the rest are the fallbacks.
+   *
+   * A side whose answer just degenerated is demoted to last, so every caller
+   * inherits the avoidance — the sticky continuation path, the retry crossing, the
+   * fresh decision and the footer label alike. Demoted rather than dropped: a
+   * machine whose only credential is on that side must still answer, and every
+   * caller falls through the order in turn.
    */
   function rankedSides(tier: Tier): ModelRef[] {
-    return quotesAt(tier)
+    const ranked = quotesAt(tier)
       .map((quote) => ({
         ref: refFor(quote.side),
         price: priceSide(quote.side, quote.rates, promptTokens),
       }))
       .sort((a, b) => a.price - b.price)
-      .map((ranked) => ranked.ref);
+      .map((sorted) => sorted.ref);
+    const healthy: ModelRef[] = [];
+    const passedOver: ModelRef[] = [];
+    for (const ref of ranked) (demoted(sideOf(ref)) ? passedOver : healthy).push(ref);
+    return passedOver.length === 0 ? ranked : [...healthy, ...passedOver];
   }
 
   /**
@@ -435,6 +574,9 @@ export default function (pi: ExtensionAPI) {
     const preferredSide = sideOf(preferred);
     const cheapest = rankedSides(tier);
     if (!preferredSide) return cheapest;
+    // Sticky first, unless it is the side being passed over: the ranking has
+    // already put it last, and re-promoting it would undo the avoidance.
+    if (demoted(preferredSide)) return cheapest;
     return [refFor(preferredSide), ...cheapest.filter((ref) => sideOf(ref) !== preferredSide)];
   }
 
@@ -553,6 +695,36 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
+  /**
+   * Relearn a recent degeneration from the branch.
+   *
+   * The observation is this session's, but killing a stuck session and resuming it
+   * is exactly how an operator recovers one, and `/new` starts knowing nothing —
+   * so the provider that broke a session would be preferred again by the very
+   * session started to replace it. The branch still holds the evidence, so read it
+   * back: a degenerate answer whose stream ended inside the cooldown window re-arms
+   * its side, with whatever remains of the window.
+   *
+   * Each session learns separately. Sharing one verdict across processes would need
+   * a file outside the session store, which is not worth it for 30 minutes.
+   */
+  function rearmFromBranch(ctx: { sessionManager?: { getBranch?(): unknown[] } }): void {
+    const entries = (ctx.sessionManager?.getBranch?.() ?? []) as BranchEntry[];
+    const now = Date.now();
+    for (const entry of entries) {
+      const msg = entry.type === "message" ? entry.message : undefined;
+      if (!msg || msg.role !== "assistant") continue;
+      if (!degeneratedResponse(msg)) continue;
+      // The stream ended `durationMs` after the message started; a cooldown that
+      // already lapsed while the session was down stays lapsed.
+      const started = typeof msg.timestamp === "number" ? msg.timestamp : now;
+      const ended = started + (msg.durationMs ?? 0);
+      if (now - ended >= DEGRADED_COOLDOWN_MS) continue;
+      const side = SIDES.find((routed) => refFor(routed).provider === msg.provider);
+      if (side) degraded.set(side, ended + DEGRADED_COOLDOWN_MS);
+    }
+  }
+
   // Show the label before the first request of a session (startup, resume, fork).
   pi.on("session_start", (_event, ctx) => {
     updateLabel(ctx, ctx.model, true);
@@ -561,6 +733,7 @@ export default function (pi: ExtensionAPI) {
     // model object — including the ones this machine has no credential for, as
     // `find()` returns those too; `resolve()` is what checks reachability.
     for (const side of SIDES) remember(findInCatalog(ctx, refFor(side)));
+    rearmFromBranch(ctx);
   });
 
   // React to /model, Ctrl+P cycling, and session restore.
@@ -575,7 +748,16 @@ export default function (pi: ExtensionAPI) {
   pi.on("message_end", (event) => {
     const msg = event.message;
     if (msg.role !== "assistant") return;
-    if (!SIDES.some((side) => refFor(side).provider === msg.provider)) return;
+    const side = SIDES.find((routed) => refFor(routed).provider === msg.provider);
+    if (!side) return;
+    if (degeneratedResponse(msg)) {
+      degraded.set(side, Date.now() + DEGRADED_COOLDOWN_MS);
+      console.error(
+        `deepseek-routing: ${msg.provider} answered with stopReason "${msg.stopReason}" after ` +
+          `${Math.round((msg.durationMs ?? 0) / 1000)}s producing ${producedChars(msg.content)} characters; ` +
+          `passing over it for ${Math.round(DEGRADED_COOLDOWN_MS / 60_000)} minutes`,
+      );
+    }
     const usage = msg.usage;
     if (!usage) return;
     const tokens = (usage.input ?? 0) + (usage.cacheRead ?? 0);
@@ -592,6 +774,7 @@ export default function (pi: ExtensionAPI) {
     pricing = undefined;
     promptTokens = undefined;
     known.clear();
+    degraded.clear();
     // Back to list price, so a later session whose fetch fails does not inherit
     // this one's discount.
     deepInfraCost = DEEPINFRA_LIST;

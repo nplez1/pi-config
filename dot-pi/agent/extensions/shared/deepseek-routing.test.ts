@@ -166,6 +166,8 @@ async function harness(
     previous?: typeof DEEPSEEK;
     failed?: typeof DEEPSEEK;
     state?: { failedOver?: true };
+    /** Session entries `getBranch()` returns, for the resume re-arm walk. */
+    branch?: unknown[];
   } = {},
 ) {
   const models: { id?: string; route?: (r: unknown, c: unknown) => Promise<{ model: { provider: string; id: string } }> }[] = [];
@@ -183,7 +185,13 @@ async function harness(
   register(pi as never);
   const router = models.find((model) => model.id === "deepseek-flash-auto");
   if (!router?.route) throw new Error("router was not registered");
-  const ctx = { modelRegistry: reg, hasUI: false, model: undefined, ui: { setStatus: () => {} } };
+  const ctx = {
+    modelRegistry: reg,
+    hasUI: false,
+    model: undefined,
+    ui: { setStatus: () => {} },
+    sessionManager: { getBranch: () => options.branch ?? [] },
+  };
   // session_start handlers take (event, ctx), so the context is the second arg.
   for (const handler of handlers["session_start"] ?? []) {
     await (handler as (e: unknown, c: unknown) => unknown)(undefined, ctx);
@@ -573,5 +581,159 @@ describe("router with IsoQuant registered", () => {
     stubPricing(async () => pricingResponse(0.2, 0.6, 0.006, 0));
     const { route } = await harness(threeSides, "continuation", { previous: DEEPSEEK });
     expect((await route()).model.provider).toBe("deepseek");
+  });
+});
+
+/** An assistant message as `message_end` reports it. */
+function answer(overrides: Record<string, unknown> = {}) {
+  return {
+    role: "assistant",
+    provider: DEEPINFRA.provider,
+    model: DEEPINFRA.id,
+    stopReason: "toolUse",
+    durationMs: 3_000,
+    usage: { input: 400, cacheRead: 280_000, output: 1_000 },
+    ...overrides,
+  };
+}
+
+/** Fire `message_end`, the hook the router watches for degenerate answers. */
+async function report(handlers: Record<string, (() => unknown)[]>, message: unknown) {
+  for (const handler of handlers["message_end"] ?? []) {
+    await (handler as (event: unknown) => unknown)({ message });
+  }
+}
+
+/**
+ * A turn that failed without failing.
+ *
+ * DeepInfra returned HTTP 200 and a complete stream five times on 2026-11-16,
+ * across two worktrees in nine hours, so pi raised no error and never retried —
+ * `looksLikeProviderFailure` and the retry crossing both stayed silent while the
+ * router kept choosing the side that was producing nothing. These shapes are
+ * straight from those transcripts.
+ */
+describe("a provider that answers with nothing", () => {
+  /** 384K output tokens over 1,465s, arriving as a tool call cut mid-argument. */
+  const runaway = answer({
+    stopReason: "length",
+    durationMs: 1_465_401,
+    usage: { input: 453, cacheRead: 279_680, output: 384_000 },
+  });
+
+  test("passes over the side whose answer degenerated, breaking mid-turn stickiness", async () => {
+    process.env.PI_DEEPSEEK_TIER = "peak";
+    stubPricing(async () => pricingResponse(0.2, 0.6, 0.006, 0));
+    const { route, handlers } = await harness(threeSides, "continuation", { previous: DEEPINFRA });
+    // Sticky is the point of the continuation path: the turn stays on DeepInfra
+    // to keep the prompt cache warm. A degenerate answer has to override that,
+    // or every follow-up in the turn repeats the failure.
+    expect((await route()).model.provider).toBe("deepinfra");
+    await report(handlers, runaway);
+    expect((await route()).model.provider).not.toBe("deepinfra");
+  });
+
+  test("keeps the turn alive when that side holds the only credential", async () => {
+    // Demoted, not dropped. A one-provider machine still has to answer, and
+    // ending the turn is the failure this avoidance exists to prevent.
+    const only = registry({ sides: [DEEPINFRA], configured: true });
+    const { route, handlers } = await harness(only, "continuation", { previous: DEEPINFRA });
+    await report(handlers, runaway);
+    expect((await route()).model.provider).toBe("deepinfra");
+  });
+
+  test("leaves a side alone when its answer was merely long", async () => {
+    // 56,499 tokens is the largest legitimate generation in this machine's
+    // history. A `length` stop there is a real truncation, not a runaway.
+    process.env.PI_DEEPSEEK_TIER = "peak";
+    stubPricing(async () => pricingResponse(0.2, 0.6, 0.006, 0));
+    const { route, handlers } = await harness(threeSides, "continuation", { previous: DEEPINFRA });
+    await report(handlers, answer({ stopReason: "length", durationMs: 130_000, usage: { output: 56_499 } }));
+    expect((await route()).model.provider).toBe("deepinfra");
+  });
+
+  test("leaves a side alone when the user aborted a healthy stream", async () => {
+    // Escape in the first seconds is the common case, and it must not condemn
+    // the provider for the next half hour.
+    process.env.PI_DEEPSEEK_TIER = "peak";
+    stubPricing(async () => pricingResponse(0.2, 0.6, 0.006, 0));
+    const { route, handlers } = await harness(threeSides, "continuation", { previous: DEEPINFRA });
+    await report(handlers, answer({ stopReason: "aborted", durationMs: 1_800, usage: { output: 0 } }));
+    expect((await route()).model.provider).toBe("deepinfra");
+  });
+
+  test("passes over a side that stalled, then produced nothing, for minutes", async () => {
+    // The session-killing shape: 22 minutes of stream, one 533-character thinking
+    // block, aborted by hand. 0.4 chars/s.
+    process.env.PI_DEEPSEEK_TIER = "peak";
+    stubPricing(async () => pricingResponse(0.2, 0.6, 0.006, 0));
+    const { route, handlers } = await harness(threeSides, "continuation", { previous: DEEPINFRA });
+    await report(
+      handlers,
+      answer({
+        stopReason: "aborted",
+        durationMs: 1_333_766,
+        usage: { output: 0 },
+        content: [{ type: "thinking", thinking: "x".repeat(533) }],
+      }),
+    );
+    expect((await route()).model.provider).not.toBe("deepinfra");
+  });
+
+  test("leaves a side alone when a long turn was aborted after real work", async () => {
+    // Every aborted message reports output 0 however much it produced, because the
+    // usage figures arrive in the stream's last chunk. `usage` cannot separate a
+    // stall from a slow stream; what came out can. This is the slowest healthy
+    // abort on record (3,000 characters over 6.7 minutes, ~7 chars/s), and it must
+    // not condemn the provider for the next half hour.
+    process.env.PI_DEEPSEEK_TIER = "peak";
+    stubPricing(async () => pricingResponse(0.2, 0.6, 0.006, 0));
+    const { route, handlers } = await harness(threeSides, "continuation", { previous: DEEPINFRA });
+    await report(
+      handlers,
+      answer({
+        stopReason: "aborted",
+        durationMs: 400_000,
+        usage: { output: 0 },
+        content: [{ type: "thinking", thinking: "x".repeat(3_000) }],
+      }),
+    );
+    expect((await route()).model.provider).toBe("deepinfra");
+  });
+
+  test("relearns a recent degeneration from the branch it resumes", async () => {
+    // Kill and resume is the recovery an operator actually performs, and the new
+    // session has observed nothing. Without reading the branch back it would
+    // prefer the side that just broke the session it replaced.
+    process.env.PI_DEEPSEEK_TIER = "peak";
+    stubPricing(async () => pricingResponse(0.2, 0.6, 0.006, 0));
+    const endedRecently = answer({
+      stopReason: "aborted",
+      durationMs: 1_333_766,
+      usage: { output: 0 },
+      // Started ~23 minutes ago, so the stream ended about a minute ago.
+      timestamp: Date.now() - 1_400_000,
+    });
+    const { route } = await harness(threeSides, "continuation", {
+      previous: DEEPINFRA,
+      branch: [{ type: "message", message: endedRecently }],
+    });
+    expect((await route()).model.provider).not.toBe("deepinfra");
+  });
+
+  test("does not relearn a degeneration older than the cooldown", async () => {
+    process.env.PI_DEEPSEEK_TIER = "peak";
+    stubPricing(async () => pricingResponse(0.2, 0.6, 0.006, 0));
+    const endedHoursAgo = answer({
+      stopReason: "aborted",
+      durationMs: 1_333_766,
+      usage: { output: 0 },
+      timestamp: Date.now() - 3 * 60 * 60_000,
+    });
+    const { route } = await harness(threeSides, "continuation", {
+      previous: DEEPINFRA,
+      branch: [{ type: "message", message: endedHoursAgo }],
+    });
+    expect((await route()).model.provider).toBe("deepinfra");
   });
 });

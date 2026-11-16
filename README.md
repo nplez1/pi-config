@@ -453,7 +453,13 @@ a DeepSeek-only machine would end up using.)
   turn started, so only crossing a peak boundary costs a prompt-cache miss. A
   retry after a provider-side error (5xx, 429, overload, network) crosses to the
   next-cheapest side that is not the one that failed, once; then the next user
-  message returns to the clock/price choice.
+  message returns to the clock/price choice. A side that degenerates *without*
+  erroring — HTTP 200, a full stream, and nothing usable at the end of it — has
+  no retry to cross on, so it is demoted to last for 30 minutes instead, relearned
+  from the branch when a session resumes after a kill. DeepInfra's own
+  registration declares 128K of output rather than the catalog's 384K, which
+  bounds one such answer at ~8 minutes; DeepSeek direct and IsoQuant keep their
+  own caps. See `degeneratedResponse`.
 - Every side is in `enabledModels`, `defaultModel` is the router, and
   `model-roles.json` `workhorse` points at it, so sessions, subagents and
   workflows all route.
