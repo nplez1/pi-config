@@ -1,8 +1,8 @@
 // shared/deepseek-schedule.ts
 //
 // Single source of truth for DeepSeek's peak/off-peak billing schedule, its
-// per-tier rate card, and the model ids the peak router swaps between.
-// Imported by deepseek-pricing.ts (billing + footer label) and
+// per-tier rate card, and the model id of every provider the peak router swaps
+// between. Imported by deepseek-pricing.ts (billing + footer label) and
 // deepseek-routing.ts (provider choice), so the price shown and the provider
 // actually used can never disagree.
 //
@@ -95,12 +95,20 @@ export interface ModelRef {
   id: string;
 }
 
+/**
+ * The providers that serve this one checkpoint. Every price comparison and
+ * cache measurement below is keyed by these names, and `SIDES` is the complete
+ * list — the router ranks all of them, so adding a fourth means adding it here
+ * and nowhere else.
+ */
+export type Side = "deepseek" | "deepinfra" | "isoquant";
+
 /** DeepSeek direct — half price off-peak, and the billing baseline. */
 export const DEEPSEEK_FLASH: ModelRef = { provider: "deepseek", id: "deepseek-flash" };
 
 /**
  * Same checkpoint (DeepSeek-V4.1-Flash-1017) resold by DeepInfra at a flat
- * rate. Which tier it wins is not declared anywhere — `cheaperAtPrompt` decides
+ * rate. Which tier it wins is not declared anywhere — `cheapestSideAt` decides
  * it per request. On the 2026-11-01 cards its list price is 25% cheaper than
  * DeepSeek's peak card on a short prompt and 49% dearer than the off-peak one;
  * the 51% promo is 64% cheaper than peak and 27% cheaper than off-peak. Those
@@ -118,6 +126,37 @@ export const DEEPINFRA_FLASH: ModelRef = {
  * DeepInfra bills `list * (1 - discount)`; see `effectiveCost`.
  */
 export const DEEPINFRA_LIST: RateSet = { input: 0.2, output: 0.6, cacheRead: 0.006 };
+
+/**
+ * The same checkpoint a third time, resold by IsoQuant as
+ * `deepseek-v4.1-flash-1017-fast`.
+ *
+ * That provider is registered by a MACHINE-LOCAL extension
+ * (`~/.pi/agent/extensions/isoquant-provider.ts`), not from this repo — the
+ * machines sharing this one have no IsoQuant account. So this side exists only
+ * where that extension and an IsoQuant credential both do; the router drops it
+ * silently everywhere else, the same way it drops DeepInfra on a machine with
+ * no DeepInfra key.
+ */
+export const ISOQUANT_FLASH: ModelRef = {
+  provider: "isoquant",
+  id: "deepseek-v4.1-flash-1017-fast",
+};
+
+/**
+ * IsoQuant's card for it, USD per 1M tokens — flat, 24/7, with no cache-write
+ * charge. Verified 2026-11-16 against https://api.isoquant.ai/v1/models
+ * (public, no key needed), which publishes nano-USD per token: input 35,
+ * cached input 5, output 370.
+ *
+ * Unlike DeepInfra this needs no refetch: there is no promo and no peak tier to
+ * discover, so a static card IS the published rate. The catch is ownership —
+ * the `cost` block in the isoquant-provider extension is what pi bills and what
+ * /session sums, while this card is what the router compares. Nothing here can
+ * read that file, so a price change belongs in both or the footer and the
+ * routing decision disagree.
+ */
+export const ISOQUANT_RATES: RateSet = { input: 0.035, output: 0.37, cacheRead: 0.005 };
 
 /** DeepInfra's discount is a fraction off list: 0.51 -> pay 49%. */
 export function effectiveCost(list: RateSet, discount: number): RateSet {
@@ -165,6 +204,14 @@ export function deepseekCost(tier: Tier): RateSet {
  * be at least as cheap on all three axes. That test is never *wrong*, it is
  * just far too conservative — it demanded a 50% DeepInfra discount where a
  * short prompt's break-even is 37.8%.
+ *
+ * IsoQuant was measured the same way and deliberately does NOT get a baseline
+ * of its own: `--provider isoquant` (13 sessions, measured 2026-11-16) gives
+ * 0.33% input, 99.49% cache reads and 0.17% output, against DeepSeek's
+ * 0.36 / 99.36 / 0.28. Its output share is ~40% lower, which is the workload
+ * (the fast tier gets the long tool-heavy sessions) rather than the provider,
+ * and a per-provider mix would make the three cards incomparable. One baseline;
+ * the only thing measured per side is CACHE_BANDS below.
  */
 export const TOKEN_MIX: RateSet = {
   input: 0.003615,
@@ -186,12 +233,16 @@ export interface CacheBand {
    * version of this table price both sides wrongly at the top.
    */
   deepseekMiss: number;
-  /** DeepInfra's miss share ÷ DeepSeek's, measured in this band. */
-  ratio: number;
+  /**
+   * Every other side's miss share ÷ DeepSeek's, measured in this band. A side
+   * at 1.0 caches exactly as well as DeepSeek direct; above 1.0 re-reads more
+   * of the prompt than DeepSeek would have.
+   */
+  ratios: Record<Exclude<Side, "deepseek">, number>;
 }
 
 /**
- * Both sides' cache behaviour as a function of CONTEXT SIZE — the measurement
+ * Every side's cache behaviour as a function of CONTEXT SIZE — the measurement
  * the router's provider choice rests on.
  *
  * DeepSeek caches KV state on disk, which is what makes a huge prefix cheap to
@@ -200,29 +251,38 @@ export interface CacheBand {
  * whose previous turn was under 60 seconds away, so elapsed time cannot explain
  * the difference:
  *
- *   prompt size    DeepSeek      DeepInfra     ratio
- *   0-65K          1 per 30      1 per 30      1.02x
- *   65K-131K       1 per 116     1 per 98      1.18x
- *   131K-262K      1 per 386     1 per 173     2.23x
- *   262K-524K      1 per 841     1 per 316     2.66x
- *   524K-1M        1 per 1675    1 per 85      19.8x
+ *   prompt size    DeepSeek      DeepInfra     IsoQuant     ratio DI   ratio IQ
+ *   0-65K          1 per 29      1 per 30      1 per 24      0.99x      1.23x
+ *   65K-131K       1 per 115     1 per 107     1 per 154     1.08x      0.75x
+ *   131K-262K      1 per 385     1 per 185     1 per 471     2.07x      0.82x
+ *   262K-524K      1 per 840     1 per 256     1 per 1090    3.29x      0.77x
+ *   524K-1M        1 per 1675    1 per 85      1 per 1981   19.82x      0.85x
  *
  * Read the direction, not just the size: DeepSeek's cache gets *better* as the
- * prompt grows. DeepInfra's gets worse. The old single 1.87 scalar was a fair
- * average over a workload that lives around 160K tokens, and wrong by 2x at
- * short prompts and by 9x at the top.
+ * prompt grows, DeepInfra's gets worse, and IsoQuant tracks DeepSeek closely —
+ * a touch worse at short prompts (1.23x, on the thinnest sample in the table), a
+ * little better from 65K up. That is what a router forwarding to the same
+ * upstream checkpoint should look like, and it is why IsoQuant's card wins or
+ * loses on PRICE at every size: its cache never becomes the argument. The old
+ * single 1.87 scalar was a fair average over a workload that lives around 160K
+ * tokens, and wrong by 2x at short prompts and by 9x at the top.
  *
  * Reproduce with `measure-token-mix.mjs --penalty`, which prints the turn counts
- * so a thin band is visible. The 524K-1M row rests on ONE DeepInfra session (91
- * turns) against DeepSeek's 11, so its ratio is indicative; that band lands near
- * parity either way, which is why the router stops preferring DeepInfra there.
+ * so a thin band is visible. Re-measured 2026-11-16, which moved the DeepInfra
+ * columns off a smaller sample (1.02/1.18/2.23/2.66/19.8) — most of all
+ * 2.66x -> 3.29x at 262K-524K, now on 3,952 turns. The 524K-1M DeepInfra row
+ * still rests on far fewer turns than the rest (91) against DeepSeek's 820, so
+ * its ratio is indicative; that band lands near parity either way, which is why
+ * the router stops preferring DeepInfra there. IsoQuant's columns rest on
+ * 144 / 400 / 384 / 469 / 255 warm turns — thin at the bottom, solid through
+ * the middle, and no claim beyond what those counts support.
  */
 export const CACHE_BANDS: readonly CacheBand[] = [
-  { upTo: 65_000, deepseekMiss: 0.032846, ratio: 1.02 },
-  { upTo: 131_000, deepseekMiss: 0.008615, ratio: 1.18 },
-  { upTo: 262_000, deepseekMiss: 0.002587, ratio: 2.23 },
-  { upTo: 524_000, deepseekMiss: 0.001189, ratio: 2.66 },
-  { upTo: Number.POSITIVE_INFINITY, deepseekMiss: 0.000597, ratio: 19.82 },
+  { upTo: 65_000, deepseekMiss: 0.032821, ratios: { deepinfra: 0.99, isoquant: 1.23 } },
+  { upTo: 131_000, deepseekMiss: 0.008614, ratios: { deepinfra: 1.08, isoquant: 0.75 } },
+  { upTo: 262_000, deepseekMiss: 0.002592, ratios: { deepinfra: 2.07, isoquant: 0.82 } },
+  { upTo: 524_000, deepseekMiss: 0.001189, ratios: { deepinfra: 3.29, isoquant: 0.77 } },
+  { upTo: Number.POSITIVE_INFINITY, deepseekMiss: 0.000597, ratios: { deepinfra: 19.82, isoquant: 0.85 } },
 ];
 
 /**
@@ -242,13 +302,18 @@ export function cacheBandAt(promptTokens?: number): CacheBand {
 }
 
 /**
- * DeepInfra's cache-miss share at `promptTokens`, from the measured ratio — the
- * share its card is actually billed on. Replaces the input-axis multiplier an
- * earlier version applied to the aggregate mix.
+ * The share of a prompt of `promptTokens` that `side` bills as a cache MISS —
+ * the share its card is actually charged on. DeepSeek is the baseline the
+ * other sides are measured against; each of them is that share times its ratio.
+ *
+ * Miss share and cache-read share are complements here too, so a side that
+ * re-reads more of the prompt also collects less cache-read revenue on the same
+ * turn. That is the whole of the cache comparison.
  */
-export function deepinfraMissAt(promptTokens?: number): number {
+export function missShareAt(side: Side, promptTokens?: number): number {
   const band = cacheBandAt(promptTokens);
-  return band.deepseekMiss * band.ratio;
+  if (side === "deepseek") return band.deepseekMiss;
+  return band.deepseekMiss * band.ratios[side];
 }
 
 /** Share of a turn's tokens that is prompt rather than output. */
@@ -271,14 +336,15 @@ export function priceAtMissShare(rates: RateSet, missShare: number): number {
 /**
  * Price of 1M tokens of this usage at `rates`, at this machine's AGGREGATE mix —
  * the number to quote when no prompt size is in play. `inputMultiplier` scales
- * the aggregate miss share, which is how the DeepInfra side is priced when the
- * size is unknown. Per *billion* tokens (x1e3):
+ * the aggregate miss share, which is how a side whose cache differs is priced
+ * when the size is unknown. Per *billion* tokens (x1e3):
  *
- *   DeepSeek off-peak   $5.19     DeepInfra list  (aggregate)  $8.35
- *   DeepSeek peak      $10.38     DeepInfra @51%  (aggregate)  $4.09
+ *   DeepSeek off-peak   $5.21     DeepInfra list  (aggregate)  $8.37
+ *   DeepSeek peak      $10.41    DeepInfra @51%  (aggregate)  $4.10
+ *   IsoQuant           $6.13
  *
- * A summary, not a substitute for `cheaperAtPrompt`: it holds DeepSeek's miss
- * share at 0.36% when a 524K prompt's is 0.06% and a 30K prompt's is 3.3%.
+ * A summary, not a substitute for `priceSide`: it holds DeepSeek's miss share at
+ * 0.36% when a 524K prompt's is 0.06% and a 30K prompt's is 3.3%.
  */
 export function blendedPrice(rates: RateSet, inputMultiplier = 1): number {
   return priceAtMissShare(rates, TOKEN_MIX.input * inputMultiplier);
@@ -298,48 +364,76 @@ export function cheaperOnMyMix(
 }
 
 /**
- * Whether `candidate` costs less than `baseline` at a prompt of `promptTokens` —
- * the comparison the router makes, with each side priced at the cache behaviour
- * measured for that context size. This is the one that decides a request.
+ * What one side would charge for 1M tokens of this usage at `promptTokens`, in
+ * USD: `rates` priced at the cache behaviour measured for that side in that
+ * band. This is what a request costs, and the number a comparison uses.
  *
- * The off-peak break-even discount it implies moves with the prompt, and past
- * 524K no plausible discount makes DeepInfra the better buy: that band lands
- * near parity, and the router stops preferring it there.
+ * The side has to be named, because the miss share is a property of the
+ * provider — pricing a card at DeepSeek's miss share is exactly the mistake the
+ * bands exist to avoid. `priceAtMissShare` stays available for arithmetic that
+ * really is about one card in isolation.
  */
-export function cheaperAtPrompt(
-  candidate: RateSet,
-  baseline: RateSet,
-  promptTokens?: number,
-): boolean {
-  const band = cacheBandAt(promptTokens);
-  return (
-    priceAtMissShare(candidate, band.deepseekMiss * band.ratio) <
-    priceAtMissShare(baseline, band.deepseekMiss)
-  );
+export function priceSide(side: Side, rates: RateSet, promptTokens?: number): number {
+  return priceAtMissShare(rates, missShareAt(side, promptTokens));
 }
 
-/** The virtual model that routes between the two. */
+/** One candidate: a side and the card it is currently billing at. */
+export interface Quote {
+  side: Side;
+  rates: RateSet;
+}
+
+/**
+ * The cheapest side at a prompt of `promptTokens` among `quotes`, or undefined
+ * for an empty list. This is the comparison that decides a request — three
+ * cards priced at their own measured cache behaviour, not two.
+ *
+ * The router needs more than the winner: a fallback order to walk when the
+ * cheapest side has no credential this session. It therefore ranks the same
+ * quotes with `priceSide` and takes them in order; this function answers the
+ * single question — which card would win here — that a test or a reader asks.
+ * Ties keep the earlier entry, so a caller that lists DeepSeek first keeps the
+ * baseline on an exact draw.
+ */
+export function cheapestSideAt(quotes: readonly Quote[], promptTokens?: number): Side | undefined {
+  let cheapest: { side: Side; price: number } | undefined;
+  for (const quote of quotes) {
+    const price = priceSide(quote.side, quote.rates, promptTokens);
+    if (cheapest === undefined || price < cheapest.price) cheapest = { side: quote.side, price };
+  }
+  return cheapest?.side;
+}
+
+/** The virtual model that routes between them. */
 export const ROUTER: ModelRef = { provider: "deepseek", id: "deepseek-flash-auto" };
+
+/** Every side, in fallback order. */
+export const SIDES: readonly Side[] = ["deepseek", "deepinfra", "isoquant"];
 
 /** Display name of each side, for the footer label. */
 export const PROVIDER_LABEL: Record<string, string> = {
   deepseek: "DeepSeek",
   deepinfra: "DeepInfra",
+  isoquant: "IsoQuant",
 };
 
-/** Whether `ref` is one of the two sides the router swaps between. */
-export function isRouted(ref: ModelRef | undefined): boolean {
-  if (!ref) return false;
-  return (
-    (ref.provider === DEEPSEEK_FLASH.provider && ref.id === DEEPSEEK_FLASH.id) ||
-    (ref.provider === DEEPINFRA_FLASH.provider && ref.id === DEEPINFRA_FLASH.id)
-  );
+/** The model reference for `side`. */
+export function refFor(side: Side): ModelRef {
+  if (side === "deepseek") return DEEPSEEK_FLASH;
+  if (side === "deepinfra") return DEEPINFRA_FLASH;
+  return ISOQUANT_FLASH;
 }
 
-/** The other side from `ref` (undefined if `ref` is neither side). */
-export function otherSide(ref: ModelRef | undefined): ModelRef | undefined {
+/** Which side `ref` is, or undefined when it is neither (or no ref at all). */
+export function sideOf(ref: ModelRef | undefined): Side | undefined {
   if (!ref) return undefined;
-  if (ref.provider === DEEPSEEK_FLASH.provider && ref.id === DEEPSEEK_FLASH.id) return DEEPINFRA_FLASH;
-  if (ref.provider === DEEPINFRA_FLASH.provider && ref.id === DEEPINFRA_FLASH.id) return DEEPSEEK_FLASH;
-  return undefined;
+  return SIDES.find((side) => {
+    const known = refFor(side);
+    return known.provider === ref.provider && known.id === ref.id;
+  });
+}
+
+/** Whether `ref` is one of the sides the router swaps between. */
+export function isRouted(ref: ModelRef | undefined): boolean {
+  return sideOf(ref) !== undefined;
 }

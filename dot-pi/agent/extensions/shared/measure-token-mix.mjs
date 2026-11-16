@@ -7,20 +7,22 @@
 //   node dot-pi/agent/extensions/shared/measure-token-mix.mjs
 //   node dot-pi/agent/extensions/shared/measure-token-mix.mjs --since 2026-10-14 --until 2026-11-01T09:00Z
 //   node dot-pi/agent/extensions/shared/measure-token-mix.mjs --provider deepinfra
+//   node dot-pi/agent/extensions/shared/measure-token-mix.mjs --provider isoquant \
+//     --model deepseek-v4.1-flash-1017-fast
 //   node dot-pi/agent/extensions/shared/measure-token-mix.mjs --penalty
 //
 // `--since` / `--until` are parsed by `Date.parse`, so a date-time without a
 // trailing `Z` is read as LOCAL time. Pass the `Z` when the window is a UTC
 // boundary, as the TOKEN_MIX provenance is.
 //
-// Session transcripts live at `sessions/<mangled-cwd>/<session>.jsonl`, so the
+// Session transcripts live at `sessions/<mangled-cwd>/<session.jsonl>`, so the
 // scan is one level of directories deep — the layout, not a limit.
 //
 // DeepSeek-only sessions are the baseline on purpose: the input share this
-// prints is what `TOKEN_MIX` holds, and DeepInfra's extra re-reads are priced
-// separately by `CACHE_BANDS`. Measuring the mix on DeepInfra
+// prints is what `TOKEN_MIX` holds, and the other sides' extra re-reads are
+// priced separately by `CACHE_BANDS`. Measuring the mix on DeepInfra or IsoQuant
 // traffic instead would count that penalty twice. `--provider` is how you
-// measure the other side; `--penalty` is the report that derives the table.
+// measure the other sides; `--penalty` is the report that derives the table.
 //
 // The first request on a provider after the router switched costs a full cache
 // miss, and that is an artefact of routing, not of the provider's cache. Those
@@ -52,11 +54,13 @@ function timestampOf(message) {
   }
   return parsed;
 }
-// The router swaps between these two checkpoints, so those are the defaults.
-const MODEL = flag(
-  "model",
-  PROVIDER === "deepseek" ? "deepseek-flash" : "deepseek-ai/DeepSeek-V4.1-Flash-1017",
-);
+// The three checkpoints the router swaps between, so those are the defaults.
+const DEFAULT_MODEL = {
+  deepseek: "deepseek-flash",
+  deepinfra: "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+  isoquant: "deepseek-v4.1-flash-1017-fast",
+};
+const MODEL = flag("model", DEFAULT_MODEL[PROVIDER] ?? "");
 /** Sessions shorter than this are mostly first-turn cache misses, not usage. */
 const MIN_SESSION_MESSAGES = Number(flag("min-messages", 60));
 
@@ -106,13 +110,14 @@ async function* sessionFiles(root) {
   }
 }
 
-/** The two checkpoints the router swaps between, for the `--penalty` report. */
-const ROUTED = new Set(["deepseek", "deepinfra"]);
+/** Every side the router swaps between, for the `--penalty` report. */
+const ROUTED = ["deepseek", "deepinfra", "isoquant"];
+const OTHERS = ROUTED.slice(1);
 
 /**
- * Re-derives `CACHE_BANDS` in deepseek-schedule.ts: how much more of
- * the prompt DeepInfra re-bills as cache misses than DeepSeek does, as a
- * function of CONTEXT SIZE.
+ * Re-derives `CACHE_BANDS` in deepseek-schedule.ts: how much more of the prompt
+ * each other side re-bills as cache misses than DeepSeek does, as a function of
+ * CONTEXT SIZE.
  *
  * Only turns whose previous turn was under a minute away are counted, so
  * elapsed time cannot be the explanation — what is left is the provider's cache
@@ -127,7 +132,8 @@ async function penaltyReport() {
     [524_000, Number.POSITIVE_INFINITY],
   ];
   const blank = () => BANDS.map(() => ({ turns: 0, input: 0, cacheRead: 0 }));
-  const acc = { deepseek: blank(), deepinfra: blank() };
+  const acc = {};
+  for (const provider of ROUTED) acc[provider] = blank();
 
   for await (const path of sessionFiles(SESSIONS)) {
     const messages = await sessionMessages(path);
@@ -137,7 +143,7 @@ async function penaltyReport() {
     for (let k = 1; k < ordered.length; k += 1) {
       const { message: current, at } = ordered[k];
       const previous = ordered[k - 1];
-      if (!ROUTED.has(current.provider)) continue;
+      if (!ROUTED.includes(current.provider)) continue;
       // A provider switch starts cold; that miss is the router's, not the cache's.
       if (previous.message.provider !== current.provider) continue;
       if (at - previous.at >= 60_000) continue;
@@ -154,25 +160,41 @@ async function penaltyReport() {
 
   const perRead = (bucket) => (bucket.input > 0 ? bucket.cacheRead / bucket.input : Number.NaN);
   console.log("cache misses per cache read, warm turns only (<60s since the previous turn)");
-  console.log("\nprompt size      DeepSeek            DeepInfra           ratio");
+  console.log(
+    `\n${"prompt size".padEnd(16)}${ROUTED.map((p) => p.padEnd(20)).join("")}ratios`,
+  );
   const rows = [];
   BANDS.forEach(([lo, hi], index) => {
-    const ds = perRead(acc.deepseek[index]);
-    const di = perRead(acc.deepinfra[index]);
-    const ratio = di > 0 && ds > 0 ? 1 / di / (1 / ds) : Number.NaN;
     const label = hi === Number.POSITIVE_INFINITY ? `${lo / 1000}K+` : `${lo / 1000}K-${hi / 1000}K`;
     const cell = (value, bucket) =>
       bucket.turns === 0 ? "—" : `1 per ${Math.round(value)} (${bucket.turns})`;
-    console.log(
-      `${label.padEnd(16)}  ${cell(ds, acc.deepseek[index]).padEnd(19)} ${cell(di, acc.deepinfra[index]).padEnd(19)} ${Number.isNaN(ratio) ? "—" : `${ratio.toFixed(2)}x`}`,
-    );
-    rows.push({ label, ratio, deepseekMiss: ds > 0 ? 1 / (ds + 1) : Number.NaN });
+    const ratios = {};
+    const cells = ROUTED.map((provider) => {
+      const bucket = acc[provider][index];
+      const per = perRead(bucket);
+      // A ratio is the miss-share quotient: this side's input/cacheRead over
+      // DeepSeek's, which is the same number as missShare_side / missShare_base.
+      const base = perRead(acc.deepseek[index]);
+      if (provider !== "deepseek") {
+        ratios[provider] = per > 0 && base > 0 ? base / per : Number.NaN;
+      }
+      return cell(per, bucket).padEnd(20);
+    });
+    const ratioText = OTHERS.map(
+      (provider) => `${provider} ${Number.isNaN(ratios[provider]) ? "—" : `${ratios[provider].toFixed(2)}x`}`,
+    ).join("  ");
+    console.log(`${label.padEnd(16)}${cells.join("")}${ratioText}`);
+    const miss = perRead(acc.deepseek[index]);
+    rows.push({ label, ratios, deepseekMiss: miss > 0 ? 1 / (miss + 1) : Number.NaN });
   });
   console.log("\nCACHE_BANDS for deepseek-schedule.ts:");
   for (const row of rows) {
     const miss = Number.isNaN(row.deepseekMiss) ? "?" : row.deepseekMiss.toFixed(6);
-    const ratio = Number.isNaN(row.ratio) ? "?" : row.ratio.toFixed(2);
-    console.log(`  { upTo: ${row.label}, deepseekMiss: ${miss}, ratio: ${ratio} },`);
+    const ratios = OTHERS.map(
+      (provider) =>
+        `${provider}: ${Number.isNaN(row.ratios[provider]) ? "?" : row.ratios[provider].toFixed(2)}`,
+    ).join(", ");
+    console.log(`  { upTo: ${row.label}, deepseekMiss: ${miss}, ratios: { ${ratios} } },`);
   }
   console.log("\nA band with few turns is indicative, not measured — check the counts.");
 }
@@ -262,6 +284,6 @@ console.log("");
 console.log(`  cache efficiency over ${ratios.length} sessions of >=${MIN_SESSION_MESSAGES} messages:`);
 console.log(`    median ${median.toFixed(4)} input misses per cache read = 1 per ${Math.round(1 / median)}`);
 if (PROVIDER === "deepseek") {
-  console.log("    This is the baseline `TOKEN_MIX` holds. For the DeepInfra cache penalty,");
-  console.log("    run with --penalty, which buckets by prompt size.");
+  console.log("    This is the baseline `TOKEN_MIX` holds. For the other sides' cache");
+  console.log("    penalties, run with --penalty, which buckets by prompt size.");
 }

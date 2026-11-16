@@ -11,15 +11,22 @@ import { describe, expect, test } from "bun:test";
 import {
   CACHE_BANDS,
   DEEPINFRA_LIST,
+  ISOQUANT_RATES,
+  SIDES,
   TOKEN_MIX,
   blendedPrice,
   cacheBandAt,
-  cheaperAtPrompt,
+  cheapestSideAt,
   cheaperOnMyMix,
-  deepinfraMissAt,
   deepseekCost,
   effectiveCost,
+  missShareAt,
   priceAtMissShare,
+  priceSide,
+  refFor,
+  sideOf,
+  type RateSet,
+  type Side,
 } from "./deepseek-schedule.ts";
 
 const near = (actual: number, expected: number, tolerance = 0.02) =>
@@ -29,6 +36,18 @@ const near = (actual: number, expected: number, tolerance = 0.02) =>
 const SHORT = 30_000;
 const MID = 200_000;
 const HUGE = 600_000;
+
+/**
+ * Whether `candidate` beats `baseline` at a prompt of `prompt` — each priced at
+ * its OWN measured cache behaviour, which is what the router compares.
+ */
+const beats = (
+  candidate: Side,
+  candidateRates: RateSet,
+  baseline: Side,
+  baselineRates: RateSet,
+  prompt: number,
+) => priceSide(candidate, candidateRates, prompt) < priceSide(baseline, baselineRates, prompt);
 
 describe("TOKEN_MIX", () => {
   test("is a share distribution", () => {
@@ -55,7 +74,11 @@ describe("CACHE_BANDS", () => {
     for (const band of CACHE_BANDS) {
       expect(band.deepseekMiss).toBeGreaterThan(0);
       expect(band.deepseekMiss).toBeLessThan(0.2);
-      expect(band.ratio).toBeGreaterThanOrEqual(1);
+      // Parity, not an advantage: a side can cache slightly BETTER than DeepSeek
+      // (DeepInfra sits at 0.99x on the short band), so this is a sanity range
+      // rather than a floor of 1.
+      expect(band.ratios.deepinfra).toBeGreaterThan(0.9);
+      expect(band.ratios.isoquant).toBeGreaterThan(0.5);
     }
   });
 
@@ -70,7 +93,17 @@ describe("CACHE_BANDS", () => {
 
   test("DeepInfra's disadvantage grows as the context grows", () => {
     for (let i = 1; i < CACHE_BANDS.length; i += 1) {
-      expect(CACHE_BANDS[i].ratio).toBeGreaterThanOrEqual(CACHE_BANDS[i - 1].ratio);
+      expect(CACHE_BANDS[i].ratios.deepinfra).toBeGreaterThanOrEqual(CACHE_BANDS[i - 1].ratios.deepinfra);
+    }
+  });
+
+  // IsoQuant forwards to the same upstream checkpoint, and its measurement says
+  // so: within a factor of two of DeepSeek at every size, never the 20x blow-up
+  // DeepInfra shows at the top. That is why its card, not its cache, decides.
+  test("IsoQuant's cache tracks DeepSeek's instead of degrading", () => {
+    for (const band of CACHE_BANDS) {
+      expect(band.ratios.isoquant).toBeGreaterThan(0.6);
+      expect(band.ratios.isoquant).toBeLessThan(1.5);
     }
   });
 
@@ -97,9 +130,11 @@ describe("cacheBandAt", () => {
     expect(cacheBandAt(Number.NaN)).toBe(CACHE_BANDS[0]);
   });
 
-  test("deepinfraMissAt is the band's DeepSeek share times its ratio", () => {
+  test("missShareAt is the band's DeepSeek share times the side's ratio", () => {
     for (const band of CACHE_BANDS) {
-      near(deepinfraMissAt(band.upTo), band.deepseekMiss * band.ratio);
+      near(missShareAt("deepseek", band.upTo), band.deepseekMiss);
+      near(missShareAt("deepinfra", band.upTo), band.deepseekMiss * band.ratios.deepinfra);
+      near(missShareAt("isoquant", band.upTo), band.deepseekMiss * band.ratios.isoquant);
     }
   });
 });
@@ -137,18 +172,40 @@ describe("blendedPrice", () => {
   test("prices DeepInfra list at ~$8.37 on the aggregate mix", () => {
     near(blendedPrice(DEEPINFRA_LIST) * 1e3, 8.37);
   });
+
+  test("prices IsoQuant at ~$6.13 on the aggregate mix", () => {
+    // Not the router's number (it prices the band, not the aggregate), just the
+    // figure the README quotes for a card that has no cache argument.
+    near(blendedPrice(ISOQUANT_RATES) * 1e3, 6.13);
+  });
 });
 
-describe("cheaperAtPrompt", () => {
-  test("rejects DeepInfra list at off-peak", () => {
-    expect(cheaperAtPrompt(DEEPINFRA_LIST, deepseekCost("off-peak"), SHORT)).toBe(false);
+describe("priceSide", () => {
+  test("prices each side at its own cache behaviour, not DeepSeek's", () => {
+    // Same card, same prompt, different cache: naming the side has to change the
+    // answer, or the bands are not being applied.
+    const card = deepseekCost("off-peak");
+    expect(priceSide("deepinfra", card, HUGE)).toBeGreaterThan(priceSide("deepseek", card, HUGE));
+    expect(priceSide("isoquant", card, HUGE)).toBeLessThan(priceSide("deepinfra", card, HUGE));
   });
 
-  test("takes DeepInfra list at peak, by ~25% on a short prompt", () => {
-    expect(cheaperAtPrompt(DEEPINFRA_LIST, deepseekCost("peak"), SHORT)).toBe(true);
+  test("an unknown prompt size is priced as the smallest band", () => {
+    expect(priceSide("deepinfra", DEEPINFRA_LIST, undefined)).toBe(
+      priceSide("deepinfra", DEEPINFRA_LIST, SHORT),
+    );
+  });
+});
+
+describe("the two-card comparison", () => {
+  test("rejects DeepInfra list at off-peak", () => {
+    expect(beats("deepinfra", DEEPINFRA_LIST, "deepseek", deepseekCost("off-peak"), SHORT)).toBe(false);
+  });
+
+  test("takes DeepInfra list from DeepSeek's peak card, by ~25% on a short prompt", () => {
+    expect(beats("deepinfra", DEEPINFRA_LIST, "deepseek", deepseekCost("peak"), SHORT)).toBe(true);
     const band = cacheBandAt(SHORT);
     const margin =
-      priceAtMissShare(DEEPINFRA_LIST, band.deepseekMiss * band.ratio) /
+      priceAtMissShare(DEEPINFRA_LIST, band.deepseekMiss * band.ratios.deepinfra) /
       priceAtMissShare(deepseekCost("peak"), band.deepseekMiss);
     expect(margin).toBeGreaterThan(0.72);
     expect(margin).toBeLessThan(0.78);
@@ -160,22 +217,22 @@ describe("cheaperAtPrompt", () => {
   test("does not assume DeepInfra wins at peak", () => {
     const dearer = { input: 0.5, output: 1.5, cacheRead: 0.012 };
     for (const prompt of [SHORT, MID, HUGE]) {
-      expect(cheaperAtPrompt(dearer, deepseekCost("peak"), prompt)).toBe(false);
-      expect(cheaperAtPrompt(dearer, deepseekCost("off-peak"), prompt)).toBe(false);
+      expect(beats("deepinfra", dearer, "deepseek", deepseekCost("peak"), prompt)).toBe(false);
+      expect(beats("deepinfra", dearer, "deepseek", deepseekCost("off-peak"), prompt)).toBe(false);
     }
   });
 
-  test("off-peak break-even is ~33% off on a short prompt", () => {
+  test("off-peak break-even is ~32% off on a short prompt", () => {
     const breakEvenAt = (prompt: number) => {
       for (let discount = 0; discount <= 1; discount += 0.001) {
-        if (cheaperAtPrompt(effectiveCost(DEEPINFRA_LIST, discount), deepseekCost("off-peak"), prompt)) {
+        if (beats("deepinfra", effectiveCost(DEEPINFRA_LIST, discount), "deepseek", deepseekCost("off-peak"), prompt)) {
           return discount;
         }
       }
       return 1;
     };
     const short = breakEvenAt(SHORT);
-    expect(short).toBeGreaterThan(0.31);
+    expect(short).toBeGreaterThan(0.3);
     expect(short).toBeLessThan(0.35);
   });
 
@@ -184,7 +241,7 @@ describe("cheaperAtPrompt", () => {
   test("the off-peak break-even rises with the prompt size", () => {
     const breakEvenAt = (prompt: number) => {
       for (let discount = 0; discount <= 1; discount += 0.001) {
-        if (cheaperAtPrompt(effectiveCost(DEEPINFRA_LIST, discount), deepseekCost("off-peak"), prompt)) {
+        if (beats("deepinfra", effectiveCost(DEEPINFRA_LIST, discount), "deepseek", deepseekCost("off-peak"), prompt)) {
           return discount;
         }
       }
@@ -202,8 +259,8 @@ describe("cheaperAtPrompt", () => {
   test("the 51% promo wins off-peak up to 400K", () => {
     const promo = effectiveCost(DEEPINFRA_LIST, 0.51);
     for (const prompt of [SHORT, MID, 400_000]) {
-      expect(cheaperAtPrompt(promo, deepseekCost("off-peak"), prompt)).toBe(true);
-      expect(cheaperAtPrompt(promo, deepseekCost("peak"), prompt)).toBe(true);
+      expect(beats("deepinfra", promo, "deepseek", deepseekCost("off-peak"), prompt)).toBe(true);
+      expect(beats("deepinfra", promo, "deepseek", deepseekCost("peak"), prompt)).toBe(true);
     }
   });
 
@@ -212,9 +269,9 @@ describe("cheaperAtPrompt", () => {
     // penalty there (~19.8x) puts the two cards at parity, so off-peak falls
     // back to DeepSeek — which the old 1.87 scalar never did.
     const promo = effectiveCost(DEEPINFRA_LIST, 0.51);
-    expect(cheaperAtPrompt(promo, deepseekCost("off-peak"), HUGE)).toBe(false);
+    expect(beats("deepinfra", promo, "deepseek", deepseekCost("off-peak"), HUGE)).toBe(false);
     // Peak is a different question and DeepInfra still wins it comfortably.
-    expect(cheaperAtPrompt(promo, deepseekCost("peak"), HUGE)).toBe(true);
+    expect(beats("deepinfra", promo, "deepseek", deepseekCost("peak"), HUGE)).toBe(true);
   });
 
   test("is not the every-axis rule", () => {
@@ -222,17 +279,99 @@ describe("cheaperAtPrompt", () => {
     // DeepInfra's cache-read rate ($0.0033) is still above DeepSeek's ($0.003).
     const card = effectiveCost(DEEPINFRA_LIST, 0.45);
     expect(card.cacheRead).toBeGreaterThan(deepseekCost("off-peak").cacheRead);
-    expect(cheaperAtPrompt(card, deepseekCost("off-peak"), MID)).toBe(true);
+    expect(beats("deepinfra", card, "deepseek", deepseekCost("off-peak"), MID)).toBe(true);
+  });
+});
+
+describe("IsoQuant", () => {
+  test("beats DeepInfra's list card at every size", () => {
+    for (const prompt of [SHORT, MID, HUGE]) {
+      expect(beats("isoquant", ISOQUANT_RATES, "deepinfra", DEEPINFRA_LIST, prompt)).toBe(true);
+    }
+    // By 30-50%, at the working prompt size.
+    const ratio = priceSide("isoquant", ISOQUANT_RATES, MID) / priceSide("deepinfra", DEEPINFRA_LIST, MID);
+    expect(ratio).toBeGreaterThan(0.6);
+    expect(ratio).toBeLessThan(0.75);
+  });
+
+  test("takes peak from DeepSeek and from DeepInfra's list card", () => {
+    for (const prompt of [SHORT, MID, HUGE]) {
+      expect(beats("isoquant", ISOQUANT_RATES, "deepseek", deepseekCost("peak"), prompt)).toBe(true);
+      expect(beats("isoquant", ISOQUANT_RATES, "deepinfra", DEEPINFRA_LIST, prompt)).toBe(true);
+    }
+  });
+
+  test("wins off-peak on a short prompt and loses it from 131K up", () => {
+    // Its input rate is a fifth of DeepSeek's, which covers its extra short-prompt
+    // misses; from 131K up DeepSeek's cheaper cache read and its own better cache
+    // together win. This is the crossover the bands exist to express.
+    expect(beats("isoquant", ISOQUANT_RATES, "deepseek", deepseekCost("off-peak"), SHORT)).toBe(true);
+    for (const prompt of [MID, HUGE]) {
+      expect(beats("isoquant", ISOQUANT_RATES, "deepseek", deepseekCost("off-peak"), prompt)).toBe(false);
+    }
+  });
+
+  test("loses to a live DeepInfra promo at every size", () => {
+    // The honest answer while the promo is deep: 51% off list undercuts even a
+    // card this cheap, which is why the router does not choose IsoQuant today.
+    const promo = effectiveCost(DEEPINFRA_LIST, 0.51);
+    for (const prompt of [SHORT, MID, HUGE]) {
+      expect(beats("isoquant", ISOQUANT_RATES, "deepinfra", promo, prompt)).toBe(false);
+    }
+  });
+});
+
+describe("cheapestSideAt", () => {
+  const promo = effectiveCost(DEEPINFRA_LIST, 0.51);
+  const a = { side: "deepseek" as const, rates: deepseekCost("off-peak") };
+  const b = { side: "deepinfra" as const, rates: promo };
+  const c = { side: "isoquant" as const, rates: ISOQUANT_RATES };
+
+  test("picks the cheapest card, so the promo keeps DeepInfra off-peak", () => {
+    for (const prompt of [SHORT, MID, 400_000]) expect(cheapestSideAt([a, b, c], prompt)).toBe("deepinfra");
+  });
+
+  test("hands the same off-peak question to DeepSeek at 600K", () => {
+    expect(cheapestSideAt([a, b, c], HUGE)).toBe("deepseek");
+  });
+
+  test("hands peak to IsoQuant once DeepInfra is back at list price", () => {
+    const peak = { side: "deepseek" as const, rates: deepseekCost("peak") };
+    const list = { side: "deepinfra" as const, rates: DEEPINFRA_LIST };
+    for (const prompt of [SHORT, MID, HUGE]) expect(cheapestSideAt([peak, list, c], prompt)).toBe("isoquant");
+  });
+
+  test("does not depend on the order of the candidates", () => {
+    for (const order of [[a, b, c], [c, b, a], [b, c, a]]) {
+      expect(cheapestSideAt(order, MID)).toBe("deepinfra");
+    }
+  });
+
+  test("is undefined for no candidates", () => {
+    expect(cheapestSideAt([], MID)).toBeUndefined();
+  });
+});
+
+describe("sides", () => {
+  test("SIDES lists each provider exactly once", () => {
+    const providers = SIDES.map((side) => refFor(side).provider);
+    expect(new Set(providers).size).toBe(SIDES.length);
+  });
+
+  test("sideOf round-trips every side and rejects anything else", () => {
+    for (const side of SIDES) expect(sideOf(refFor(side))).toBe(side);
+    expect(sideOf({ provider: "deepseek", id: "deepseek-v4-pro" })).toBeUndefined();
+    expect(sideOf(undefined)).toBeUndefined();
   });
 });
 
 describe("cheaperOnMyMix (aggregate)", () => {
   // Kept for the summary figures the README quotes; the router uses
-  // cheaperAtPrompt, which prices both sides at the context's own band.
-  test("agrees with cheaperAtPrompt near the aggregate's centre of mass", () => {
+  // `priceSide`, which prices each side at the context's own band.
+  test("agrees with the per-band comparison near the aggregate's centre of mass", () => {
     const promo = effectiveCost(DEEPINFRA_LIST, 0.51);
     for (const prompt of [SHORT, MID, 400_000]) {
-      expect(cheaperAtPrompt(promo, deepseekCost("off-peak"), prompt)).toBe(true);
+      expect(beats("deepinfra", promo, "deepseek", deepseekCost("off-peak"), prompt)).toBe(true);
     }
     expect(cheaperOnMyMix(promo, deepseekCost("off-peak"))).toBe(true);
   });

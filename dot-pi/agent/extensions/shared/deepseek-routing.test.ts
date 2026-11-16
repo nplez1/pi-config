@@ -20,7 +20,10 @@ import register from "../deepseek-routing.ts";
 
 const DEEPSEEK = { provider: "deepseek", id: "deepseek-flash" };
 const DEEPINFRA = { provider: "deepinfra", id: "deepseek-ai/DeepSeek-V4.1-Flash-1017" };
+const ISOQUANT = { provider: "isoquant", id: "deepseek-v4.1-flash-1017-fast" };
+/** The sides a machine without the IsoQuant extension has — the common case. */
 const SIDES = ["deepseek", "deepinfra"];
+const ALL_SIDES = [...SIDES, "isoquant"];
 
 interface FakeRegistry {
   find(provider: string, id: string): unknown;
@@ -104,6 +107,8 @@ const staleAvailability = registry({ sides: [DEEPSEEK, DEEPINFRA], configured: f
  * shape, not an empty catalog.
  */
 const emptyCatalog = registry({ sides: [], configured: false, store: "none", live: false });
+/** A machine that also has the machine-local IsoQuant provider registered. */
+const threeSides = registry({ sides: [DEEPSEEK, DEEPINFRA, ISOQUANT], configured: true });
 
 /** DeepInfra's public catalog, as the router reads it. */
 function pricingResponse(input: number, output: number, cacheRead: number, discount: number) {
@@ -156,8 +161,12 @@ function staleRegistry(): FakeRegistry {
  */
 async function harness(
   reg: FakeRegistry,
-  reason: "user" | "continuation" = "user",
-  options: { previous?: typeof DEEPSEEK } = {},
+  reason: "user" | "continuation" | "retry" = "user",
+  options: {
+    previous?: typeof DEEPSEEK;
+    failed?: typeof DEEPSEEK;
+    state?: { failedOver?: true };
+  } = {},
 ) {
   const models: { id?: string; route?: (r: unknown, c: unknown) => Promise<{ model: { provider: string; id: string } }> }[] = [];
   const handlers: Record<string, (() => unknown)[]> = {};
@@ -181,7 +190,15 @@ async function harness(
   }
   const route = () =>
     router.route!(
-      { reason, thinkingLevel: "high", previous: options.previous ? { model: options.previous } : undefined },
+      {
+        reason,
+        thinkingLevel: "high",
+        previous: options.previous ? { model: options.previous } : undefined,
+        failed: options.failed
+          ? { model: options.failed, message: { errorMessage: "429 overload", stopReason: "error" } }
+          : undefined,
+        state: options.state,
+      },
       ctx,
     );
   /** `route()`, then pi's own check — the request pi would actually make. */
@@ -344,7 +361,7 @@ describe("router recovery", () => {
       (reason: Error) => reason.message,
     );
     expect(error).toContain("extension context is stale");
-    expect(error).toContain("neither credential is at fault");
+    expect(error).toContain("no credential is at fault");
   });
   test("falls to the other side when only it is in the catalog", async () => {
     // Whichever tier is asked for, a missing side must not become a throw.
@@ -410,20 +427,24 @@ describe("router follows the price, not the clock", () => {
   });
 });
 
-describe("router prices the context size the last turn reported", () => {
-  /** Report an assistant turn of `promptTokens` so the gate has a size to price. */
-  function reportPrompt(handlers: Record<string, (() => unknown)[]>, promptTokens: number): void {
-    const fire = handlers["message_end"]?.[0] as ((event: unknown) => unknown) | undefined;
-    if (!fire) throw new Error("the extension does not listen for message_end");
-    fire({
-      message: {
-        role: "assistant",
-        provider: "deepinfra",
-        usage: { input: promptTokens * 0.01, cacheRead: promptTokens * 0.99, output: 500 },
-      },
-    });
-  }
+/** Report an assistant turn of `promptTokens` so the router has a size to price. */
+function reportPrompt(
+  handlers: Record<string, (() => unknown)[]>,
+  promptTokens: number,
+  provider = "deepinfra",
+): void {
+  const fire = handlers["message_end"]?.[0] as ((event: unknown) => unknown) | undefined;
+  if (!fire) throw new Error("the extension does not listen for message_end");
+  fire({
+    message: {
+      role: "assistant",
+      provider,
+      usage: { input: promptTokens * 0.01, cacheRead: promptTokens * 0.99, output: 500 },
+    },
+  });
+}
 
+describe("router prices the context size the last turn reported", () => {
   test("takes the 51% promo at 200K, where DeepInfra still wins off-peak", async () => {
     process.env.PI_DEEPSEEK_TIER = "off-peak";
     stubPricing(async () => pricingResponse(0.098, 0.294, 0.00294, 0));
@@ -450,5 +471,107 @@ describe("router prices the context size the last turn reported", () => {
     const { routeAsPi, handlers } = await harness(healthy);
     reportPrompt(handlers, 600_000);
     expect((await routeAsPi()).model.provider).toBe("deepinfra");
+  });
+});
+
+// A third side changes the answer only where a third card can win, so these pin
+// the cases the two-side table cannot express: peak without a promo (IsoQuant),
+// off-peak on a fresh short prompt (IsoQuant's input rate), the huge-context
+// fallback (DeepSeek), and a failover that has to pick the NEXT-cheapest side
+// rather than a fixed "other" one.
+describe("router with IsoQuant registered", () => {
+  test("routes to one of the three sides when the registry is healthy", async () => {
+    for (const tier of ["peak", "off-peak"] as const) {
+      process.env.PI_DEEPSEEK_TIER = tier;
+      expect(ALL_SIDES).toContain((await (await harness(threeSides)).routeAsPi()).model.provider);
+    }
+  });
+
+  test("re-checks every side in play, instead of only the winner", async () => {
+    // A stale credential snapshot has to be rebuilt for all of them: the side
+    // that answers the retry is chosen after the refresh, not before it.
+    process.env.PI_DEEPSEEK_TIER = "off-peak";
+    const reg = registry({
+      sides: [DEEPSEEK, DEEPINFRA, ISOQUANT],
+      configured: false,
+      snapshot: false,
+      recheck: true,
+    });
+    const { routeAsPi } = await harness(reg);
+    expect((await routeAsPi()).model.provider).toBe("isoquant");
+    expect(reg.refreshes).toHaveLength(1);
+    expect([...reg.refreshes[0]].sort()).toEqual([...ALL_SIDES].sort());
+  });
+
+  test("takes IsoQuant at peak once DeepInfra is back at list price", async () => {
+    process.env.PI_DEEPSEEK_TIER = "peak";
+    stubPricing(async () => pricingResponse(0.2, 0.6, 0.006, 0));
+    expect((await (await harness(threeSides)).routeAsPi()).model.provider).toBe("isoquant");
+  });
+
+  test("still takes DeepInfra at peak while its promo is deep", async () => {
+    process.env.PI_DEEPSEEK_TIER = "peak";
+    stubPricing(async () => pricingResponse(0.2, 0.6, 0.006, 0.51));
+    expect((await (await harness(threeSides)).routeAsPi()).model.provider).toBe("deepinfra");
+  });
+
+  test("takes IsoQuant off-peak on a fresh, short prompt", async () => {
+    // Its input rate is a fifth of DeepSeek's, and on a session's first request
+    // there is no cache to reward DeepSeek's cheaper cache read yet.
+    process.env.PI_DEEPSEEK_TIER = "off-peak";
+    stubPricing(async () => pricingResponse(0.2, 0.6, 0.006, 0));
+    expect((await (await harness(threeSides)).routeAsPi()).model.provider).toBe("isoquant");
+  });
+
+  test("drops IsoQuant past 524K off-peak, where DeepSeek's cache wins", async () => {
+    process.env.PI_DEEPSEEK_TIER = "off-peak";
+    stubPricing(async () => pricingResponse(0.2, 0.6, 0.006, 0));
+    const { routeAsPi, handlers } = await harness(threeSides);
+    reportPrompt(handlers, 600_000, "isoquant");
+    expect((await routeAsPi()).model.provider).toBe("deepseek");
+  });
+
+  test("counts the prompt size an IsoQuant turn reported", async () => {
+    // The size tracking is per-conversation, not per-provider; an IsoQuant turn
+    // must move the band exactly as a DeepInfra one does.
+    process.env.PI_DEEPSEEK_TIER = "off-peak";
+    stubPricing(async () => pricingResponse(0.2, 0.6, 0.006, 0));
+    const shortPrompt = await harness(threeSides);
+    expect((await shortPrompt.routeAsPi()).model.provider).toBe("isoquant");
+    reportPrompt(shortPrompt.handlers, 600_000, "isoquant");
+    expect((await shortPrompt.routeAsPi()).model.provider).toBe("deepseek");
+  });
+
+  test("crosses a failed side to the next-cheapest, not to a fixed other side", async () => {
+    process.env.PI_DEEPSEEK_TIER = "peak";
+    stubPricing(async () => pricingResponse(0.2, 0.6, 0.006, 0));
+    // Peak with DeepInfra at list: IsoQuant is first, DeepInfra second, DeepSeek
+    // last. Failing DeepInfra must therefore land on IsoQuant.
+    const { route } = await harness(threeSides, "retry", { failed: DEEPINFRA });
+    expect((await route()).model.provider).toBe("isoquant");
+  });
+
+  test("crosses away from IsoQuant when it is the one that failed", async () => {
+    process.env.PI_DEEPSEEK_TIER = "peak";
+    stubPricing(async () => pricingResponse(0.2, 0.6, 0.006, 0));
+    const { route } = await harness(threeSides, "retry", { failed: ISOQUANT });
+    expect((await route()).model.provider).toBe("deepinfra");
+  });
+
+  test("does not cross twice when the retry has already failed over", async () => {
+    // The ping-pong guard, now with three sides to bounce between.
+    process.env.PI_DEEPSEEK_TIER = "peak";
+    stubPricing(async () => pricingResponse(0.2, 0.6, 0.006, 0));
+    const { route } = await harness(threeSides, "retry", { failed: ISOQUANT, state: { failedOver: true } });
+    expect((await route()).model.provider).toBe("isoquant");
+  });
+
+  test("keeps a continuation on the side that started the turn", async () => {
+    // Staying put is what keeps the prompt cache warm; a cheaper side mid-turn
+    // is not worth the miss.
+    process.env.PI_DEEPSEEK_TIER = "peak";
+    stubPricing(async () => pricingResponse(0.2, 0.6, 0.006, 0));
+    const { route } = await harness(threeSides, "continuation", { previous: DEEPSEEK });
+    expect((await route()).model.provider).toBe("deepseek");
   });
 });

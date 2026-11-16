@@ -2,34 +2,56 @@
 //
 // Keeps DeepSeek V4.1 Flash traffic on whichever provider is cheaper right now.
 //
-// DeepSeek bills two tiers by wall clock (peak = 2x off-peak, see
-// shared/deepseek-schedule.ts). DeepInfra resells the same checkpoint
-// (DeepSeek-V4.1-Flash-1017) at a flat rate. This extension registers both
-// sides plus a virtual model, `deepseek/deepseek-flash-auto`, that picks a
-// physical provider per request:
+// The same checkpoint is sold three ways. DeepSeek direct bills two tiers by
+// wall clock (peak = 2x off-peak, see shared/deepseek-schedule.ts). DeepInfra
+// resells it flat with a promo discount. IsoQuant resells it flat at a fifth of
+// DeepSeek's input rate, with no peak tier and no promo. This extension
+// registers the DeepInfra side and a virtual model,
+// `deepseek/deepseek-flash-auto`, that picks a physical provider per request.
+// IsoQuant's provider is registered by a MACHINE-LOCAL extension, so this file
+// treats that side as optional: a side pi cannot resolve is not a candidate,
+// which is also how a machine with no DeepInfra key keeps working.
 //
-//   peak      -> DeepInfra
-//   off-peak  -> DeepSeek, unless a DeepInfra promo beats it
+//   peak      -> DeepInfra while its promo is live, else IsoQuant
+//   off-peak  -> DeepInfra while its promo is live, else DeepSeek
 //
-// Neither tier is pre-decided. Every request compares the two cards at this
-// machine's measured token mix and takes whichever is cheaper; the two lines
-// above are just what that arithmetic returns for the rates in force on
-// 2026-11-01. No branch in this file assumes DeepInfra wins at peak — a change
-// to either card, or to the mix, changes the answer on its own.
+// Neither line is pre-decided, and neither is a branch in this file. Every
+// request prices all available cards at this machine's measured token mix and
+// cache behaviour and takes the cheapest; the two lines above are just what
+// that arithmetic returns for the rates in force on 2026-11-16. No side is
+// assumed to win any tier — a change to one card, to the mix, or to a measured
+// cache ratio changes the answer on its own.
 //
 // "Cheaper" is measured, not asserted axis by axis. `TOKEN_MIX` in
 // shared/deepseek-schedule.ts records how this machine actually spends tokens
-// on DeepSeek (99.4% of every prompt is a cache read), and `cheaperAtPrompt`
-// compares the two cards at that mix. The old every-axis test treated the three
+// on DeepSeek (99.4% of every prompt is a cache read), and `cheapestSideAt`
+// prices each card at that mix. The old every-axis test treated the three
 // prices as equally important, which is wrong by a factor of ~290 — it demanded
 // a 50% DeepInfra discount where the mix-weighted break-even is ~37%.
 //
-// The comparison also has to price the tokens DeepInfra would actually bill, and
+// The comparison also has to price the tokens each side would actually bill, and
 // that is not a constant: DeepInfra's cache degrades with CONTEXT SIZE while
-// DeepSeek's improves, so `cheaperAtPrompt` prices BOTH sides at the miss share
-// measured for this session's latest prompt size. A single scalar here was right
+// DeepSeek's improves, and IsoQuant's tracks DeepSeek's almost exactly. So
+// `priceSide` prices every side at the miss share measured for ITS cache in the
+// band this session's latest prompt falls in. A single scalar here was right
 // only for the ~160K band this machine happens to live in; at 524K+ it kept
 // choosing DeepInfra for a context where the two cards reach parity.
+//
+// What that arithmetic currently says, so a reader can sanity-check it against
+// any rate change (per billion tokens, this machine's mix, 200K prompt):
+//
+//   DeepSeek off-peak  $5.06   IsoQuant          $6.09   ($6.13 aggregate)
+//   DeepSeek peak     $10.11  DeepInfra @51%    $4.26
+//   DeepInfra list     $8.70
+//
+// IsoQuant is the cheapest side at peak whenever DeepInfra's promo lapses — 0.60x
+// DeepSeek's peak card at 200K — and it beats DeepSeek off-peak on a short
+// prompt, where its 4.3x cheaper input rate more than covers the extra misses.
+// From ~65K up off-peak it is third, and while a deep DeepInfra promo is live it
+// is third everywhere: 27% off DeepInfra's list is enough to undercut it at
+// 524K, 49% at a short prompt. Its cache is never the argument, by design: the
+// measured ratios are 1.23 at short prompts and 0.75-0.85 above 65K, so it holds
+// a prefix about as well as DeepSeek direct does.
 //
 //  - Promos. DeepInfra discounts its list price from time to time (51% off on
 //    2026-11-01, so $0.098/$0.294/$0.00294). On those cards its list price is
@@ -39,13 +61,15 @@
 //    true past 524K tokens where DeepInfra's cache penalty outweighs it.
 //    DeepInfra publishes its rates publicly at
 //    /v1/openai/models, so the extension refetches them each session instead of
-//    trusting a hardcoded number.
+//    trusting a hardcoded number. IsoQuant needs no fetch: its card is flat and
+//    published (see `ISOQUANT_RATES`), so a static reading is the real rate.
 //
 //  - Failover. A retry after a provider-side error (5xx, 429, overload,
-//    network) crosses to the other side for that one request, so a DeepSeek
-//    peak-time outage or a DeepInfra blip does not stall the turn. The session
-//    returns to the clock/price choice on the next user message. Router state
-//    remembers the failover so the two sides cannot ping-pong.
+//    network) crosses to the next-cheapest side that is not the one that
+//    failed, for that one request, so a DeepSeek peak-time outage or a DeepInfra
+//    blip does not stall the turn. The session returns to the clock/price choice
+//    on the next user message. Router state remembers the failover, so a broken
+//    side cannot be retried in a loop and three sides still cannot ping-pong.
 //
 // Provider selection is per *turn*, not per request: tool follow-ups stay on
 // the provider that handled the turn (`request.previous`), which keeps the
@@ -57,33 +81,38 @@
 // Registering the provider here (rather than in models.json) is what lets the
 // cost metadata track DeepInfra's live discount: models.json overrides compose
 // above extension registrations, so a static cost there would win and freeze
-// the per-token price at whatever was true when the file was written.
+// the per-token price at whatever was true when the file was written. The same
+// rule is why this file must NOT re-register IsoQuant: that provider's model
+// list and cost belong to the extension that owns it, and a `{}` registration
+// here would replace them.
 //
 // Credentials: this file holds none. The DeepInfra key lives in
 // ~/.pi/agent/auth.json as provider "deepinfra" (see README); the pricing
-// endpoint needs no key at all.
+// endpoint needs no key at all. IsoQuant's key lives beside it as provider
+// "isoquant", or the side simply does not appear.
 //
 // Portability: the virtual model is registered under the `deepseek` provider, so
 // it exists only where DeepSeek has credentials — a machine without them never
-// lists it and never runs this code. The DeepInfra side is gated per request:
+// lists it and never runs this code. Every other side is gated per request:
 // pi's find() returns catalog entries whose provider has no credentials and
 // aborts a request routed to one, so resolve() prefers getAvailable() and falls
 // back to hasConfiguredAuth() — the check pi itself applies — so a DeepSeek-only
-// machine stays on DeepSeek instead of erroring. A cached verdict that says
-// "no" is repaired rather than trusted: a live `getProviderAuth()` plus a
-// re-registration put the provider back into the catalog and the credential
-// cache pi reads, which is what makes a stale registry cost one stderr line
-// instead of a dead turn.
+// machine stays on DeepSeek instead of erroring, and a machine without the
+// IsoQuant extension never sees that side as a candidate at all. A cached
+// verdict that says "no" is repaired rather than trusted: a live
+// `getProviderAuth()` plus a re-registration put the provider back into the
+// catalog and the credential cache pi reads, which is what makes a stale
+// registry cost one stderr line instead of a dead turn.
 //
 //  - A dead context is not a credential problem, and conflating the two is what
 //    made one failure recur. Every field of the context `route()` is handed is a
 //    getter that begins with the extension runner's staleness check, so once pi
 //    replaces or reloads the session behind this registration — `/new`, `/fork`,
 //    `/resume`, `/reload`, or another session's runner in the same process —
-//    *every* registry read throws at once. That reads exactly like "neither side
-//    has a credential": same shape, both sides, with nothing wrong with either
-//    key, and the recovery chain above cannot help because it re-checks the same
-//    dead context. So `route()` recognises that state and answers with the last
+//    *every* registry read throws at once. That reads exactly like "no side has
+//    a credential": same shape, every side, with nothing wrong with any key, and
+//    the recovery chain above cannot help because it re-checks the same dead
+//    context. So `route()` recognises that state and answers with the last
 //    physical model it knows to be good instead of ending the turn, and a guard
 //    around the whole of `route()` does the same for anything this file has not
 //    anticipated. pi re-checks credentials on what `route()` returns, so the
@@ -94,16 +123,20 @@ import {
   CACHE_WRITE_RATE,
   DEEPINFRA_FLASH,
   DEEPINFRA_LIST,
-  DEEPSEEK_FLASH,
+  ISOQUANT_FLASH,
+  ISOQUANT_RATES,
   PROVIDER_LABEL,
   RATES,
   ROUTER,
-  cheaperAtPrompt,
+  SIDES,
   currentTier,
   deepseekCost,
   effectiveCost,
-  otherSide,
+  priceSide,
+  refFor,
+  sideOf,
   type ModelRef,
+  type Quote,
   type RateSet,
   type Tier,
 } from "./shared/deepseek-schedule";
@@ -198,6 +231,8 @@ class RouteFailure extends Error {}
 interface LabelContext {
   hasUI: boolean;
   model?: CatalogModel;
+  /** Present on a real session context; lets the label skip an unreachable side. */
+  modelRegistry?: RouteContext["modelRegistry"];
   ui: { setStatus(key: string, text: string | undefined): void };
 }
 
@@ -249,10 +284,14 @@ async function fetchDeepInfraCost(): Promise<RateSet | undefined> {
  * undefined when the registry cannot answer (then callers fall back to trust
  * `find()`, which is what pi would do). An empty snapshot is "cannot answer":
  * it is a cache, and an unpopulated one must not read as "nothing is usable".
+ *
+ * The registry is optional because the footer label also asks this, from a
+ * context that may not carry one — a label with no snapshot falls back to the
+ * price ranking rather than losing the status line.
  */
-function availableIds(ctx: RouteContext): Set<string> | undefined {
+function availableIds(ctx: { modelRegistry?: RouteContext["modelRegistry"] }): Set<string> | undefined {
   try {
-    const available = ctx.modelRegistry.getAvailable?.();
+    const available = ctx.modelRegistry?.getAvailable?.();
     if (!Array.isArray(available) || available.length === 0) return undefined;
     return new Set(available.map((model) => `${model.provider}/${model.id}`.toLowerCase()));
   } catch {
@@ -355,20 +394,61 @@ export default function (pi: ExtensionAPI) {
   let warnedStaleSnapshot = false;
 
   /**
-   * The largest prompt this session has sent, in tokens — the size
-   * `cheaperAtPrompt` prices both cards at. `route()` is handed no token count,
-   * so the last turn's usage is the estimate: the next prompt is that plus the
-   * new content, which cannot move it across a band by itself. Assistant
-   * messages on either side count, because the prompt is the same conversation
-   * either way.
+   * The largest prompt this session has sent, in tokens — the size every card is
+   * priced at. `route()` is handed no token count, so the last turn's usage is
+   * the estimate: the next prompt is that plus the new content, which cannot
+   * move it across a band by itself. Assistant messages from ANY side count,
+   * because the prompt is the same conversation whichever side answers it.
    */
   let promptTokens: number | undefined;
 
-  /** Which side to use for `tier`, at this session's prompt size and price. */
-  function chooseSide(tier: Tier): ModelRef {
-    return cheaperAtPrompt(deepInfraCost, deepseekCost(tier), promptTokens)
-      ? DEEPINFRA_FLASH
-      : DEEPSEEK_FLASH;
+  /** Every side's current card, as pairs of side and rate for the ranking. */
+  function quotesAt(tier: Tier): Quote[] {
+    return [
+      { side: "deepseek", rates: deepseekCost(tier) },
+      { side: "deepinfra", rates: deepInfraCost },
+      { side: "isoquant", rates: ISOQUANT_RATES },
+    ];
+  }
+
+  /**
+   * All three sides, cheapest first at this session's prompt size and the cards
+   * in force. This is the router's whole policy: the first entry is the answer
+   * when pi can reach it, and the rest are the fallbacks.
+   */
+  function rankedSides(tier: Tier): ModelRef[] {
+    return quotesAt(tier)
+      .map((quote) => ({
+        ref: refFor(quote.side),
+        price: priceSide(quote.side, quote.rates, promptTokens),
+      }))
+      .sort((a, b) => a.price - b.price)
+      .map((ranked) => ranked.ref);
+  }
+
+  /**
+   * `preferred` first, then the remaining sides cheapest-first — the order to
+   * fall back through. `preferred` goes through `sideOf` so a model object from
+   * some other provider cannot slip into the ranking.
+   */
+  function orderFrom(preferred: ModelRef | undefined, tier: Tier): ModelRef[] {
+    const preferredSide = sideOf(preferred);
+    const cheapest = rankedSides(tier);
+    if (!preferredSide) return cheapest;
+    return [refFor(preferredSide), ...cheapest.filter((ref) => sideOf(ref) !== preferredSide)];
+  }
+
+  /**
+   * The first side of `order` pi can reach, for the footer label. Price alone is
+   * the right answer on a machine that has every credential, and the wrong one
+   * on a machine missing a key — where the label would promise a provider the
+   * request can never go to. The availability snapshot is a cache, so it only
+   * ever demotes: when it cannot answer, the price winner is still shown.
+   */
+  function reachableSide(ctx: LabelContext | undefined, order: ModelRef[]): ModelRef {
+    const available = ctx ? availableIds(ctx) : undefined;
+    if (!available) return order[0];
+    return order.find((ref) => available.has(`${ref.provider}/${ref.id}`.toLowerCase())) ?? order[0];
   }
 
   /**
@@ -384,7 +464,7 @@ export default function (pi: ExtensionAPI) {
 
   function remember(model: CatalogModel | undefined): void {
     if (!model) return;
-    if (model.provider !== DEEPSEEK_FLASH.provider && model.provider !== DEEPINFRA_FLASH.provider) return;
+    if (!sideOf(model)) return;
     known.set(model.provider, model);
   }
 
@@ -399,13 +479,15 @@ export default function (pi: ExtensionAPI) {
    * Undefined only for a session that has never routed at all.
    */
   function lastKnown(request: RouteRequest): CatalogModel | undefined {
-    const preferred = chooseSide(currentTier());
-    return (
-      request.previous?.model ??
-      request.failed?.model ??
-      knownSide(preferred) ??
-      knownSide(otherSide(preferred))
-    );
+    // The model that just answered, then the one that just failed, then anything
+    // this session has already routed to, cheapest side first.
+    const justHandled = request.previous?.model ?? request.failed?.model;
+    if (justHandled) return justHandled;
+    for (const ref of rankedSides(currentTier())) {
+      const kept = knownSide(ref);
+      if (kept) return kept;
+    }
+    return undefined;
   }
 
   /** The first line of an error, for a one-line stderr note. */
@@ -431,10 +513,12 @@ export default function (pi: ExtensionAPI) {
   }
 
   /** The footer label for `model` right now, or undefined to clear it. */
-  function labelFor(model: CatalogModel | undefined): string | undefined {
+  function labelFor(model: CatalogModel | undefined, ctx?: LabelContext): string | undefined {
     if (!model || model.provider !== "deepseek") return undefined;
     const tier = currentTier();
-    if (model.id === ROUTER.id) return `${tier} → ${PROVIDER_LABEL[chooseSide(tier).provider]}`;
+    if (model.id === ROUTER.id) {
+      return `${tier} → ${PROVIDER_LABEL[reachableSide(ctx, rankedSides(tier)).provider]}`;
+    }
     // A directly selected DeepSeek model: show the tier it bills at.
     if (RATES[model.id]) return tier;
     return undefined;
@@ -447,7 +531,7 @@ export default function (pi: ExtensionAPI) {
   function updateLabel(ctx: LabelContext, model: CatalogModel | undefined, force = false): void {
     activeCtx = ctx;
     activeModel = model;
-    const text = labelFor(model);
+    const text = labelFor(model, ctx);
     if (force || text !== appliedText) {
       appliedText = text;
       if (ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, text);
@@ -460,7 +544,7 @@ export default function (pi: ExtensionAPI) {
     // without any model change or message traffic.
     if (refreshTimer === undefined) {
       refreshTimer = setInterval(() => {
-        const fresh = labelFor(activeModel);
+        const fresh = labelFor(activeModel, activeCtx);
         if (fresh !== undefined && fresh !== appliedText && activeCtx?.hasUI) {
           appliedText = fresh;
           activeCtx.ui.setStatus(STATUS_KEY, fresh);
@@ -473,8 +557,10 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", (_event, ctx) => {
     updateLabel(ctx, ctx.model, true);
     // The context is fresh here, so this is the one moment the catalog can be
-    // read for free. Whatever dies later, both sides now have a model object.
-    for (const side of [DEEPSEEK_FLASH, DEEPINFRA_FLASH]) remember(findInCatalog(ctx, side));
+    // read for free. Whatever dies later, every side in the catalog now has a
+    // model object — including the ones this machine has no credential for, as
+    // `find()` returns those too; `resolve()` is what checks reachability.
+    for (const side of SIDES) remember(findInCatalog(ctx, refFor(side)));
   });
 
   // React to /model, Ctrl+P cycling, and session restore.
@@ -482,14 +568,14 @@ export default function (pi: ExtensionAPI) {
     updateLabel(ctx, event.model);
   });
 
-  // Track the prompt size that `cheaperAtPrompt` prices, so the DeepInfra cache
-  // penalty follows the context instead of a constant. Only the two routed
-  // sides matter; a virtual-model or unrelated-provider message says nothing
-  // about the prompt these cards would be billed for.
+  // Track the prompt size the cards are priced at, so each side's cache penalty
+  // follows the context instead of a constant. Only the routed sides matter; a
+  // virtual-model or unrelated-provider message says nothing about the prompt
+  // these cards would be billed for.
   pi.on("message_end", (event) => {
     const msg = event.message;
     if (msg.role !== "assistant") return;
-    if (msg.provider !== DEEPSEEK_FLASH.provider && msg.provider !== DEEPINFRA_FLASH.provider) return;
+    if (!SIDES.some((side) => refFor(side).provider === msg.provider)) return;
     const usage = msg.usage;
     if (!usage) return;
     const tokens = (usage.input ?? 0) + (usage.cacheRead ?? 0);
@@ -550,8 +636,9 @@ export default function (pi: ExtensionAPI) {
   }
 
   /**
-   * The side to use for this request, preferring `ref` and falling back to the
-   * other side when that one is not in the catalog.
+   * The side to use for this request: the first reachable entry of `order`,
+   * where `order` is the price ranking with any preferred side moved to the
+   * front.
    *
    * The availability snapshot decides only the preference, never the verdict.
    * pi serves `getAvailable()` from a cache it refreshes asynchronously, so a
@@ -566,8 +653,8 @@ export default function (pi: ExtensionAPI) {
    * side, the full availability refresh that follows replaces
    * `configuredProviders` wholesale from live `checkAuth` results, and the
    * first request of a resumed session can arrive while that set is
-   * momentarily empty — which reads as "neither provider has a key". pi does
-   * not trust the snapshot for this either; its send path accepts
+   * momentarily empty — which reads as "no side has a key". pi does not trust
+   * the snapshot for this either; its send path accepts
    * `hasConfiguredAuth(provider) || await checkAuth(provider)`. The registry
    * exposes the same live check as `refresh({ providers })`, so re-check and
    * re-resolve before failing. Returning the catalog entry alone would not do:
@@ -589,50 +676,60 @@ export default function (pi: ExtensionAPI) {
    * A dead *context* is checked for first, because it is the one failure the
    * chain above cannot fix and the one it used to misreport: once pi has replaced
    * or reloaded the session, every registry read throws, which is indistinguishable
-   * from "neither side has a key" to a reader of the four facts. There the router
+   * from "no side has a key" to a reader of the four facts. There the router
    * answers with the last model it saw work and says so.
    */
-  async function resolveEither(ctx: RouteContext, ref: ModelRef): Promise<CatalogModel> {
-    const decided = decide(ctx, ref);
+  async function resolveBest(ctx: RouteContext, order: ModelRef[]): Promise<CatalogModel> {
+    const decided = decide(ctx, order);
     if (decided) return decided;
 
     // A dead context cannot be re-checked, probed or repaired — every one of
     // those reads the same invalidated runner, so the chain below would report
     // "no credentials" about keys that are perfectly fine. Answer from what this
     // session has already used instead.
-    if (await contextIsStale(ctx, ref)) {
-      const kept = knownSide(ref) ?? knownSide(otherSide(ref));
+    if (await contextIsStale(ctx, order)) {
+      const kept = firstKnown(order);
       if (kept) {
         note(`the extension context is stale, so the registry cannot be read; kept ${kept.provider}/${kept.id}`);
         return kept;
       }
       // Nothing cached yet: not deliberate, so the guard around `route()` gets a
       // chance to answer with the model that just handled the turn.
-      throw new Error(await describeFailure(ctx, ref));
+      throw new Error(await describeFailure(ctx, order));
     }
 
-    await recheckCredentials(ctx, ref);
-    const recovered = decide(ctx, ref);
+    await recheckCredentials(ctx, order);
+    const recovered = decide(ctx, order);
     if (recovered) {
       note(`credential snapshot was stale; re-checked live and routed to ${recovered.provider}/${recovered.id}`);
       return recovered;
     }
 
-    // Prove the side usable live, then repair what pi reads. A live credential
-    // alone is not enough: pi's post-route check reads the cache again.
-    for (const side of [ref, otherSide(ref)]) {
-      if (!side) continue;
+    // Prove a side usable live, then repair what pi reads. A live credential
+    // alone is not enough: pi's post-route check reads the cache again. This
+    // walks `order`, so the cheapest side that can be repaired wins, not the
+    // first one this file happens to list.
+    for (const side of order) {
       const state = await probe(ctx, side);
       if (!state.live) continue;
       repair(ctx, side);
-      const repaired = decide(ctx, ref);
+      const repaired = decide(ctx, order);
       if (repaired) {
         note(`repaired the registry for ${side.provider}; routed to ${repaired.provider}/${repaired.id}`);
         return repaired;
       }
     }
 
-    throw new RouteFailure(await describeFailure(ctx, ref));
+    throw new RouteFailure(await describeFailure(ctx, order));
+  }
+
+  /** The last model this session used from any side of `order`, in that order. */
+  function firstKnown(order: ModelRef[]): CatalogModel | undefined {
+    for (const ref of order) {
+      const kept = knownSide(ref);
+      if (kept) return kept;
+    }
+    return undefined;
   }
 
   /**
@@ -648,11 +745,10 @@ export default function (pi: ExtensionAPI) {
     return !state.catalog && state.snapshot === undefined && state.store === "unknown" && state.live === undefined;
   }
 
-  /** Whether both sides of the registry are unreadable — a dead context, not a credential. */
-  async function contextIsStale(ctx: RouteContext, ref: ModelRef): Promise<boolean> {
-    const sides = [ref, otherSide(ref)].filter((side): side is ModelRef => Boolean(side));
-    if (sides.length === 0) return false;
-    for (const side of sides) {
+  /** Whether every side in `order` is unreadable — a dead context, not a credential. */
+  async function contextIsStale(ctx: RouteContext, order: ModelRef[]): Promise<boolean> {
+    if (order.length === 0) return false;
+    for (const side of order) {
       if (!registryUnreadable(await probe(ctx, side))) return false;
     }
     return true;
@@ -706,22 +802,35 @@ export default function (pi: ExtensionAPI) {
    * recomposes the provider (restoring a registration this file owns — DeepInfra
    * is not in pi's builtin catalog) and marks it provisionally configured when
    * the credential store has it, which is what `hasConfiguredAuth()` reads.
+   *
+   * IsoQuant is deliberately not repaired here: its model list and cost belong to
+   * the extension that registers it, and re-registering with an empty object
+   * would replace them. A lost IsoQuant registration is simply a side this file
+   * cannot offer, so the ranking moves on to the next one.
    */
   function repair(ctx: RouteContext, side: ModelRef): void {
     try {
       if (side.provider === DEEPINFRA_FLASH.provider) registerDeepInfra(deepInfraCost);
-      else pi.registerProvider(side.provider, {});
+      else if (side.provider !== ISOQUANT_FLASH.provider) pi.registerProvider(side.provider, {});
     } catch (error) {
       console.error(`deepseek-routing: could not re-register ${side.provider}: ${String(error)}`);
     }
   }
 
-  /** The error, carrying what the registry said about each side. */
-  async function describeFailure(ctx: RouteContext, ref: ModelRef): Promise<string> {
-    const sides = [ref, otherSide(ref)].filter((side): side is ModelRef => Boolean(side));
+  /**
+   * The error, carrying what the registry said about each side.
+   *
+   * It reports the sides that are actually in play: one that was never in this
+   * machine's catalog (no IsoQuant extension installed, say) is not a failure and
+   * naming it would read as one, so it is filtered out — unless nothing else was
+   * in the catalog either, in which case every side is the story.
+   */
+  async function describeFailure(ctx: RouteContext, order: ModelRef[]): Promise<string> {
     const states: { side: ModelRef; state: SideState }[] = [];
-    for (const side of sides) states.push({ side, state: await probe(ctx, side) });
-    const details = states.map(({ side, state }) =>
+    for (const side of order) states.push({ side, state: await probe(ctx, side) });
+    const inPlayStates = states.filter(({ state }) => state.catalog || registryUnreadable(state));
+    const shown = inPlayStates.length > 0 ? inPlayStates : states;
+    const details = shown.map(({ side, state }) =>
       registryUnreadable(state)
         ? `${side.provider}/${side.id}: the model registry could not be read`
         : `${side.provider}/${side.id}: ${state.catalog ? "in the catalog" : "missing from the catalog"}, ` +
@@ -731,7 +840,7 @@ export default function (pi: ExtensionAPI) {
     );
     // Name the real cause. "Check auth.json" is actively misleading here: the
     // credentials are fine, the context that would read them is not.
-    const dead = states.length > 0 && states.every(({ state }) => registryUnreadable(state));
+    const dead = shown.length > 0 && shown.every(({ state }) => registryUnreadable(state));
     let registry = "";
     try {
       const error = ctx.modelRegistry.getError?.();
@@ -739,23 +848,28 @@ export default function (pi: ExtensionAPI) {
     } catch {
       // A stale context cannot report; the per-side lines already say so.
     }
+    const names = shown.map(({ side }) => `${side.provider}/${side.id}`);
+    const lead =
+      names.length === 1
+        ? `deepseek-routing: ${names[0]} is not usable. `
+        : `deepseek-routing: none of ${names.join(", ")} is usable. `;
     return (
-      `deepseek-routing: neither ${sides.map((side) => `${side.provider}/${side.id}`).join(" nor ")} is usable. ` +
-      `${details.join("; ")}.${registry} ` +
+      `${lead}${details.join("; ")}.${registry} ` +
       (dead
         ? `The extension context is stale — pi replaced or reloaded the session under this router — so no ` +
-          `registry read can succeed and neither credential is at fault. `
+          `registry read can succeed and no credential is at fault. `
         : "") +
       `Run /reload to rebuild the registry; if a credential is really missing, ` +
       `check it in ~/.pi/agent/auth.json`
     );
   }
 
-  /** The side the snapshots pick as they stand; undefined when neither is usable. */
-  function decide(ctx: RouteContext, ref: ModelRef): CatalogModel | undefined {
+  /** The side the snapshots pick as they stand; undefined when none is usable. */
+  function decide(ctx: RouteContext, order: ModelRef[]): CatalogModel | undefined {
     const available = availableIds(ctx);
-    const wanted = resolve(ctx, ref, available) ?? resolve(ctx, otherSide(ref), available);
-    if (wanted) {
+    for (const ref of order) {
+      const wanted = resolve(ctx, ref, available);
+      if (!wanted) continue;
       remember(wanted);
       if (available === undefined) {
         note(`availability snapshot is empty; routed to ${wanted.provider}/${wanted.id} without it`);
@@ -764,7 +878,7 @@ export default function (pi: ExtensionAPI) {
       }
       return wanted;
     }
-    const fallback = pickConfigured(ctx, [ref, otherSide(ref)]);
+    const fallback = pickConfigured(ctx, order);
     if (fallback) {
       remember(fallback);
       note(`availability snapshot omitted ${fallback.provider}/${fallback.id}; using the catalog entry`);
@@ -774,17 +888,28 @@ export default function (pi: ExtensionAPI) {
   }
 
   /**
-   * Rebuild the credential snapshot for the two sides from a live check — the
+   * Rebuild the credential snapshot for every side from a live check — the
    * scoped form of `/reload`. Best effort: a pi without `refresh()`, or a
    * failing refresh, leaves the snapshot as it was and the caller throws.
+   *
+   * Scoped to the sides this machine's catalog actually has: asking pi to check
+   * a provider that was never registered (no IsoQuant extension here, say) can
+   * only fail, and the caller would report that noise as the reason the turn
+   * died.
    */
-  async function recheckCredentials(ctx: RouteContext, ref: ModelRef): Promise<void> {
-    const providers = [ref.provider, otherSide(ref)?.provider].filter((id): id is string => Boolean(id));
+  async function recheckCredentials(ctx: RouteContext, order: ModelRef[]): Promise<void> {
+    const providers = inPlay(ctx, order).map((ref) => ref.provider);
+    if (providers.length === 0) return;
     try {
       await ctx.modelRegistry.refresh?.({ allowNetwork: false, providers });
     } catch {
       // The stale snapshot stands; the error message covers that case.
     }
+  }
+
+  /** The sides of `order` whose provider this machine's catalog actually has. */
+  function inPlay(ctx: RouteContext, order: ModelRef[]): ModelRef[] {
+    return order.filter((ref) => findInCatalog(ctx, ref) !== undefined);
   }
 
   /** One stderr note per streak of requests the snapshot could not place. */
@@ -811,22 +936,28 @@ export default function (pi: ExtensionAPI) {
     ctx: RouteContext,
   ): Promise<{ model: CatalogModel; thinkingLevel: string; state?: RouterState }> {
     // Tool follow-ups and steering mid-turn: stay where the turn started, so
-    // the prompt cache survives. Crossing a peak boundary mid-turn would cost
-    // more than the per-token difference it saves.
+    // the prompt cache survives. Crossing a peak boundary, or re-ranking on a
+    // price change, mid-turn would cost more than the per-token difference it
+    // saves.
     if (request.reason === "continuation") {
       const previous = request.previous?.model;
-      if (previous && (previous.provider === DEEPSEEK_FLASH.provider || previous.provider === DEEPINFRA_FLASH.provider)) {
-        return { model: await resolveEither(ctx, previous), thinkingLevel: request.thinkingLevel };
+      if (sideOf(previous)) {
+        return {
+          model: await resolveBest(ctx, orderFrom(previous, currentTier())),
+          thinkingLevel: request.thinkingLevel,
+        };
       }
     }
 
-    // A retry: cross to the other side once, for provider-side failures only.
+    // A retry: cross to the next-cheapest side that is not the one that failed,
+    // once, and only for provider-side failures.
     if (request.reason === "retry") {
       const failed = request.failed;
-      if (failed?.model && !request.state?.failedOver && looksLikeProviderFailure(failed.message)) {
-        const other = otherSide(failed.model);
-        const target = resolve(ctx, other);
-        if (other && target) {
+      const failedSide = sideOf(failed?.model);
+      if (failed?.model && failedSide && !request.state?.failedOver && looksLikeProviderFailure(failed.message)) {
+        const order = rankedSides(currentTier()).filter((ref) => sideOf(ref) !== failedSide);
+        const target = decide(ctx, order);
+        if (target) {
           return {
             model: target,
             thinkingLevel: request.thinkingLevel,
@@ -835,7 +966,10 @@ export default function (pi: ExtensionAPI) {
         }
       }
       if (failed?.model) {
-        return { model: await resolveEither(ctx, failed.model), thinkingLevel: request.thinkingLevel };
+        return {
+          model: await resolveBest(ctx, orderFrom(failed.model, currentTier())),
+          thinkingLevel: request.thinkingLevel,
+        };
       }
     }
 
@@ -846,7 +980,7 @@ export default function (pi: ExtensionAPI) {
     // Continuations and retries above deliberately skip it — they must not
     // spend latency mid-turn.
     await refreshPricing();
-    const target = await resolveEither(ctx, chooseSide(currentTier()));
+    const target = await resolveBest(ctx, rankedSides(currentTier()));
     return {
       model: target,
       thinkingLevel: request.thinkingLevel,

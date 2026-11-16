@@ -16,9 +16,11 @@
 // which keeps the in-flight streaming estimate (before message_end fires) and
 // the /model picker display on realistic numbers.
 //
-// DeepInfra requests are deliberately untouched: that provider bills a flat
-// rate (with a live discount), so its cost comes from the model registration
-// in deepseek-routing.ts and is already correct when the message lands.
+// DeepInfra and IsoQuant requests are deliberately untouched: those providers
+// bill a flat rate (DeepInfra with a live discount), so their cost comes from
+// their provider registrations — DeepInfra's in deepseek-routing.ts, IsoQuant's
+// in the machine-local isoquant-provider extension — and is already correct when
+// the message lands.
 //
 // The footer tier indicator ("peak", "off-peak", "peak → DeepInfra") is
 // published by deepseek-routing.ts, which owns that decision; this file stays

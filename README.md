@@ -339,22 +339,29 @@ node --test tests/loop.test.mjs
 (cd plugins/pi-smart-compaction && npm test)
 ```
 
-## DeepSeek peak/off-peak routing
+## DeepSeek V4.1 Flash provider routing
 
 DeepSeek bills two tiers by wall clock (peak = 2x off-peak: 01:00-04:00 and
-06:00-10:00 UTC, Mon-Fri). `extensions/deepseek-routing.ts` registers a virtual
-model, **`deepseek/deepseek-flash-auto`**, that sends each request to whichever
-provider for DeepSeek-V4.1-Flash-1017 is cheaper at that moment:
+06:00-10:00 UTC, Mon-Fri). The same checkpoint (DeepSeek-V4.1-Flash-1017) is
+resold flat by two other providers, so `extensions/deepseek-routing.ts`
+registers a virtual model, **`deepseek/deepseek-flash-auto`**, that sends each
+request to whichever of the three is cheaper at that moment:
 
-| | DeepSeek direct | DeepInfra |
-| --- | --- | --- |
-| off-peak | $0.15 / $0.60 / $0.003 (in/out/cache-read) | same model, flat rate |
-| peak | $0.30 / $1.20 / $0.006 | flat rate |
+| | DeepSeek direct | DeepInfra | IsoQuant |
+| --- | --- | --- | --- |
+| card (in / out / cache-read, per 1M) | $0.15 / $0.60 / $0.003 off-peak, 2x at peak | $0.20 / $0.60 / $0.006 list, times `1 - discount` | $0.035 / $0.37 / $0.005 flat, no cache-write charge |
+| promo | — | 51% off, 2026-11-16 | none |
+| cache | on disk, improves as the context grows | memory-resident, degrades | tracks DeepSeek's |
 
-**How "cheaper" is decided.** Not axis by axis — the three prices are not
-remotely equally important. A long agent session replays its whole history every
-turn, so on this machine **99.4% of every prompt token is a cache read**, and
-the measured split of a turn's tokens is:
+IsoQuant's side is optional: its provider is registered by a **machine-local**
+extension (`~/.pi/agent/extensions/isoquant-provider.ts`), because the machines
+sharing this repo have no IsoQuant account. A side that is not in the catalog is
+simply not a candidate, which is also how a DeepSeek-only machine keeps working.
+
+**How "cheaper" is decided.** Measured, not asserted axis by axis: the three
+prices are not remotely equally important. A long agent session replays its
+whole history every turn, so on this machine **99.4% of every prompt token is a
+cache read**, and the measured split of a turn's tokens is:
 
 | axis | share of tokens | share of spend, DeepSeek off-peak |
 | --- | --- | --- |
@@ -362,84 +369,109 @@ the measured split of a turn's tokens is:
 | cache read (cache hit) | 99.4% | 57.2% |
 | output | 0.28% | 32.4% |
 
-Cache reads are therefore both the heaviest axis and the one the two cards
-differ most on — DeepInfra's list price is 2x DeepSeek's off-peak there, 1.33x
-on input and exactly equal on output — so the decision is essentially a
-cache-read comparison. `TOKEN_MIX` in the shared module holds that measurement.
+Cache reads are therefore both the heaviest axis and the one the cards differ
+most on — DeepInfra's list price is 2x DeepSeek's off-peak there (1.33x on input,
+the same on output) and IsoQuant's 1.67x (a fifth on input, 0.62x on output) — so
+the decision is essentially a cache-read comparison. `TOKEN_MIX` in the shared
+module holds that measurement, from DeepSeek traffic only: measuring the mix on
+each side instead would put its cache penalty in the weighting *and* in the
+ratio, counting the same thing twice.
 
-**The mix alone is not enough, because the two caches age differently as the
-context grows.** DeepSeek caches KV state on disk; DeepInfra's cache is
-best-effort and memory-resident. Holding the gap under 60 seconds — so elapsed
-time cannot explain it — the miss rates are identical up to ~65K tokens and then
+**The mix alone is not enough, because the caches age differently as the context
+grows.** DeepSeek caches KV state on disk; DeepInfra's cache is best-effort and
+memory-resident; IsoQuant forwards to the same upstream checkpoint, so its cache
+behaves like DeepSeek's. Holding the gap under 60 seconds — so elapsed time
+cannot explain it — the miss rates are identical up to ~65K tokens and then
 diverge, while DeepSeek's *improves*:
 
-| prompt size | DeepSeek | DeepInfra | ratio |
+| prompt size | DeepSeek | DeepInfra | IsoQuant | ratio DI | ratio IQ |
+| --- | --- | --- | --- | --- | --- |
+| 0–65K | 1 per 29 | 1 per 30 | 1 per 24 | 0.99x | 1.23x |
+| 65K–131K | 1 per 115 | 1 per 107 | 1 per 154 | 1.08x | 0.75x |
+| 131K–262K | 1 per 385 | 1 per 185 | 1 per 471 | 2.07x | 0.82x |
+| 262K–524K | 1 per 840 | 1 per 256 | 1 per 1090 | 3.29x | 0.77x |
+| 524K–1M | 1 per 1675 | 1 per 85 | 1 per 1981 | 19.82x | 0.85x |
+
+`CACHE_BANDS` holds that table, and `priceSide` prices **every** side at the
+band the current prompt falls in — each at its own measured cache behaviour —
+using the latest turn's `input + cacheRead` as the size; `cheapestSideAt` then
+picks the winner. A single scalar was wrong in both directions: the old 1.87 was
+tuned for the ~160K band this machine happens to live in, and it kept choosing
+DeepInfra at 524K+ where the two cards reach parity. Blended over a billion
+tokens:
+
+| prompt size | DeepSeek off-peak | DeepInfra @51% | IsoQuant |
 | --- | --- | --- | --- |
-| 0–65K | 1 per 29 | 1 per 29 | 1.02x |
-| 65K–131K | 1 per 115 | 1 per 97 | 1.19x |
-| 131K–262K | 1 per 386 | 1 per 172 | 2.24x |
-| 262K–524K | 1 per 840 | 1 per 316 | 2.66x |
-| 524K–1M | 1 per 1675 | 1 per 85 | 19.8x |
+| 30K | $9.49 | $6.93 | $7.23 |
+| 200K | $5.06 | $4.26 | $6.09 |
+| 600K | $4.76 | $4.87 | $6.04 |
 
-`CACHE_BANDS` holds that table, and `cheaperAtPrompt` prices **both** sides at
-the band the current prompt falls in, using the latest turn's `input +
-cacheRead` as the size. A single scalar was wrong in both directions: the old
-1.87 was tuned for the ~160K band this machine happens to live in, and it kept
-choosing DeepInfra at 524K+ where the two cards reach parity. Blended over a
-billion tokens:
-
-| prompt size | DeepSeek off-peak | DeepInfra @51% |
-| --- | --- | --- |
-| 30K | $9.56 | $6.98 |
-| 200K | $5.06 | $4.31 |
-| 600K | $4.76 | $4.88 |
+IsoQuant is the cheapest side at **peak** whenever DeepInfra's promo lapses —
+0.60x DeepSeek's peak card at 200K — and it beats DeepSeek off-peak on a fresh,
+short prompt, where its input rate is a fifth. From ~65K up off-peak it is third,
+and while a deep promo is live it is third everywhere: 27% off DeepInfra's list
+undercuts it at 524K, 49% at a short prompt.
 
 The old rule required DeepInfra to beat DeepSeek on *all three* axes. That test
 is never wrong, just far too conservative: it demands a 50% discount where the
-break-even is **~33% at a short prompt** and **~42% at 200K**. At 51% the promo
+break-even is **~32% at a short prompt** and **~42% at 200K**. At 51% the promo
 wins off-peak up to ~400K; at 30% — what DeepInfra's un-suffixed
 `DeepSeek-V4.1-Flash` lists — it loses off-peak and wins at peak.
 
-**No tier is hardcoded, and no price is assumed.** The peak branch runs the same
-comparison as the off-peak one, against DeepSeek's peak card instead of its
-off-peak card, so a DeepInfra price above DeepSeek's peak price sends peak back
-to DeepSeek with no code change. The extension is seeded with DeepInfra's *list*
+**No tier is hardcoded, and no price is assumed.** Every request ranks all three
+cards and takes the cheapest reachable one, so a DeepInfra price above DeepSeek's
+peak card sends peak to IsoQuant with no code change, and a lapsed promo moves
+peak off DeepInfra entirely. The extension is seeded with DeepInfra's *list*
 price, never with the current promo, and `route()` awaits the live fetch before
 deciding — so a session whose fetch fails routes conservatively on list price
-instead of on an assumed discount. (`PI_DEEPSEEK_TIER` still forces a tier for
-testing, and the footer label shows which side the comparison picked, not what a
-DeepSeek-only machine would end up using.)
+instead of on an assumed discount. IsoQuant's card is static because it has
+nothing to discover: no promo, no peak tier, one published rate. (`PI_DEEPSEEK_TIER`
+still forces a tier for testing, and the footer label shows which side the
+comparison picked — and which of them this machine can actually reach — not what
+a DeepSeek-only machine would end up using.)
 
 - DeepInfra publishes its rates publicly at `/v1/openai/models`, so the extension
   refetches them each session and re-registers the model's cost — the footer's
   dollar figure tracks the real billed rate, promos included. `models.json`
   deliberately has no `deepinfra` entry: an override there would freeze the
   price at whatever was true when the file was written.
-- `TOKEN_MIX` is a measurement, not a guess. Re-derive it with
-  `node dot-pi/agent/extensions/shared/measure-token-mix.mjs` (add
-  `--provider deepinfra` for the cache-efficiency figure behind the multiplier),
-  and `bun test dot-pi/agent/extensions/shared/` pins the arithmetic — including
-  the break-even discount — so a drifted constant fails instead of quietly
-  flipping the router.
+- IsoQuant publishes its card at `/v1/models` (nano-USD per token) and has
+  nothing to fetch for: no promo, no peak tier. So its card is a constant,
+  `ISOQUANT_RATES`, verified against that endpoint. It is deliberately *not*
+  re-registered here — that provider's model list and cost belong to the
+  machine-local extension that owns it, and a `{}` registration from the router
+  would replace them. The one maintenance rule: a price change belongs in both
+  files, or the router compares a card pi no longer bills.
+- `TOKEN_MIX` and `CACHE_BANDS` are measurements, not guesses. Re-derive them
+  with `node dot-pi/agent/extensions/shared/measure-token-mix.mjs` (and
+  `--penalty`, which now reports all three sides), passing `--provider deepinfra`
+  or `--provider isoquant` for a side's own cache-efficiency figure, and
+  `bun test dot-pi/agent/extensions/shared/` pins the arithmetic — including the
+  break-even discount — so a drifted constant fails instead of quietly flipping
+  the router.
 - Provider choice is per turn, not per request: tool follow-ups stay where the
   turn started, so only crossing a peak boundary costs a prompt-cache miss. A
   retry after a provider-side error (5xx, 429, overload, network) crosses to the
-  other side once, then the next user message returns to the clock/price choice.
-- Both sides are in `enabledModels`, `defaultModel` is the router, and
+  next-cheapest side that is not the one that failed, once; then the next user
+  message returns to the clock/price choice.
+- Every side is in `enabledModels`, `defaultModel` is the router, and
   `model-roles.json` `workhorse` points at it, so sessions, subagents and
   workflows all route.
 
 **Where it shows up.** The router is a model, not a proxy: nothing else is
-redirected, and selecting `deepseek/deepseek-flash` or the `deepinfra` model
-directly pins that provider. It is registered under the `deepseek` provider, so
-it exists only on a machine logged into DeepSeek — without that credential it
-never appears in `/model` and no routing code runs, so a work machine that has
-neither provider stays untouched. It routes to DeepInfra only when DeepInfra
-also has a credential; a DeepSeek-only machine stays on DeepSeek instead of
-failing (`modelRegistry.find()` returns credential-less models, so the router
-checks `getAvailable()` first). Without a DeepInfra key pi hides that provider
-entirely. `getAvailable()` is a *cache* pi refreshes asynchronously, so it
-decides the preferred side and nothing more: when it omits both sides — or comes
+redirected, and selecting `deepseek/deepseek-flash`, the `deepinfra` model or
+the `isoquant` model directly pins that provider. It is registered under the
+`deepseek` provider, so it exists only on a machine logged into DeepSeek —
+without that credential it never appears in `/model` and no routing code runs,
+so a work machine that has none of the three stays untouched. It routes to
+DeepInfra or IsoQuant only when that side also has a credential and a catalog
+entry; a DeepSeek-only machine stays on DeepSeek instead of failing
+(`modelRegistry.find()` returns credential-less models, so the router checks
+`getAvailable()` first). Without a key, pi hides that provider entirely. The
+footer label names the side the comparison picked *and this machine can reach*,
+so it does not promise a provider the request can never go to.
+`getAvailable()` is a *cache* pi refreshes asynchronously, so it
+decides the preferred side and nothing more: when it omits every side — or comes
 back empty — the router confirms against the catalog and notes it once on stderr,
 because `route()` throwing ends the request with an error pi does not retry and —
 every request going through the router — would keep ending it until pi was
@@ -449,14 +481,18 @@ refresh that follows replaces the configured-provider set wholesale, so the firs
 request can arrive while that set is momentarily empty. pi's own send path does
 not trust it either (`hasConfiguredAuth() || await checkAuth()`), and
 `modelRegistry.refresh({ providers })` runs that live check, so the router
-rebuilds the snapshot for the two sides and re-resolves. If that rebuild still
+rebuilds the snapshot for every side in the catalog and re-resolves. If that
+rebuild still
 leaves the cached verdict saying no, the router repairs what pi reads instead of
 trusting it: `getProviderAuth()` resolves the credential without the cache, and
 re-registering the provider restores a lost registration — DeepInfra is not in
 pi's builtin catalog, so its entry exists only because this extension registered
 it — and marks the provider configured again, which is the cache
-`hasConfiguredAuth()` reads. The error, naming `/reload`, is only for the case
-where the live check itself finds no key; it now names, per side, whether the
+`hasConfiguredAuth()` reads. IsoQuant is the exception: its registration belongs
+to the machine-local extension, so the router never re-registers it, and a lost
+IsoQuant simply drops out of the ranking. The error, naming `/reload`, is only
+for the case where the live check itself finds no key; it names, per side,
+whether the
 model was in the catalog, what the credential store holds, what the cached
 verdict said, and what the live check found, so a recurrence is diagnosable from
 the message instead of by reproduction.
@@ -466,8 +502,9 @@ one.** Every field of the context `route()` is handed is a getter that begins
 with the extension runner's staleness check, so once pi replaces or reloads the
 session behind the registration — `/new`, `/fork`, `/resume`, `/reload`, or
 another session's runner in the same process — *every* registry read throws at
-once. That produces exactly the same four facts on both sides as two missing
-credentials, with nothing wrong with either key, and none of the recovery above
+once. That produces exactly the same four facts on every side as the missing
+credentials would, with nothing wrong with any key, and none of the recovery
+above
 can help because each step re-reads the same dead context. So the router checks
 for that state first and answers with the last physical model it saw this session
 use — seeded at `session_start`, refreshed on every decision, topped up from the
@@ -491,9 +528,17 @@ provider `deepinfra` (it is not tracked, and `models.json` holds no key):
 "deepinfra": { "type": "api_key", "key": "sk-di-REPLACE_ME" }
 ```
 
+IsoQuant is optional on top of that: a key as provider `isoquant` in the same
+file **plus** the machine-local `~/.pi/agent/extensions/isoquant-provider.ts`
+(which registers the provider and its card — it is kept out of this repo because
+no other machine has an IsoQuant account). With the key but no extension the
+side never enters the catalog, so the router behaves exactly as it does on a
+two-provider machine.
+
 Known gap: DeepSeek's docs also make Chinese public holidays off-peak all day;
 `DEEPSEEK_HOLIDAYS` in the shared module is empty, so a holiday is treated as a
-normal weekday (it over-routes to DeepInfra for that day rather than mis-pricing).
+normal weekday (it over-routes to DeepInfra or IsoQuant for that day rather than
+mis-pricing).
 
 ## `/loop` — one scheduler, two execution homes
 
