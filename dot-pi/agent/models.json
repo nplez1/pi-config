@@ -8,8 +8,16 @@
           "api": "anthropic-messages",
           "baseUrl": "https://api.githubcopilot.com",
           "reasoning": true,
-          "input": ["text", "image"],
-          "cost": { "input": 8, "output": 40, "cacheRead": 0.2, "cacheWrite": 10 },
+          "input": [
+            "text",
+            "image"
+          ],
+          "cost": {
+            "input": 8,
+            "output": 40,
+            "cacheRead": 0.2,
+            "cacheWrite": 10
+          },
           "contextWindow": 1000000,
           "maxTokens": 128000,
           "headers": {
@@ -18,10 +26,26 @@
             "Editor-Plugin-Version": "copilot-chat/0.35.0",
             "Copilot-Integration-Id": "vscode-chat"
           },
-          "thinkingLevelMap": { "off": null, "xhigh": "xhigh", "max": "max" },
-          "compat": { "forceAdaptiveThinking": true }
+          "thinkingLevelMap": {
+            "off": null,
+            "xhigh": "xhigh",
+            "max": "max"
+          },
+          "compat": {
+            "forceAdaptiveThinking": true
+          },
+          "promptCache": {
+            "short": 270
+          }
         }
-      ]
+      ],
+      "modelOverrides": {
+        "claude-opus-5.5": {
+          "promptCache": {
+            "short": 270
+          }
+        }
+      }
     },
     "deepseek": {
       "modelOverrides": {
@@ -125,16 +149,23 @@
       ]
     },
     "m5-omlx": {
-      "name": "M5 omlx",
-      "baseUrl": "http://100.98.144.27:8033/v1",
+      "baseUrl": "http://127.0.0.1:8033/v1",
       "api": "openai-completions",
       "models": [
         {
           "id": "Qwen3.8-27B-Uncen-oQ4e",
-          "name": "Qwen3.8-27B-Uncen-oQ4e",
-          "contextWindow": 262144,
-          "maxTokens": 262144,
+          "name": "Qwen3.8-27B Uncensored oQ4e + MTP (M5 Max)",
           "reasoning": true,
+          "input": [
+            "text",
+            "image"
+          ],
+          "cost": {
+            "input": 0,
+            "output": 0,
+            "cacheRead": 0,
+            "cacheWrite": 0
+          },
           "thinkingLevelMap": {
             "minimal": "low",
             "low": "low",
@@ -156,7 +187,53 @@
                 "omitWhenOff": true
               }
             }
+          },
+          "contextWindow": 262144,
+          "maxTokens": 262144,
+          "samplingParams": {
+            "temperature": 1,
+            "top_p": 0.95,
+            "top_k": 20,
+            "repetition_penalty": 1
+          },
+          "samplingParamsByThinkingLevel": {
+            "off": {
+              "temperature": 0.7,
+              "top_p": 0.8
+            }
           }
+        },
+        {
+          "id": "Qwen3.8-27B-oQ4e-mtp",
+          "name": "Qwen3.8-27B oQ4e + MTP (M5 Max)",
+          "reasoning": true,
+          "input": [
+            "text",
+            "image"
+          ],
+          "thinkingLevelMap": {
+            "minimal": "low",
+            "low": "low",
+            "medium": "medium",
+            "high": "xhigh",
+            "xhigh": "xhigh",
+            "max": "xhigh"
+          },
+          "compat": {
+            "thinkingFormat": "chat-template",
+            "maxTokensField": "max_tokens",
+            "chatTemplateKwargs": {
+              "enable_thinking": {
+                "$var": "thinking.enabled"
+              },
+              "preserve_thinking": true,
+              "reasoning_effort": {
+                "$var": "thinking.effort",
+                "omitWhenOff": true
+              }
+            }
+          },
+          "contextWindow": 262144
         }
       ]
     },
@@ -238,89 +315,14 @@
       "modelOverrides": {
         "accounts/fireworks/models/deepseek-v4-flash-0731": {
           "name": "DeepSeek v4 Flash"
+        },
+        "accounts/fireworks/models/deepseek-v4p1-flash-1017": {
+          "name": "DeepSeek v4.1 Flash 1017"
+        },
+        "accounts/fireworks/models/ember-1": {
+          "name": "Ember-1"
         }
       }
-    },
-    "m5-omlx": {
-      "baseUrl": "http://127.0.0.1:8033/v1",
-      "api": "openai-completions",
-      "models": [
-        {
-          "id": "Qwen3.8-27B-Uncen-oQ4e",
-          "name": "Qwen3.8-27B Uncensored oQ4e + MTP (M5 Max)",
-          "reasoning": true,
-          "input": [
-            "text",
-            "image"
-          ],
-          "cost": {
-            "input": 0,
-            "output": 0,
-            "cacheRead": 0,
-            "cacheWrite": 0
-          },
-          "thinkingLevelMap": {
-            "minimal": "low",
-            "low": "low",
-            "medium": "medium",
-            "high": "xhigh",
-            "xhigh": "xhigh",
-            "max": "xhigh"
-          },
-          "compat": {
-            "thinkingFormat": "chat-template",
-            "maxTokensField": "max_tokens",
-            "chatTemplateKwargs": {
-              "enable_thinking": {
-                "$var": "thinking.enabled"
-              },
-              "preserve_thinking": true,
-              "reasoning_effort": {
-                "$var": "thinking.effort",
-                "omitWhenOff": true
-              }
-            }
-          },
-          "contextWindow": 262144,
-          "maxTokens": 262144,
-          "samplingParams": {
-            "temperature": 1.0,
-            "top_p": 0.95,
-            "top_k": 20,
-            "repetition_penalty": 1.0
-          },
-          "samplingParamsByThinkingLevel": {
-            "off": {
-              "temperature": 0.7,
-              "top_p": 0.8
-            }
-          }
-        },
-        {
-          "id": "Qwen3.8-27B-oQ4e-mtp",
-          "name": "Qwen3.8-27B oQ4e + MTP (M5 Max)",
-          "reasoning": true,
-          "input": ["text", "image"],
-          "thinkingLevelMap": {
-            "minimal": "low",
-            "low": "low",
-            "medium": "medium",
-            "high": "xhigh",
-            "xhigh": "xhigh",
-            "max": "xhigh"
-          },
-          "compat": {
-            "thinkingFormat": "chat-template",
-            "maxTokensField": "max_tokens",
-            "chatTemplateKwargs": {
-              "enable_thinking": {"$var": "thinking.enabled"},
-              "preserve_thinking": true,
-              "reasoning_effort": {"$var": "thinking.effort", "omitWhenOff": true}
-            }
-          },
-          "contextWindow": 262144
-        }
-      ]
     }
   }
 }
