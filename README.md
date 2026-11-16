@@ -124,6 +124,7 @@ dot-agents/
   skills/find-skills/             -> ~/.agents/skills/find-skills   (symlinked)
 plugins/                          -> ~/.pi/agent/plugins   (git submodules)
   pi-subagents/  pi-advisor-subagent/  pi-todo/  pi-smart-compaction/  pi-codex-goal/
+  pi-vcc/
 pi-bolt/                          -> ~/.pi/agent/pi-bolt-bundles
   rebuild.sh / rebuild.mjs        the staleness check and bundle rebuild driver
   lib/bundle-info.mjs             fingerprint + build-info writer + shim snippet
@@ -189,11 +190,12 @@ Then: `export` any env var `models.json` references (e.g. `OMLX_API_KEY`), run
 `pi` and `/login` for the providers that machine has, and pick a default model
 with `/model`. Restart pi; `pi list` should show this repo's packages — under
 Pi-Bolt that is the npm entries, `plugins/pi-codex-goal`,
-`plugins/pi-smart-compaction` and the three `pi-bolt-bundles/…` entries, because
-`piBolt.packages` swaps `pi-subagents`, `pi-advisor-subagent` and
-`npm:pi-web-access` for their bundles and `pi-todo` for `npm:opensec-pi-todo`;
-stock pi (`PI_CONFIG_SKIP_PIBOLT=1`) lists all five `plugins/…` forks and no
-bundles. `pi-bolt compile --status` reports the compiled set.
+`plugins/pi-smart-compaction`, `plugins/pi-vcc` and the three
+`pi-bolt-bundles/…` entries, because `piBolt.packages` swaps `pi-subagents`,
+`pi-advisor-subagent` and `npm:pi-web-access` for their bundles and `pi-todo`
+for `npm:opensec-pi-todo`; stock pi (`PI_CONFIG_SKIP_PIBOLT=1`) lists all six
+`plugins/…` forks and no bundles. `pi-bolt compile --status` reports the compiled
+set.
 
 `install.sh` is idempotent, moves any file it would replace into
 `~/.pi-config-backups/<timestamp>/` (flattened, deliberately **not** next to the
@@ -546,6 +548,40 @@ Known gap: DeepSeek's docs also make Chinese public holidays off-peak all day;
 normal weekday (it over-routes to DeepInfra or IsoQuant for that day rather than
 mis-pricing).
 
+## Compaction
+
+Two plugins share this job, and they are deliberately on different halves of it:
+
+| Plugin | Decides | How |
+| --- | --- | --- |
+| `plugins/pi-smart-compaction` | **when** an idle session is worth compacting on resume | gate on idle time past the provider's cache lifetime + a context floor, then calls `ctx.compact()` |
+| `plugins/pi-vcc` | **how** every compaction is summarized | answers Pi's `session_before_compact` hook with an algorithmic, LLM-free summary, and adds `vcc_recall` over the raw session file |
+
+They compose rather than fight. Pi's `ctx.compact()` — which is all
+pi-smart-compaction calls, it has no summarizer of its own — emits
+`session_before_compact`, so a resume-time compaction gets a pi-vcc summary and
+the same 15 % floor / cache-lifetime gate as before. pi-vcc's own hook stays the
+single handler that returns a compaction; nothing else does, so Pi's
+"last handler wins" rule on that event has one candidate. No provider is listed
+in pi-vcc's `skipForProviders`, so it also compacts the automatic
+threshold/overflow case that Copilot Fusion's pre-route check hands back to Pi.
+
+Per-compaction cost falls out of this: smart-compaction still chooses *not* to
+compact a warm cache or a small context, and when it does compact, the summary
+costs no model call.
+
+`~/.pi/agent/pi-vcc-config.json` is **machine-owned** and not tracked here. It
+is created by the extension with its defaults (`overrideDefaultCompaction: true`,
+`smartKeepTail: true`, `continueAfterThresholdCompact: true`) on first load, and
+a later release only fills in keys it is missing — so a machine keeps its own
+`skipForProviders` / `trackCommands` choices across installs. Tracked config
+stays on the smart-compaction side (`dot-config/pi-smart-compaction/config.json`,
+the 15 % context floor).
+
+Commands: `/pi-vcc` compacts now (keeping the last user turn, `keep:N [prompt]`
+to choose), `/pi-vcc-recall <query>` runs the recall search as a command, and
+`/smart-compaction [force]` prints the resume gate's status or fires it.
+
 ## `/loop` — one scheduler, two execution homes
 
 `extensions/loop.ts` owns every recurring prompt in a session. It has two
@@ -655,6 +691,7 @@ node --test tests/loop.test.mjs
 | `~/.pi/agent/npm/`, `models-store.json`, `web-search-cache/` | caches |
 | `~/.pi/agent/bin/{fd,rg}` | platform-specific binaries |
 | `~/.pi/agent/trust.json`, `run-history.jsonl` | machine-local state |
+| `~/.pi/agent/pi-vcc-config.json` | pi-vcc's own compaction policy; the extension writes it with its defaults on first load |
 | `~/.pi/agent/reports/` | generated analyses of my own sessions |
 | Orca-specific extensions (`orca-*.ts`) | deliberately not shared |
 | Orca-managed skills (`orca-cli`, `orchestration`, `computer-use`) | installed and updated locally by Orca, so transferring them would fight that |

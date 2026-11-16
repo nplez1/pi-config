@@ -13,3 +13,7 @@
 [submodule "plugins/pi-codex-goal"]
 	path = plugins/pi-codex-goal
 	url = https://github.com/nplez1/pi-codex-goal.git
+[submodule "plugins/pi-vcc"]
+	path = plugins/pi-vcc
+	url = https://github.com/nplez1/pi-vcc.git
+	branch = master

@@ -12,6 +12,7 @@
     "npm:pi-mimo-provider",
     "plugins/pi-todo",
     "plugins/pi-smart-compaction",
+    "plugins/pi-vcc",
     "npm:pi-system-one@1.3.4"
   ],
   "piBolt": {
