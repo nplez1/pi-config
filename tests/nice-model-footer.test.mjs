@@ -75,6 +75,24 @@ function render({ model, branch = [], providers = 2, width = 200, thinkingLevel 
   return footerFactory({ requestRender: () => {} }, theme, footerData).render(width).join('\n');
 }
 
+test('reports provider-sourced Copilot AI Credits separately from the mixed USD total', () => {
+  const billed = (aiCredits) => ({
+    ...usage, copilotBilling: { aiCredits, totalNanoAiu: Math.round(aiCredits * 1e9) },
+    cost: { total: aiCredits / 100, totalFromProvider: true },
+  });
+  const out = render({ model: FUSION, branch: [
+    assistant('github-copilot', LUNA.id, billed(4)),
+    assistant('github-copilot', LUNA.id),
+    { type: 'compaction', usage: billed(0.25) },
+  ] });
+  assert.ok(out.includes('4.25 AIC'), out);
+  assert.ok(out.includes('$.04'), out);
+  const old = render({ model: LUNA, branch: [assistant('github-copilot', LUNA.id)] });
+  assert.ok(!old.includes('AIC'), old);
+  const free = render({ model: LUNA, branch: [assistant('github-copilot', LUNA.id, billed(0))] });
+  assert.ok(free.includes('0 AIC'), free);
+});
+
 test('cache read and write counters are gone from the stats row', () => {
   const out = render({
     model: LUNA,

@@ -293,6 +293,60 @@ reports as skipped, and
 [`probe-windows.mjs`](dot-pi/agent/extensions/fast-search/tests/probe-windows.mjs)
 proves inside the real Pi-Bolt runtime that fd/rg run there and match native.
 
+## GitHub Copilot models and billing
+
+The default `extensions/copilot.ts` extension builds on Pi's native Copilot
+provider. Keep using `/login` and the `github-copilot` model IDs. The extension
+uses the signed-in account's catalog to populate `/model` with eligible chat
+models that support Pi's transports, including IDs not yet in Pi's bundled
+catalog. It applies the reported default prompt and output budgets without
+turning on long context. If your `enabledModels` list is scoped, add new IDs to
+it as needed.
+
+Pi refreshes the catalog when opening the model picker; `/copilot-refresh`
+forces a refresh. Catalog discovery is in memory. An offline startup or a failed
+lookup falls back to existing model metadata; use `/model` after refresh for
+IDs that weren't in Pi's startup catalog. `models.json` is not rewritten.
+
+For direct Copilot and Fusion chat responses that report billing, the session
+JSONL stores `usage.copilotBilling.totalNanoAiu` and `usage.copilotBilling.aiCredits`.
+The provider amount replaces the estimate in `usage.cost.total` (USD equivalent,
+[1 AI Credit = $0.01](https://docs.github.com/en/copilot/concepts/billing/usage-based-billing-for-individuals));
+`usage.cost.totalFromProvider` is `true`. Component costs remain estimates.
+The footer's `AIC` subtotal includes reported credits only. Responses without
+billing data keep their estimates, and older logs are not backfilled. The USD
+value represents usage, not necessarily an out-of-pocket charge.
+
+```sh
+python3 tests/copilot_provider_test.py
+node --test tests/nice-model-footer.test.mjs
+```
+
+## GitHub Copilot long context
+
+The standard pi-config install includes `/long-context`. Select a direct
+`github-copilot` model and run **`/long-context`** to enable its larger context
+window immediately. No model ID, config edit, or reload is needed to switch
+modes. This is a no-op on unsupported models and other providers, including
+Copilot Fusion.
+
+The command reads the signed-in account's versioned Copilot `/models` catalog.
+It uses the `long_context` tier and the model's reported limits to set Pi's
+prompt budget with room for output, and adds `X-GitHub-Api-Version: 2026-08-01`
+to that selection's inference requests. `--list-models` still shows the
+registry's model metadata, not this session-local override. No inference
+request is sent just by running the command.
+
+Use `/long-context off` to restore the previous settings. The change applies
+only to the current model selection: selecting another model or reloading or
+resuming the session does not carry it over. No changes are written to
+`models.json`. [Larger contexts can consume more AI credits](https://github.blog/changelog/2026-06-04-larger-context-windows-and-configurable-reasoning-levels-for-github-copilot/).
+
+```sh
+bun test dot-pi/agent/extensions/shared/copilot-long-context.test.ts
+python3 tests/copilot_long_context_test.py
+```
+
 ## GitHub Copilot Fusion Standard
 
 `extensions/copilot-fusion.ts` adds **`copilot-fusion/standard`**. Select it in

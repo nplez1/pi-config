@@ -13,6 +13,7 @@ import { statSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
+import type { CopilotUsage } from "./shared/copilot-billing";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
@@ -308,16 +309,17 @@ export default function (pi: ExtensionAPI) {
 					let input = 0,
 						output = 0,
 						cost = 0;
+					let reportedCopilotCredits: number | undefined;
 					let latestCacheHitRate: number | undefined;
 					let latestHadCacheTraffic = false;
-					const addUsage = (u: {
-						input: number;
-						output: number;
-						cost: { total: number };
-					}) => {
+					const addUsage = (u: CopilotUsage) => {
 						input += u.input;
 						output += u.output;
 						cost += u.cost.total;
+						const credit = u.copilotBilling?.aiCredits;
+						if (u.cost.totalFromProvider && typeof credit === "number" && Number.isFinite(credit) && credit >= 0) {
+							reportedCopilotCredits = (reportedCopilotCredits ?? 0) + credit;
+						}
 					};
 					for (const entry of ctx.sessionManager.getEntries()) {
 						if (entry.type === "message" && entry.message.role === "assistant") {
@@ -365,6 +367,11 @@ export default function (pi: ExtensionAPI) {
 						: false;
 					if (cost || usingSubscription) {
 						statsParts.push(`${formatCost(cost)}${usingSubscription ? " (sub)" : ""}`);
+					}
+					if (reportedCopilotCredits !== undefined) {
+						const credits = reportedCopilotCredits > 0 && reportedCopilotCredits < 0.001
+							? "<0.001" : reportedCopilotCredits.toLocaleString("en-US", { maximumFractionDigits: 3 });
+						statsParts.push(`${credits} AIC`);
 					}
 
 					let contextPercentStr: string;
