@@ -61,6 +61,9 @@ interface ModelSetup {
   defaultPrompt: number;
   contextWindow: number;
   maxTokens: number;
+  // True only when the long tier is priced at or below the default tier for
+  // every token rate, so enabling it cannot raise the AI credit cost.
+  priceNeutral: boolean;
 }
 
 export function isCopilotChatModel(model: Pick<PiModel, "provider" | "api">): boolean {
@@ -91,6 +94,18 @@ function tierLimit(value: unknown): number | undefined {
   return limit(tier?.max_prompt_tokens) ?? limit(tier?.context_max);
 }
 
+function tierRates(tier: unknown): (number | undefined)[] {
+  const row = record(tier);
+  const rate = (value: unknown) => typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : undefined;
+  return [rate(row?.input_price), rate(row?.output_price), rate(row?.cache_read_price ?? row?.cache_price), rate(row?.cache_write_price)];
+}
+
+function priceNeutral(defaultTier: unknown, longTier: unknown): boolean {
+  const base = tierRates(defaultTier);
+  const long = tierRates(longTier);
+  return base.every((value, i) => value !== undefined && long[i] !== undefined && long[i]! <= value);
+}
+
 export function copilotLongContext(raw: unknown, model: PiModel, authBaseUrl?: string): ModelSetup | undefined {
   const endpoint = ENDPOINTS.get(model.api);
   if (model.provider !== COPILOT_PROVIDER || !endpoint || !isDirectCopilotEndpoint(authBaseUrl ?? model.baseUrl)) return;
@@ -106,6 +121,7 @@ export function copilotLongContext(raw: unknown, model: PiModel, authBaseUrl?: s
     if (record(capabilities?.supports)?.tool_calls === false) continue;
     const limits = record(capabilities?.limits);
     const tiers = record(record(row.billing)?.token_prices);
+    const neutral = priceNeutral(tiers?.default, tiers?.long_context);
     const defaultPrompt = tierLimit(tiers?.default);
     const longPrompt = tierLimit(tiers?.long_context);
     const prompt = limit(limits?.max_prompt_tokens);
@@ -118,6 +134,6 @@ export function copilotLongContext(raw: unknown, model: PiModel, authBaseUrl?: s
     // Honor both prompt caps, and reserve room for the request's maximum output.
     const contextWindow = Math.min(longPrompt, prompt, total - maxTokens);
     if (contextWindow <= defaultPrompt) continue;
-    return { defaultPrompt, contextWindow, maxTokens };
+    return { defaultPrompt, contextWindow, maxTokens, priceNeutral: neutral };
   }
 }

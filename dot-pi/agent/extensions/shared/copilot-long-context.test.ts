@@ -12,7 +12,31 @@ const row = {
 const setup = (entry = row, selected = model, authBase?: string) => copilotLongContext({ data: [entry] }, selected, authBase);
 
 test("selects a safe prompt budget and output cap from the catalog", () => {
-  expect(setup()).toEqual({ defaultPrompt: 200_000, contextWindow: 936_000, maxTokens: 64_000 });
+  expect(setup()).toEqual({ defaultPrompt: 200_000, contextWindow: 936_000, maxTokens: 64_000, priceNeutral: false });
+});
+
+const prices = (overrides: Record<string, number> = {}) => ({ input_price: 10, output_price: 50, cache_read_price: 1, cache_write_price: 12.5, ...overrides });
+const priced = (long: Record<string, number>, defaultOverrides: Record<string, number> = {}) => ({
+  ...row, billing: { token_prices: {
+    default: { max_prompt_tokens: 200_000, ...prices(defaultOverrides) },
+    long_context: { max_prompt_tokens: 1_000_000, ...prices(long) },
+  } },
+});
+
+test("marks long context price-neutral only when no token rate rises", () => {
+  expect(setup(priced({}))?.priceNeutral).toBe(true);
+  expect(setup(priced({ input_price: 5, output_price: 50 }))?.priceNeutral).toBe(true);
+  expect(setup(priced({ output_price: 51 }))?.priceNeutral).toBe(false);
+  expect(setup(priced({ cache_write_price: 13 }))?.priceNeutral).toBe(false);
+  expect(setup(priced({ cache_read_price: 2 }))?.priceNeutral).toBe(false);
+});
+
+test("treats missing or non-numeric prices on either tier as not price-neutral", () => {
+  const { cache_write_price: _omit, ...withoutCacheWrite } = prices();
+  expect(setup({ ...row, billing: { token_prices: { default: { max_prompt_tokens: 200_000, ...prices() }, long_context: { max_prompt_tokens: 1_000_000, ...withoutCacheWrite } } } })?.priceNeutral).toBe(false);
+  expect(setup(priced({ input_price: Number.NaN }))?.priceNeutral).toBe(false);
+  expect(setup(priced({ input_price: -1 }))?.priceNeutral).toBe(false);
+  expect(setup(priced({}, { input_price: Number.NaN }))?.priceNeutral).toBe(false);
 });
 
 test("honors the long-tier cap, the endpoint prompt cap, and a lower configured output limit", () => {

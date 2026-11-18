@@ -330,6 +330,15 @@ window immediately. No model ID, config edit, or reload is needed to switch
 modes. This is a no-op on unsupported models and other providers, including
 Copilot Fusion.
 
+Long context is the default where it costs no more: when a direct Copilot model
+is selected, when the session starts, or when you send a message (which covers
+re-selecting the same model), its catalog long-context tier is checked,
+and if every token rate is at or below the standard tier's rate, the larger
+budget is applied automatically. Models whose long tier is priced higher keep
+the standard budget until you run `/long-context`. With `--offline` or
+`PI_OFFLINE` set, the automatic check is skipped entirely, so run `/long-context`
+to enable it.
+
 The command reads the signed-in account's versioned Copilot `/models` catalog.
 It uses the `long_context` tier and the model's reported limits to set Pi's
 prompt budget with room for output, and adds `X-GitHub-Api-Version: 2026-08-01`
@@ -337,10 +346,10 @@ to that selection's inference requests. `--list-models` still shows the
 registry's model metadata, not this session-local override. No inference
 request is sent just by running the command.
 
-Use `/long-context off` to restore the previous settings. The change applies
-only to the current model selection: selecting another model or reloading or
-resuming the session does not carry it over. No changes are written to
-`models.json`. [Larger contexts can consume more AI credits](https://github.blog/changelog/2026-06-04-larger-context-windows-and-configurable-reasoning-levels-for-github-copilot/).
+Use `/long-context off` to restore the standard budget. It stays off for that
+model for the rest of the session, even if you reselect it; a reload or new
+session applies the default again. Selecting a different model applies its own
+default. No changes are written to `models.json`. [Larger contexts can consume more AI credits](https://github.blog/changelog/2026-06-04-larger-context-windows-and-configurable-reasoning-levels-for-github-copilot/).
 
 ```sh
 bun test dot-pi/agent/extensions/shared/copilot-long-context.test.ts
