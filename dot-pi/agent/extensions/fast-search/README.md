@@ -6,11 +6,11 @@ Every supported search root, including small directories and Git worktrees, is e
 
 fd enumerates a conservative candidate superset, native-compatible ignore rules are applied, and results are sorted before find limits. When no safe filename literal can be extracted, it enumerates all entries instead of narrowing the scope. Eligible grep queries include searches without a filename glob, with positive or negative globs, and with `~/` or `@` root paths. For these, rg is only a literal prefilter: Pi-Bolt's native grep performs the actual regular-expression match and formatting. Patterns without a provable required literal, uncertain cases and subprocess failures remain native. No searches are silently narrowed.
 
-There is no version gate: the compatibility rules are verified against Pi 1.4.0, 1.5.0 and 1.5.2, and any other version still gets the fast path, because every call re-checks the native shapes it reads — a changed notice, detail key or per-file result shape falls back to native for that call. Re-run the suites below after each Pi upgrade. Pi 1.5.1's grep context-line fix comes from native per-file grep, and Pi 1.5.2 asks find's candidate operation for `limit + 1` entries and decides truncation from the extra one, which the fast path returns so the result-limit notice still appears. The extension does not replace tools provided by other extensions, and it does not fingerprint Pi-Bolt, fd or rg. It uses `fd` and `rg` found on `PATH` and falls back to native on missing tools, subprocess errors or uncertain cases. `pi-config/install.sh` installs missing dependencies with Homebrew when available (`brew install fd ripgrep`); without Homebrew, install them separately. The repo's `pi-bolt/compile-exclude.txt` keeps the file shim and linked directory on disk until their bundled behavior is verified. This is not a security sandbox.
+There is no version gate: the compatibility rules are verified against Pi 1.4.0, 1.5.0 and 1.5.2, and any other version still gets the fast path, because every call re-checks the native shapes it reads — a changed notice, detail key or per-file result shape falls back to native for that call. Re-run the suites below after each Pi upgrade. Pi 1.5.1's grep context-line fix comes from native per-file grep, and Pi 1.5.2 asks find's candidate operation for `limit + 1` entries and decides truncation from the extra one, which the fast path returns so the result-limit notice still appears. The extension does not replace tools provided by other extensions, and it does not fingerprint Pi-Bolt, fd or rg. It uses `fd` and `rg` found on `PATH` and falls back to native on missing tools, subprocess errors or uncertain cases. `pi-config/install.sh` installs missing dependencies with Homebrew when available (`brew install fd ripgrep`); without Homebrew, install them separately. The repo's `pi-bolt/compile-exclude.txt` keeps the file shim and linked directory on disk until their bundled behavior is verified. The extension is discovered through the `fast-search.js` file only: the `fast-search` directory has no `index.js`, `index.ts` or manifest entry, because Pi 1.5.1 and later discover symlinked extension directories too and would otherwise load the extension twice (`tests/discovery.test.mjs` holds that). This is not a security sandbox.
 
 ## Disable or inspect
 
-Start a new process with `PI_FAST_SEARCH_BACKEND=native pi-bolt` to retain the original built-ins. Alternatively, remove the `~/.pi/agent/extensions/fast-search.js` entry-point symlink and restart; the `fast-search` directory symlink holds the supporting files and may remain. `PI_FAST_SEARCH_TRACE=1` emits only tool name and selected backend to stderr, not query text or results.
+Start a new process with `PI_FAST_SEARCH_BACKEND=native pi-bolt` to retain the original built-ins. Alternatively, remove the `~/.pi/agent/extensions/fast-search.js` entry-point symlink and restart; the `fast-search` directory symlink holds the supporting files and may remain, because only the file is a discovery entry. `PI_FAST_SEARCH_TRACE=1` emits only tool name and selected backend to stderr, not query text or results.
 
 ## Tests
 
@@ -25,6 +25,14 @@ FAST_FUZZ_SEEDS=200 python3 ~/.pi/agent/extensions/fast-search/tests/differentia
 ```
 
 The differential test uses the installed Pi-Bolt runtime, fd and rg; it intentionally fails if the supported accelerated paths did not run. The routing test forces the external candidate path on small, Git, and broad roots and compares its output to native. The tests establish bounded evidence, not proof for every filesystem or concurrent filesystem mutation.
+
+The find result-limit boundary has its own node driver, which runs on every platform and needs no python:
+
+```sh
+node ~/.pi/agent/extensions/fast-search/tests/probe-limits.mjs
+```
+
+It runs the accelerated find path directly (`forceExternal`, so no race can hide a native fallback) across trees of 1, 3 and 5 matching files and limits 0 to 6, and asserts three things per case: output is identical to native, the result-limit notice appears exactly when more than `limit` files match, and a limit below 1 defers to native. This is the boundary Pi 1.5.1 changed — native now asks a custom glob operation for `limit + 1` entries and compares against `limit`, so truncating the candidate list to exactly `limit` makes the notice vanish. A limit below 1 is clamped to 1 before that comparison, which is why the fast path leaves those limits to native.
 
 Windows ships no python, so the two in-Pi probes have a node driver that runs the
 same `executables.mjs` and `routes.mjs` harnesses inside the real Pi-Bolt runtime:

@@ -1,5 +1,5 @@
 // Executed inside Pi: an unreadable execPath must not disable the extension.
-import fastSearch from '../index.js';
+import fastSearch from '../index.mjs';
 export default pi=>{
  Object.defineProperty(process,'execPath',{value:'/nonexistent/unreadable-pi-bin',configurable:true});
  fastSearch(pi);

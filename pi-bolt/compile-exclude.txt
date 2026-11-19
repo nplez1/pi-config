@@ -27,6 +27,9 @@ juicesharp-rpiv-ask-user-question
 
 # The file shim and linked multi-file directory appear as two compile targets.
 # Load this extension from its files until bundling both targets is verified.
+# (Only the `fast-search.js` shim is a discovery entry now — the directory has no
+# index.js/index.ts so Pi 1.5.1+ does not load it twice — so a compile target list
+# may well show one entry; that is worth re-checking before the names go back.)
 #
 # fast-search is NOT installed by install.sh, and pi-bolt refuses the whole flag
 # for a name it cannot resolve (see above), so these two lines are kept out until

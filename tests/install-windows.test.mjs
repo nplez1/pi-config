@@ -74,7 +74,7 @@ function fixture(t) {
     'dot-pi/agent/subagents.json': '{}\n',
     'dot-pi/agent/pi-system-one.json': '{}\n',
     'dot-pi/agent/agents/helper.md': '# helper\n',
-    'dot-pi/agent/extensions/fast-search/index.js': '// stub\n',
+    'dot-pi/agent/extensions/fast-search/index.mjs': '// stub\n',
     'dot-pi/web-search.json': '{}\n',
     'dot-agents/skills/find-skills/SKILL.md': '# skill\n',
     'dot-config/rpiv-todo/config.json': '{}\n',
@@ -238,7 +238,7 @@ test('uninstall removes the links into the repo and leaves machine-owned files',
   // Removing a link must never reach through it.
   assert.ok(fs.existsSync(path.join(f.repo, 'dot-pi/agent/models.json')), 'uninstall must not touch the repo file');
   assert.ok(fs.existsSync(path.join(f.repo, 'plugins')), 'uninstall must not delete the repo plugins');
-  assert.ok(fs.existsSync(path.join(f.repo, 'dot-pi/agent/extensions/fast-search/index.js')),
+  assert.ok(fs.existsSync(path.join(f.repo, 'dot-pi/agent/extensions/fast-search/index.mjs')),
     'uninstall must not delete a linked directory\'s contents');
   assert.equal(fs.existsSync(path.join(f.home, '.pi/agent/extensions/fast-search')), false);
   assert.equal(fs.existsSync(path.join(f.home, '.pi/agent/plugins')), false, 'the plugins link is removed');
