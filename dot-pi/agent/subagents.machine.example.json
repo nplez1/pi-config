@@ -11,15 +11,6 @@
       "model": "claude/opus",
       "thinking": "high"
     },
-    "rpiv-advisor": {
-      "model": "claude/opus",
-      "thinking": "high",
-      "enabled": true
-    },
-    "rpiv-compressor": {
-      "model": "deepseek/deepseek-flash-auto",
-      "thinking": "low"
-    },
     "general-purpose": {
       "model": "deepseek/deepseek-flash-auto",
       "thinking": "high",

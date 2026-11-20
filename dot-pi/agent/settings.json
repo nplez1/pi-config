@@ -6,7 +6,6 @@
   "packages": [
     "npm:@juicesharp/rpiv-ask-user-question",
     "plugins/pi-subagents",
-    "plugins/pi-advisor-subagent",
     "npm:pi-web-access",
     "plugins/pi-codex-goal",
     "npm:pi-mimo-provider",
@@ -22,9 +21,7 @@
       "-plugins/pi-subagents",
       "pi-bolt-bundles/pi-bolt-subagents",
       "pi-bolt-bundles/pi-bolt-web-access",
-      "-npm:pi-web-access",
-      "-plugins/pi-advisor-subagent",
-      "pi-bolt-bundles/pi-bolt-advisor-subagent"
+      "-npm:pi-web-access"
     ],
     "packagesOverlay": true
   },

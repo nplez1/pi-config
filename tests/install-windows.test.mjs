@@ -80,7 +80,6 @@ function fixture(t) {
     'dot-config/rpiv-todo/config.json': '{}\n',
     'dot-config/pi-smart-compaction/config.json': '{}\n',
     'dot-config/pi-config/model-roles.json': '{ "opus": null }\n',
-    'dot-config/rpiv-advisor/advisor.json': '{ "guidance": "shared" }\n',
   };
   for (const [rel, body] of Object.entries(files)) {
     fs.mkdirSync(path.join(repo, path.dirname(rel)), { recursive: true });
@@ -287,15 +286,10 @@ test('capture publishes shared keys and strips the account-owned ones', { skip }
   }
 });
 
-test('capture strips the advisor model keys and rewrites bundle paths portably', { skip }, (t) => {
+test('capture rewrites bundle paths portably', { skip }, (t) => {
   const f = fixture(t);
   f.ok(f.install(), 'install');
 
-  const advisor = path.join(f.home, '.config/rpiv-advisor/advisor.json');
-  fs.writeFileSync(advisor, JSON.stringify({
-    guidance: 'live guidance', modelKey: 'a/b', compressorModelKey: 'c/d', effort: 'high',
-    disabledForModels: ['x/y'],
-  }, null, 2));
   const settings = path.join(f.home, '.pi/agent/settings.json');
   const live = JSON.parse(fs.readFileSync(settings, 'utf8'));
   fs.writeFileSync(settings, JSON.stringify({
@@ -304,11 +298,6 @@ test('capture strips the advisor model keys and rewrites bundle paths portably',
 
   f.ok(f.install(['capture']), 'capture');
 
-  const advisorSeed = JSON.parse(fs.readFileSync(path.join(f.repo, 'dot-config/rpiv-advisor/advisor.json'), 'utf8'));
-  assert.equal(advisorSeed.guidance, 'live guidance', 'shared guidance travels back');
-  for (const key of ['modelKey', 'compressorModelKey', 'effort', 'compressorEffort', 'disabledForModels']) {
-    assert.equal(key in advisorSeed, false, `${key} is machine-owned and must not be published`);
-  }
   const settingsSeed = JSON.parse(fs.readFileSync(path.join(f.repo, 'dot-pi/agent/settings.json'), 'utf8'));
   assert.deepEqual(settingsSeed.piBolt.packages, ['pi-bolt-bundles/pi-bolt-subagents'],
     'an absolute bundle path must be published relative to the checkout');

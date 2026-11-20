@@ -165,7 +165,13 @@ works.
 - The rest is CI/release plumbing (`974e34c`, `c5e2000`, `6e8dc6e`, `34e083f`,
   `aeeeb56`, `25a1941`) — ignore.
 
-## 4. pi-advisor-subagent — nothing worth merging
+## 4. pi-advisor-subagent — removed 2026-11-18
+
+> **Gone.** The plugin, its submodule, its `advisor.json` seed, its two agent
+> profiles, the `pi-bolt-advisor-subagent` bundle and every config/install
+> reference were removed the same day this audit was written: 0 of the last 34
+> days' sessions call it, and the last call was 2026-10-15. What follows is the
+> audit as written, kept for the record.
 
 We forked `rpiv-advisor` ~2.12.0 on 2026-10-02 and rebuilt the review path: the
 advice is assembled in `advisor/payload.ts` and run as a *visible pi-subagents

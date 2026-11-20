@@ -91,9 +91,9 @@ export function writeBuildInfo({
     source: {
       description: sourceDescription,
       inputs,
-      // Directories under `inputs` that are NOT part of the bundle. The advisor
-      // plugin reads its prompts live from them (see its builder), so an edit
-      // there changes behaviour without a rebuild and must not read as stale.
+      // Directories under `inputs` that are NOT part of the bundle. A builder
+      // that reads assets live from the source checkout passes them here, so an
+      // edit there changes behaviour without a rebuild and must not read as stale.
       ...(skip ? { skip } : {}),
       version: sourceVersion,
       versionFile,

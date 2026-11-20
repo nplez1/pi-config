@@ -12,7 +12,6 @@
 
   The bundle sources are:
     plugins/pi-subagents          -> pi-bolt/pi-bolt-subagents
-    plugins/pi-advisor-subagent   -> pi-bolt/pi-bolt-advisor-subagent
     ~/.pi/agent/npm/node_modules/pi-web-access
                                   -> pi-bolt/pi-bolt-web-access
 
@@ -28,7 +27,7 @@
 .EXAMPLE
   .\rebuild.ps1            # rebuild whatever is stale
   .\rebuild.ps1 -Check     # is anything stale?
-  .\rebuild.ps1 -Force     # all three, unconditionally
+  .\rebuild.ps1 -Force     # both, unconditionally
 
   .\rebuild.cmd -Force     # what to use: the default execution policy refuses .ps1
 

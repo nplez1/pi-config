@@ -34,7 +34,7 @@
 ### Resolving IDs
 
 - Resolve pi models from `enabledModels` in `~/.pi/agent/settings.json`; `models-store.json` holds the full registry. Never invent an ID.
-- **`claude/*` is the exception: it is deliberately NOT in `enabledModels`.** It names the Claude Code CLI backend rather than a model pi serves, so it never appears in the model picker or the allowlist. It IS valid everywhere a *subagent* or *workflow* model is given — agent frontmatter `model:`, the `Agent` tool's `model` parameter, `subagents.json` overrides, advisor config, and workflow steps. Use it there without adding it to `enabledModels`, and never as the *session* model (pi's own session machinery needs a registry model).
+- **`claude/*` is the exception: it is deliberately NOT in `enabledModels`.** It names the Claude Code CLI backend rather than a model pi serves, so it never appears in the model picker or the allowlist. It IS valid everywhere a *subagent* or *workflow* model is given — agent frontmatter `model:`, the `Agent` tool's `model` parameter, `subagents.json` overrides, and workflow steps. Use it there without adding it to `enabledModels`, and never as the *session* model (pi's own session machinery needs a registry model).
 - **Never pass** a bare name (`sonnet`), a shorthand (`Opus`), an empty string, or a doubled provider prefix (`fireworks/accounts/fireworks/models/...`).
 - **Never request `deepseek/deepseek-v4-pro`.** It is disabled by policy on every machine this config seeds: dropped from `enabledModels` on 2026-10-15 because orchestrators kept reading the workhorse glob and pinning general-purpose agents to it unprompted. Never as a session model, an `Agent`/`SubagentWorkflow` model, an agent frontmatter pin, or a `subagents.json` default. A machine can disable more models by listing them under `never` in the roles file — treat that list the same way, and if a prompt asks for a disabled model, say it is disabled and stop.
 - If a requested model is not enabled, say so and stop. Do not pick a lookalike.
@@ -44,7 +44,6 @@
 - Treat every `claude/*` model as expensive: it bills my Claude subscription, so ration it deliberately.
 - **Workhorse** (exploration, implementation, mechanical edits): every ID in `workhorse` and `exploration`. Named exactly as the roles file writes it, never as a provider glob (`xiaomi/*`, `deepseek/*`) — the globs also cover the more expensive pro tiers, which is what put v4-pro into subagent spawns.
 - **Expensive, planning and review only**: the `opus`, `sonnet` and `fable` roles (the Claude Code backend by default). **Review, planning, verification and unblock work defaults to `opus` at `thinking`/`effort` high** — that tier is where the judgment lives. `sonnet` is the cheaper expensive tier for work that does not need Opus. `fable` is **manual-only**: kept available for when I ask for it by name, never a default for planning, review, unblock or any automated task.
-- Advisor escalations run on the advisor's own configured model; never pay for a peer-model escalation when the session is already on an expensive one.
 
 ## Bash tool timeouts — the unit is seconds
 

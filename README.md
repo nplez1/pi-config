@@ -20,10 +20,9 @@ uses GitHub Copilot Enterprise), and pi writes the chosen model back into
 | `~/.pi/agent/settings.json` | `defaultProvider`, `defaultModel`, `enabledModels` | which providers/models this machine actually has |
 | `~/.pi/agent/subagents.json` | `agentOverrides.*.model`, `agentOverrides.*.thinking` | the model each subagent type runs on is an account fact, not a shared one |
 | `~/.config/pi-config/model-roles.json` | every ID | the provider IDs `AGENTS.md`'s shorthand (Explore/Fast, Deep/Pro, Opus/Sonnet/Fable, workhorse) resolves to |
-| `~/.config/rpiv-advisor/advisor.json` | `disabledForModels` | which executor models the advisor refuses to escalate from |
 
 Everything else — the plugin/package list, theme, tui mode, agent `.md`
-definitions, extensions, skills, `models.json`, todo/advisor **guidance** — is
+definitions, extensions, skills, `models.json`, todo **guidance** — is
 shared and symlinked, so editing it edits this repo. Which models those agents
 run on is deliberately *not* in that list: a work machine on a different account
 has to be able to retarget them without editing this repo, which is also why no
@@ -41,8 +40,8 @@ tier for work that does not need Opus.
 keep `claude/fable` one request away, but it is never a default for planning,
 review, unblock or any automated task — ask for it by name.
 
-`install.sh` **seeds** five files (copy only if absent) instead of symlinking
-them — the four above, plus `~/.pi/agent/pi-system-one.json`, which is seeded
+`install.sh` **seeds** four files (copy only if absent) instead of symlinking
+them — the three above, plus `~/.pi/agent/pi-system-one.json`, which is seeded
 because `/so` rewrites its own config — so a `/subagents` or `/model` change on
 one machine can never rewrite the other's config. When you change something
 *shared* inside those files, run:
@@ -50,16 +49,6 @@ one machine can never rewrite the other's config. When you change something
 ```sh
 ~/Code/pi-config/install.sh capture   # copies them back, stripping account keys
 ```
-
-The advisor and compressor models are **not** in `advisor.json`. They are the
-`rpiv-advisor` / `rpiv-compressor` entries in `subagents.json`'s
-`agentOverrides`, so `/subagents` is the only writer and `/advisor` only reports
-what resolved — one store cannot disagree with itself, which two files plus a
-precedence rule or a sync step eventually do. `install.sh` migrates any legacy
-`modelKey` / `compressorModelKey` / `effort` / `compressorEffort` from
-`advisor.json` into those entries once (never overwriting a value `/subagents`
-already set), then deletes them; what remains in `advisor.json` is `guidance`
-(shared) and `disabledForModels` (machine-owned).
 
 `capture` always deletes the account keys listed above before writing the seed,
 so they cannot leak into the repo. The shared keys travel back the other way
@@ -92,8 +81,7 @@ Already pulled? The old content is still in history:
 Models chosen through `/subagents` were stored in that same shared file, so they
 need the same re-apply, and the provider IDs belong in
 `~/.config/pi-config/model-roles.json` (see
-`dot-config/pi-config/model-roles.machine.example.json`). The advisor config was
-already seeded, so its `modelKey`/`effort` stay as that machine has them.
+`dot-config/pi-config/model-roles.machine.example.json`).
 
 ## Layout
 
@@ -118,13 +106,10 @@ dot-config/
   pi-config/model-roles.machine.example.json
   rpiv-todo/config.json           -> ~/.config/rpiv-todo/config.json
   pi-smart-compaction/config.json -> ~/.config/pi-smart-compaction/config.json  (15% floor)
-  rpiv-advisor/advisor.json       SEEDED   guidance shared, models local
-  rpiv-advisor/advisor.machine.example.json
 dot-agents/
   skills/find-skills/             -> ~/.agents/skills/find-skills   (symlinked)
 plugins/                          -> ~/.pi/agent/plugins   (git submodules)
-  pi-subagents/  pi-advisor-subagent/  pi-todo/  pi-smart-compaction/  pi-codex-goal/
-  pi-vcc/
+  pi-subagents/  pi-todo/  pi-smart-compaction/  pi-codex-goal/  pi-vcc/
 pi-bolt/                          -> ~/.pi/agent/pi-bolt-bundles
   rebuild.sh / rebuild.mjs        the staleness check and bundle rebuild driver
   lib/bundle-info.mjs             fingerprint + build-info writer + shim snippet
@@ -133,7 +118,7 @@ pi-bolt/                          -> ~/.pi/agent/pi-bolt-bundles
   after-update.ps1 / .cmd         the Windows half: bundles + the build input
   deps-audit.sh                   pins undici, then `npm audit fix`, in both trees
   pi-swap.sh                      the reversible `pi` -> pi-bolt switch
-  pi-bolt-subagents/  pi-bolt-web-access/  pi-bolt-advisor-subagent/
+  pi-bolt-subagents/  pi-bolt-web-access/
 ```
 
 `settings.json` refers to the forks as `plugins/<name>`, which pi resolves
@@ -190,9 +175,9 @@ Then: `export` any env var `models.json` references (e.g. `OMLX_API_KEY`), run
 `pi` and `/login` for the providers that machine has, and pick a default model
 with `/model`. Restart pi; `pi list` should show this repo's packages — under
 Pi-Bolt that is the npm entries, `plugins/pi-codex-goal`,
-`plugins/pi-smart-compaction`, `plugins/pi-vcc` and the three
-`pi-bolt-bundles/…` entries, because `piBolt.packages` swaps `pi-subagents`,
-`pi-advisor-subagent` and `npm:pi-web-access` for their bundles and `pi-todo`
+`plugins/pi-smart-compaction`, `plugins/pi-vcc` and the two
+`pi-bolt-bundles/…` entries, because `piBolt.packages` swaps `pi-subagents` and
+`npm:pi-web-access` for their bundles and `pi-todo`
 for `npm:opensec-pi-todo`; stock pi (`PI_CONFIG_SKIP_PIBOLT=1`) lists all six
 `plugins/…` forks and no bundles. `pi-bolt compile --status` reports the compiled
 set.
@@ -644,7 +629,7 @@ Four things touch compaction, and they are deliberately on different halves of i
 | `plugins/pi-codex-goal` | what a goal loop's control messages look like | filters `preparation` in the same hook, returns no compaction |
 
 `plugins/pi-todo` / `npm:opensec-pi-todo` replays its task list from the branch
-on `session_compact` and never summarizes; pi-subagents, pi-advisor-subagent,
+on `session_compact` and never summarizes; pi-subagents,
 pi-web-access, pi-system-one, rpiv-ask-user-question, `deepseek-*`, `loop` and
 `orca-*` register no compaction hook at all. The one other request-time
 `context` transform is `cache-keepalive`'s `context_with_system` hook, which Pi

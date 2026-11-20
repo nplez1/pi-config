@@ -8,13 +8,12 @@
 
     portable  linked into place. Editing the live file edits this repo.
     seeded    copied only if the target does not exist, then owned by the
-              machine. Five files are seeded, each because it holds something
+              machine. Four files are seeded, each because it holds something
               that differs per machine: settings.json (which models you have,
               the default model), subagents.json (the model and thinking level
-              each agent runs on, the advisor's included), model-roles.json
-              (the role -> provider/model ID map), advisor.json
-              (disabledForModels) and pi-system-one.json (/so rewrites it with
-              an atomic rename, which would drop the edit if it were a link).
+              each agent runs on), model-roles.json (the role -> provider/model
+              ID map) and pi-system-one.json (/so rewrites it with an atomic
+              rename, which would drop the edit if it were a link).
 
   No real file is deleted: an existing real file is moved to
   %USERPROFILE%\.pi-config-backups\<stamp>\<flattened path>, and a foreign
@@ -286,7 +285,6 @@ function Get-SeedTargets {
   $out.Add((New-Target 'dot-pi/agent/pi-system-one.json'       '.pi/agent/pi-system-one.json'))
   $out.Add((New-Target 'dot-pi/agent/subagents.json'           '.pi/agent/subagents.json'))
   $out.Add((New-Target 'dot-config/pi-config/model-roles.json' '.config/pi-config/model-roles.json'))
-  $out.Add((New-Target 'dot-config/rpiv-advisor/advisor.json'  '.config/rpiv-advisor/advisor.json'))
   return $out
 }
 
@@ -322,9 +320,6 @@ const jobs = [
     seed: path.join(repo, "dot-config/pi-config/model-roles.json"),
     strip: [],
     transform: (live) => { for (const k of Object.keys(live)) live[k] = Array.isArray(live[k]) ? [] : null; } },
-  { live: path.join(home, ".config/rpiv-advisor/advisor.json"),
-    seed: path.join(repo, "dot-config/rpiv-advisor/advisor.json"),
-    strip: ["modelKey","compressorModelKey","effort","compressorEffort","disabledForModels"] },
   { live: path.join(home, ".pi/agent/pi-system-one.json"),
     seed: path.join(repo, "dot-pi/agent/pi-system-one.json"), strip: [] }
 ];
@@ -408,7 +403,7 @@ function Invoke-Uninstall {
     } else { Write-Line 'keep' "$dst (points elsewhere: $cur)" }
   }
   Write-Output ''
-  Write-Output 'Machine-owned files (settings.json, pi-system-one.json, subagents.json, model-roles.json, advisor.json) are left in place.'
+  Write-Output 'Machine-owned files (settings.json, pi-system-one.json, subagents.json, model-roles.json) are left in place.'
 }
 
 # ------------------------------------------------------------------ main -----
@@ -562,7 +557,7 @@ if ($env:PI_CONFIG_SKIP_PIBOLT -eq '1') {
 
     # ---- bundles: the forks pi-bolt loads as prebuilt dist-bun/ ------------
     # pi-bolt's piBolt.packages points at pi-bolt-bundles/pi-bolt-subagents and
-    # pi-bolt-bundles/pi-bolt-advisor-subagent, whose package.json entries are
+    # pi-bolt-bundles/pi-bolt-web-access, whose package.json entries are
     # `./dist-bun/index.js`. That build output is gitignored and per-machine, so
     # on a machine that has never built them the extension entry does not exist
     # and the plugin silently does not load. On Unix rebuild.sh is run by the

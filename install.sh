@@ -6,14 +6,13 @@
 #
 #   portable  symlinked into place. Editing the live file edits this repo.
 #   seeded    copied only if the target does not exist, then owned by the
-#             machine. Five files are seeded, each because it holds something
+#             machine. Four files are seeded, each because it holds something
 #             that legitimately differs per machine: `settings.json` (which
 #             models you have, the default model), `subagents.json` (the model
-#             and thinking level each agent runs on — the advisor's included),
-#             `model-roles.json` (the role -> provider/model ID map),
-#             `advisor.json` (`disabledForModels`) and `pi-system-one.json`
-#             (`/so` rewrites it with an atomic rename, which would replace a
-#             symlink with a real file and silently drop the edit). Run
+#             and thinking level each agent runs on), `model-roles.json` (the
+#             role -> provider/model ID map) and `pi-system-one.json` (`/so`
+#             rewrites it with an atomic rename, which would replace a symlink
+#             with a real file and silently drop the edit). Run
 #             `./install.sh capture` to publish the non-account parts of those
 #             files back into the repo.
 #
@@ -178,8 +177,7 @@ seed_targets() {
     "dot-pi/agent/settings.json"            "$HOME/.pi/agent/settings.json" \
     "dot-pi/agent/pi-system-one.json"       "$HOME/.pi/agent/pi-system-one.json" \
     "dot-pi/agent/subagents.json"           "$HOME/.pi/agent/subagents.json" \
-    "dot-config/pi-config/model-roles.json" "$HOME/.config/pi-config/model-roles.json" \
-    "dot-config/rpiv-advisor/advisor.json"  "$HOME/.config/rpiv-advisor/advisor.json"
+    "dot-config/pi-config/model-roles.json" "$HOME/.config/pi-config/model-roles.json"
 }
 
 # ---- capture: publish the non-account parts of the seeded files --------------
@@ -233,11 +231,6 @@ const jobs = [
       }
     },
     note: "every model ID (roles kept null)",
-  },
-  {
-    live: path.join(home, ".config/rpiv-advisor/advisor.json"),
-    seed: path.join(repo, "dot-config/rpiv-advisor/advisor.json"),
-    strip: ["modelKey", "compressorModelKey", "effort", "compressorEffort", "disabledForModels"],
   },
   {
     // Seeded, not linked: /so config rewrites this file with an atomic rename,
@@ -298,7 +291,7 @@ if [ "$MODE" = "uninstall" ]; then
   unlink_one "$HOME/.pi/agent/pi-bolt-bundles"
   echo
   echo "Done ($CHANGED change(s)). Seeded files (settings.json, pi-system-one.json,"
-  echo "subagents.json, model-roles.json, advisor.json) are left in place, and \`pi\` still runs Pi-Bolt — revert that"
+  echo "subagents.json, model-roles.json) are left in place, and \`pi\` still runs Pi-Bolt — revert that"
   echo "separately with $REPO/pi-bolt/pi-swap.sh remove."
   exit 0
 fi
@@ -463,75 +456,6 @@ if (!changes.length) {
 }
 for (const c of changes) console.log(`  ${mode === "dry-run" ? "would add" : "added   "} ${c}`);
 if (mode !== "dry-run") fs.writeFileSync(livePath, JSON.stringify(live, null, 2) + "\n");
-NODE
-
-echo
-echo "Legacy advisor model keys (advisor.json -> /subagents agentOverrides):"
-node - "$HOME" "$MODE" <<'NODE'
-const fs = require("node:fs");
-const path = require("node:path");
-const home = process.argv[2];
-const mode = process.argv[3];
-const advisorPath = path.join(home, ".config/rpiv-advisor/advisor.json");
-const subagentsPath = path.join(home, ".pi/agent/subagents.json");
-
-const read = (p) => {
-  try {
-    return JSON.parse(fs.readFileSync(p, "utf-8"));
-  } catch {
-    return undefined;
-  }
-};
-const advisor = read(advisorPath);
-const subagents = read(subagentsPath);
-if (!advisor || !subagents) {
-  console.log("  ok       nothing to migrate");
-  process.exit(0);
-}
-
-// The four keys /advisor used to own. The plugin ignores them now — models live
-// in agentOverrides — so without this a machine that seeded before the move
-// would silently lose the selection it had. Copy each one in only where
-// /subagents has not already spoken: a value set in the menu is newer than the
-// file it inherited, so it wins.
-const moves = [
-  { agent: "rpiv-advisor", model: "modelKey", thinking: "effort" },
-  { agent: "rpiv-compressor", model: "compressorModelKey", thinking: "compressorEffort" },
-];
-const isPlain = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
-if (!isPlain(subagents.agentOverrides)) subagents.agentOverrides = {};
-const overrides = subagents.agentOverrides;
-const notes = [];
-for (const m of moves) {
-  const model = advisor[m.model];
-  const thinking = advisor[m.thinking];
-  if (model === undefined && thinking === undefined) continue;
-  const entry = isPlain(overrides[m.agent]) ? overrides[m.agent] : {};
-  if (model !== undefined && entry.model === undefined) {
-    entry.model = model;
-    notes.push(`agentOverrides.${m.agent}.model = ${model}`);
-  }
-  if (thinking !== undefined && entry.thinking === undefined) {
-    entry.thinking = thinking;
-    notes.push(`agentOverrides.${m.agent}.thinking = ${thinking}`);
-  }
-  overrides[m.agent] = entry;
-}
-
-const legacyKeys = ["modelKey", "effort", "compressorModelKey", "compressorEffort"];
-const present = legacyKeys.filter((k) => k in advisor);
-if (!present.length && !notes.length) {
-  console.log("  ok       nothing to migrate");
-  process.exit(0);
-}
-const wrote = notes.length > 0 || present.length > 0;
-for (const n of notes) console.log(`  ${mode === "dry-run" ? "would migrate" : "migrated    "} ${n}`);
-for (const k of present) console.log(`  ${mode === "dry-run" ? "would drop " : "dropped   "} advisor.json ${k}`);
-if (mode !== "dry-run" && wrote) {
-  if (notes.length) fs.writeFileSync(subagentsPath, JSON.stringify(subagents, null, 2) + "\n");
-  for (const k of present) delete advisor[k];
-  fs.writeFileSync(advisorPath, JSON.stringify(advisor, null, 2) + "\n");
-}
 NODE
 
 echo
@@ -780,8 +704,8 @@ Next steps:
   2. Pick a default model for this machine: `pi`, then /model.
      settings.json is machine-owned, so that choice stays local.
   3. Restart pi; `pi list` should show this repo's packages (Pi-Bolt lists
-     pi-subagents, pi-advisor-subagent and pi-web-access as pi-bolt-bundles/
-     entries, and pi-todo as npm:opensec-pi-todo).
+     pi-subagents and pi-web-access as pi-bolt-bundles/ entries, and pi-todo
+     as npm:opensec-pi-todo).
   4. `pi` now runs Pi-Bolt (pi-config/pi-bolt/README.md). `pi-real` or
      `PI_REAL=1 pi` reaches the stock launcher; revert with
      pi-config/pi-bolt/pi-swap.sh remove. Credentials are shared.

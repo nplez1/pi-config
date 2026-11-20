@@ -23,7 +23,6 @@ seeded `~/.pi/agent/settings.json` under `piBolt`, which stock `pi` ignores.
 | `opensec-pi-todo` 2.13.1 | pi-bolt only (`piBolt.packages`) |
 | `@nplez1/pi-bolt-subagents` (built here) | pi-bolt only |
 | `@nplez1/pi-bolt-web-access` (built here) | pi-bolt only |
-| `@nplez1/pi-bolt-advisor-subagent` (built here) | pi-bolt only |
 
 **Not installed: `opensec-pi-fff`.** It was dropped on 2026-10-22 because its
 extension hung on other machines; it is out of `piBolt.packages` until that is
@@ -36,11 +35,9 @@ understood. Putting it back is one line in `piBolt.packages` in the seeded
 
 Pi-Bolt shares `~/.pi/agent` with `pi`, so providers, `auth.json`, `models.json`,
 `settings.json`, sessions, `AGENTS.md`, `subagents.json`, extensions, skills and
-the advisor/todo config are inherited as-is. `opensec-pi-todo` reads the same
+the todo config are inherited as-is. `opensec-pi-todo` reads the same
 `~/.config/rpiv-todo/config.json` pi-config already symlinks, and the web-access
-bundle reads the same `~/.pi/web-search.json`. The advisor bundle reads its prompts
-live from `plugins/pi-advisor-subagent/prompts/` and its config from the same
-`~/.config/rpiv-advisor/advisor.json` pi-config symlinks.
+bundle reads the same `~/.pi/web-search.json`.
 
 ## The build variant: JIT off (the installer's default)
 
@@ -111,18 +108,16 @@ deleting the `-jit` folder is safe.
     "-plugins/pi-subagents",
     "pi-bolt-bundles/pi-bolt-subagents",
     "pi-bolt-bundles/pi-bolt-web-access",
-    "-npm:pi-web-access",
-    "-plugins/pi-advisor-subagent",
-    "pi-bolt-bundles/pi-bolt-advisor-subagent"
+    "-npm:pi-web-access"
   ],
   "packagesOverlay": true
 }
 ```
 
-So under Pi-Bolt: OpenSec's bun prebuilts replace the local todo fork, and the three
-bundles built here replace the local subagents and advisor forks and npm's
-pi-web-access. Stock `pi` still loads `plugins/pi-todo`, `plugins/pi-subagents`,
-`plugins/pi-advisor-subagent` and `npm:pi-web-access` untouched.
+So under Pi-Bolt: OpenSec's bun prebuilts replace the local todo fork, and the two
+bundles built here replace the local subagents fork and npm's pi-web-access. Stock
+`pi` still loads `plugins/pi-todo`, `plugins/pi-subagents` and `npm:pi-web-access`
+untouched.
 
 ## Results
 
@@ -155,7 +150,6 @@ Cold cost per extension, original → now:
 | `pi-web-access` | 958 ms | **12 ms** |
 | `plugins/pi-subagents` | 807 ms | **9 ms** |
 | `pi-codex-goal` | 216 ms | 0–5 ms (compiled in) |
-| `plugins/pi-advisor-subagent` | 145 ms | **2–6 ms** |
 | `@juicesharp/rpiv-ask-user-question` | 83 ms | 0–1 ms (compiled in) |
 | seven global extensions | ~115 ms | ~115 ms |
 | `opensec-pi-todo` | — | 0–3 ms |
@@ -163,7 +157,7 @@ Cold cost per extension, original → now:
 What is left is spread thin: `pi-web-access` 12 ms, `orca-prefill` 8 ms,
 `pi-codex-goal` 8 ms, `orca-agent-status` 0 ms, the rest 1–2 ms each.
 
-### Why the advisor plugin cost 41 ms for 114 KB
+### Why module count, not byte size, drives load time
 
 It looked disproportionate, so it was measured rather than assumed. The cost is per
 **module**, not per byte:
@@ -172,24 +166,28 @@ It looked disproportionate, so it was measured rather than assumed. The cost is 
 |---|---:|---:|---:|---:|
 | `extensions/orca-agent-status.ts` | **1** | **62 KB** | **0 ms** | 1 ms |
 | `extensions/model-manager.ts` | 1 | 14 KB | 0 ms | 2 ms |
-| `plugins/pi-advisor-subagent` | **22** | 114 KB | **41 ms** | 64 ms |
 | `plugins/pi-todo` (as TS) | 17 | 75 KB | — | 33 ms |
 | `plugins/pi-subagents` (as TS) | 65 | 1048 KB | — | 189 ms |
 
-A 62 KB *single* module is free; 114 KB across 22 modules is 41 ms — about 1.8 ms
-per module, the same model on Node (≈2 ms). Each module pays a jiti cache read, a
-wrapper eval in the bytecode interpreter (these were measured on the JIT-less
-build, which is where the interpreter matters), and an
-async `jitiImport(...)` for every bare import — that plugin's graph has ~42 of them.
-jiti's raw transform of those 25 files measures 2.9 ms/file, so the transpile alone
-would be 72 ms with the cache cold; warm loads trade that for per-module overhead.
+A 62 KB *single* module is free; 75 KB across 17 modules is 33 ms — about 2 ms per
+module, and the same model on `pi`. Each module pays a jiti cache read, a wrapper
+eval in the bytecode interpreter (these were measured on the JIT-less build, which
+is where the interpreter matters), and an async `jitiImport(...)` for every bare
+import. jiti's raw transform measures 2.9 ms/file, so the transpile alone would
+cost the whole graph with the cache cold; warm loads trade that for per-module
+overhead.
 
-Two other things fall out of this and were worth knowing:
+*The clearest case was a third bundle, `pi-bolt-advisor-subagent` — 22 modules,
+114 KB, 41 ms warm on Pi-Bolt against 64 ms on `pi`. It was removed on 2026-11-18
+together with the rpiv-advisor plugin it wrapped; its numbers are what pinned the
+cost to module count rather than bytes.*
 
-- **It was never a Pi-Bolt problem.** Node took 64 ms for the same extension.
-- **It is why bundling works so well.** Collapsing 22 modules into 1 and removing
-  jiti is the whole fix, which is also why the 1048 KB subagents source loads in
-  7 ms as a bundle and 189 ms as TypeScript.
+Two things fall out of this and were worth knowing:
+
+- **It is never a Pi-Bolt problem.** Node took 64 ms for the same extension.
+- **It is why bundling works so well.** Collapsing every module into one and
+  removing jiti is the whole fix, which is also why the 1048 KB subagents source
+  loads in 7 ms as a bundle and 189 ms as TypeScript.
 
 ## When extension loads regress: a `node_modules` above the agent dir
 
@@ -239,7 +237,7 @@ too. It **warns rather than fixing** — moving a directory out of someone's hom
 theirs to approve — and it does not flag `~/.pi/agent/npm/node_modules`, where the
 extensions themselves are installed and `typebox` legitimately lives.
 
-## The three bundles
+## The two bundles
 
 Both are the same trick, which is what OpenSec's own `dist-bun/` packages do: Pi
 evaluates an extension's entry through jiti, which transcribes TypeScript/ESM on
@@ -251,12 +249,12 @@ pi-bolt/   (this directory; `~/.pi/agent/pi-bolt-bundles` -> it)
   lib/bundle-info.mjs         the fingerprint + build-info writer + shim snippet
   rebuild.sh / rebuild.mjs    the pre-launch check and rebuild driver
 
-  pi-bolt-subagents/          pi-bolt-web-access/       pi-bolt-advisor-subagent/
-    package.json                package.json              package.json
-    build-info.json             build-info.json           build-info.json
-    scripts/build.mjs           scripts/build.mjs         scripts/build.mjs
-    dist-bun/index.js           dist-bun/index.js         dist-bun/index.js   the jiti shim
-    dist-bun/core.cjs           dist-bun/core.cjs         dist-bun/core.cjs   the extension, as CJS
+  pi-bolt-subagents/          pi-bolt-web-access/
+    package.json                package.json
+    build-info.json             build-info.json
+    scripts/build.mjs           scripts/build.mjs
+    dist-bun/index.js           dist-bun/index.js    the jiti shim
+    dist-bun/core.cjs           dist-bun/core.cjs    the extension, as CJS
                                 node_modules -> ~/.pi/agent/npm/node_modules
 ```
 
@@ -269,8 +267,8 @@ global that the shim populates.
 Rebuild after the source changes (or let the hook do it):
 
 ```sh
-~/Code/pi-config/pi-bolt/rebuild.sh            # all three, whatever is stale
-~/Code/pi-config/pi-bolt/rebuild.sh --force    # all three, unconditionally
+~/Code/pi-config/pi-bolt/rebuild.sh            # both, whatever is stale
+~/Code/pi-config/pi-bolt/rebuild.sh --force    # both, unconditionally
 ```
 
 Each builder also runs on its own (`bun <bundle>/scripts/build.mjs`). They read
@@ -282,31 +280,6 @@ their source and never write to it. Restart Pi-Bolt afterwards.
 |---|---|---|
 | subagents | `pi-coding-agent`, `pi-tui`, `@sinclair/typebox`, `typebox/value` | `croner`, `nanoid` — inlined |
 | web-access | `pi-coding-agent`, `pi-ai`, `pi-ai/compat`, `pi-tui`, `typebox` | 9 runtime deps — left external, via the `node_modules` symlink |
-| advisor | `pi-coding-agent`, `pi-ai`, `pi-tui`, `typebox`, `typebox/value` | `@juicesharp/rpiv-config` — inlined, so no symlink needed |
-
-### What the advisor needed that the other two did not
-
-**A module that reads assets relative to its own URL.** `advisor/prompt.ts` loads
-`../prompts/<name>` from `import.meta.url`, at module init:
-
-```ts
-export const ADVISOR_SYSTEM_PROMPT = load("advisor-system.txt");
-```
-
-so it throws on load rather than degrading if the base is wrong — and `import.meta`
-is invalid in CommonJS anyway. The builder replaces each module's `import.meta.url`
-with that module's own original file URL, which keeps the prompts resolving to the
-live `plugins/pi-advisor-subagent/prompts/`. **Prompt edits therefore take effect
-with no rebuild**, which is also why `prompts/` and `agents/` are excluded from the
-staleness fingerprint: they are not in the bundle, so they cannot make it stale.
-
-**Host detection had to change.** The web-access builder pre-scanned its entry
-file, which works because that entry is one already-bundled file. Doing the same
-here found **one** of the four host packages — the imports are spread across 22
-modules plus an inlined dependency — which would have bundled duplicate copies of
-Pi. The advisor builder instead collects host specifiers as bun resolves them
-during the build, and asserts afterwards that no `require("@earendil-works/...")`
-survived into the output.
 
 ### Two problems worth remembering
 
@@ -339,16 +312,10 @@ asserts how many call sites it rewrote so it cannot silently stop applying.
 
 ### Verification
 
-Loading is not working, so all three were exercised end to end:
+Loading is not working, so both were exercised end to end:
 
 - **subagents** — spawned a real `Explore` subagent through the bundle; it returned
   its answer, using the `xiaomi/mimo-v2.6-flash` override from `subagents.json`.
-- **advisor** — spawned a real `rpiv-compressor` subagent through the bundle (the
-  cheap model, not the `claude/opus` advisor). It returned a proper digest, which
-  exercises all 22 modules, the live prompt read, and the subagent spawn path at
-  once. The prompt URL baked into the bundle resolves to
-  `.../plugins/pi-advisor-subagent/advisor/prompt.ts`, and `../prompts/*.txt` from
-  it lands on the real files (1059 and 3577 bytes — matching the source).
 - **web-access** — `fetch_content` on `https://example.com` returns the title
   `Example Domain`, and `websearch_search` returns the same 5 results on Pi-Bolt as
   on `pi`. Note the default `readable` mode fails on this machine **identically
@@ -375,7 +342,7 @@ checks, and **nothing runs per launch**.
 ```sh
 rebuild.sh              # rebuild whatever is stale
 rebuild.sh --check      # report and exit 1 if stale; rebuild nothing
-rebuild.sh --force      # rebuild all three regardless
+rebuild.sh --force      # rebuild both regardless
 ```
 
 **"Stale" means** the fingerprint moved (file count, total bytes, newest mtime) or
@@ -595,12 +562,11 @@ Three limits bite here (see
 
 - **Only `npm:` packages compile in.** Local checkouts are passed over with
   "only npm: packages can be compiled in (a git: checkout is resolved by Pi)", so
-  `plugins/pi-subagents`, `plugins/pi-advisor-subagent` and `plugins/pi-todo`
-  never can be. (`plugins/pi-smart-compaction` is the exception that proves the
-  rule: the seeded `packages` list names it as a plain path, not a `git:` spec, so
-  pi loads it as a local package and it compiles in like any `npm:` one.) The
-  three `pi-bolt-bundles/` are passed over for a different
-  reason: they are Bun builds that load their real code from a `core.cjs`
+  `plugins/pi-subagents` and `plugins/pi-todo` never can be. (`plugins/pi-smart-compaction`
+  is the exception that proves the rule: the seeded `packages` list names it as a
+  plain path, not a `git:` spec, so pi loads it as a local package and it compiles
+  in like any `npm:` one.) The two `pi-bolt-bundles/` are passed over for a
+  different reason: they are Bun builds that load their real code from a `core.cjs`
   sibling, which a compiled executable has no file for.
 - **A module with a top-level `await` is refused**, and it fails the whole build,
   not just that extension:
@@ -693,8 +659,8 @@ yet. `plugins/pi-todo` is 1 ms because OpenSec's prebuilt already replaces it.
 **One idea not tried:** these bundles are plain CommonJS plus a shim, unlike
 OpenSec's (built for Bun, which is why those are `--pi-bolt` only). If they also
 load under Node — untested — then replacing the TypeScript source in the *shared*
-`packages` list would cut the same cost on `pi` (which pays 64 ms for the advisor
-alone, and 189 ms for subagents). Worth a look if `pi` stays in the picture.
+`packages` list would cut the same cost on `pi` (which pays 189 ms for subagents
+alone). Worth a look if `pi` stays in the picture.
 
 ## Reference clones (analysis only, safe to delete)
 
