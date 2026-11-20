@@ -87,7 +87,19 @@ export function catalogModels(
   return result;
 }
 
-export function withCopilotCatalog(base: Provider) {
+export interface CatalogSource {
+  // Reads the versioned /models response for an account. The extension supplies
+  // a shared, briefly cached reader, so this does not re-fetch what the
+  // long-context probe already read for the same account. `signal` only bounds
+  // this caller's wait; a shared request keeps running for the other callers.
+  versionedCatalog(endpoint: string, apiKey: string, force?: boolean, signal?: AbortSignal): Promise<unknown>;
+}
+
+const defaultSource: CatalogSource = {
+  versionedCatalog: (endpoint, apiKey, _force, signal) => fetchCopilotCatalog(endpoint, apiKey, undefined, { signal }),
+};
+
+export function withCopilotCatalog(base: Provider, source: CatalogSource = defaultSource) {
   let live: { fetchedAt: number; models: Map<string, Model<Api>>; credential: string } | undefined;
   // Compare credentials only in memory. Never persist an account's model visibility
   // in the account-agnostic built-in catalog store.
@@ -130,7 +142,7 @@ export function withCopilotCatalog(base: Provider) {
       if (!auth?.apiKey || !baseUrl || !endpoint || !isDirectCopilotEndpoint(endpoint)) return;
       const [raw, priced] = await Promise.all([
         fetchCopilotCatalog(endpoint, auth.apiKey, undefined, { defaultTier: true, signal: ctx.signal }),
-        fetchCopilotCatalog(endpoint, auth.apiKey, undefined, { signal: ctx.signal }).catch(() => undefined),
+        source.versionedCatalog(endpoint, auth.apiKey, ctx.force, ctx.signal).catch(() => undefined),
       ]);
       const models = catalogModels(raw, priced, base.getModels(), baseUrl);
       await ctx.publish({ update: () => { live = { fetchedAt: Date.now(), models, credential }; } });

@@ -3,6 +3,7 @@
 
 import json
 import os
+import re
 from pathlib import Path
 import select
 import shutil
@@ -13,9 +14,9 @@ import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-EXTENSION = ROOT / "dot-pi/agent/extensions/copilot-fusion.ts"
-HELPER = ROOT / "dot-pi/agent/extensions/shared/copilot-fusion-router.ts"
-AUTH_HELPER = ROOT / "dot-pi/agent/extensions/shared/copilot-fusion-auth.ts"
+EXTENSIONS = ROOT / "dot-pi/agent/extensions"
+EXTENSION = EXTENSIONS / "copilot.ts"
+SHARED = EXTENSIONS / "shared"
 FIXTURE = ROOT / "tests/fusion-compaction-fixture.ts"
 SMART = ROOT / "plugins/pi-smart-compaction/index.ts"
 # plugins/* are git submodules, and a linked worktree starts with them empty even
@@ -84,8 +85,10 @@ class FusionCompactionIntegration(unittest.TestCase):
                 start = code.index('  pi.on("session_before_compact",')
                 end = code.index('  pi.on("session_shutdown",', start)
                 code = code[:start] + code[end:]
-                code = code.replace('"./shared/copilot-fusion-router"', json.dumps(str(HELPER)))
-                code = code.replace('"./shared/copilot-fusion-auth"', json.dumps(str(AUTH_HELPER)))
+                # The extension now bundles three concerns, so repoint every
+                # helper import rather than only Fusion's two.
+                code = re.sub(r'"\./shared/([\w.-]+)"',
+                              lambda match: json.dumps(str(SHARED / match.group(1))), code)
                 source = Path(temp) / "unguarded.ts"
                 source.write_text(code)
             env = os.environ.copy()

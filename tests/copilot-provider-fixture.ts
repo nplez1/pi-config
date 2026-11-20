@@ -49,7 +49,11 @@ export default function (pi: ExtensionAPI) {
         } },
         ...(versioned ? { billing: { token_prices: { batch_size: 1_000_000,
           default: { max_prompt_tokens: 100_000, input_price: 10, output_price: 50, cache_read_price: 1, cache_write_price: 12.5 },
-          long_context: { max_prompt_tokens: 960_000, input_price: 50, output_price: 250, cache_read_price: 5, cache_write_price: 62.5 },
+          // COPILOT_FIXTURE_NEUTRAL_LONG prices the long tier like the default
+          // one, which is what makes long context the automatic choice.
+          long_context: process.env.COPILOT_FIXTURE_NEUTRAL_LONG
+            ? { max_prompt_tokens: 960_000, input_price: 10, output_price: 50, cache_read_price: 1, cache_write_price: 12.5 }
+            : { max_prompt_tokens: 960_000, input_price: 50, output_price: 250, cache_read_price: 5, cache_write_price: 62.5 },
         } } } : {}),
       })) });
     }

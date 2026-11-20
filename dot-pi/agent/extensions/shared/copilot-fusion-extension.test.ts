@@ -12,8 +12,18 @@ class FakeStream {
   result() { return this.done; }
 }
 mock.module("@earendil-works/pi-ai/compat", () => ({ createAssistantMessageEventStream: () => new FakeStream() }));
-mock.module("@earendil-works/pi-coding-agent", () => ({ getAgentDir: () => "/nonexistent-fusion-test" }));
-const { default: register } = await import("../copilot-fusion.ts");
+// The merged extension also loads the billing and catalog wrappers, which import
+// the base package; a real one is not resolvable from this repo checkout.
+mock.module("@earendil-works/pi-ai", () => ({
+  createAssistantMessageEventStream: () => new FakeStream(),
+  getModelType: (model: { api: string }) => model.api,
+  InMemoryCredentialStore: class {},
+}));
+mock.module("@earendil-works/pi-coding-agent", () => ({
+  getAgentDir: () => "/nonexistent-fusion-test",
+  ModelRuntime: { create: async () => ({ getProvider: () => undefined }) },
+}));
+const { default: register } = await import("../copilot.ts");
 const realFetch = globalThis.fetch;
 afterEach(() => { globalThis.fetch = realFetch; });
 
@@ -28,15 +38,27 @@ type TestVirtual = { contextWindow: number; route: (request: unknown, ctx: unkno
 function harness(allowed = true, physicalBaseUrl = physical.baseUrl, scopeWindow = physical.contextWindow) {
   let provider: TestProvider | undefined;
   let virtualModel: TestVirtual | undefined;
+  const providers = new Map<string, TestProvider>();
   const registrations: number[] = [];
-  const handlers: Record<string, (event: unknown, ctx: unknown) => unknown> = {};
+  const handlers: Record<string, (event: unknown, ctx: unknown) => unknown[]> = {};
   const calls: { model: unknown; context: unknown; options: Record<string, unknown> }[] = [];
+  // What a session whose Copilot provider comes from elsewhere looks like: the
+  // catalog wrapper has to keep this provider underneath its own.
+  const native = { id: "github-copilot", baseUrl: physical.baseUrl, getModels: () => [physical],
+    filterModels: (models: unknown[]) => models, refreshModelsAuth: undefined,
+    auth: { apiKey: { check: async () => ({ apiKey: "real-key" }) } },
+    streamSimple: () => new FakeStream() };
   const registry = {
     getProviderAuth: async () => ({ auth: { apiKey: "real-key", baseUrl: "https://api.business.githubcopilot.com" } }),
-    getProvider: () => ({ baseUrl: "https://api.business.githubcopilot.com" }),
+    getRegisteredNativeProvider: (id: string) => id === "github-copilot" ? native : undefined,
+    getRegisteredProviderConfig: () => undefined,
+    getProvider: () => undefined,
     getProviderAuthStatus: () => ({ configured: true }),
-    find: (_provider: string, id: string) => id === physical.id ? physical : undefined,
+    // A Fusion session still triggers the catalog refresh gate on session start.
+    refresh: async () => ({ aborted: false, errors: new Map() }),
     hasConfiguredAuth: () => true,
+    isIdle: () => true,
+    find: (_provider: string, id: string) => id === physical.id ? physical : undefined,
     getAvailable: () => [physical],
     getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "real-key", baseUrl: physicalBaseUrl }),
     streamSimple: (model: unknown, context: unknown, options: Record<string, unknown>) => {
@@ -45,14 +67,34 @@ function harness(allowed = true, physicalBaseUrl = physical.baseUrl, scopeWindow
       return { async *[Symbol.asyncIterator]() { yield { type: "done", message: answer }; }, result: async () => answer };
     },
   };
-  register({ registerProvider: (value: TestProvider) => { provider = value; },
+  const commands = new Map<string, { description: string; handler: (args: string, ctx: unknown) => Promise<void> }>();
+  register({
+    registerProvider: (value: TestProvider) => { providers.set(String((value as { id?: string }).id), value); },
     registerVirtualModel: (value: TestVirtual) => { virtualModel = value; registrations.push(value.contextWindow); },
-    on: (name: string, handler: typeof handlers[string]) => { handlers[name] = handler; } } as never);
+    registerCommand: (name: string, options: { description: string; handler: (args: string, ctx: unknown) => Promise<void> }) => {
+      commands.set(name, options);
+    },
+    on: (name: string, handler: (event: unknown, ctx: unknown) => unknown) => {
+      handlers[name] = [...(handlers[name] ?? []), handler];
+    },
+  } as never);
+  provider = providers.get("copilot-fusion");
   if (!provider || !virtualModel) throw new Error("Fusion provider or virtual model not registered");
   const ctx = { modelRegistry: registry, sessionManager: { getSessionId: () => "one" },
+    isIdle: () => true, ui: { notify() {} },
     scopedModels: allowed ? [{ model: { ...physical, contextWindow: scopeWindow } }] : [{ model: virtual }], model: virtual };
-  handlers.session_start(undefined, ctx);
-  return { provider, getVirtual: () => virtualModel!, handlers, registry, calls, registrations, ctx };
+  fire(handlers, "session_start", undefined, ctx);
+  return { provider, getVirtual: () => virtualModel!, handlers, registry, calls, registrations, commands, ctx,
+    catalog: providers.get("github-copilot"), native };
+}
+
+function fire(handlers: Record<string, ((event: unknown, ctx: unknown) => unknown)[]>, name: string, event: unknown, ctx: unknown) {
+  return (handlers[name] ?? []).map((handler) => handler(event, ctx));
+}
+
+// Only Fusion registers this event; the long-context half has no say in it.
+function compact(h: ReturnType<typeof harness>, reason: string) {
+  return fire(h.handlers, "session_before_compact", { reason }, h.ctx)[0];
 }
 
 function stubRouter(limits?: Record<string, number>) {
@@ -70,6 +112,16 @@ async function route(h: ReturnType<typeof harness>, text: string, reason = "user
 }
 
 describe("Copilot Fusion Pi provider", () => {
+  test("the catalog wraps the provider a session already serves and marks its base", () => {
+    const h = harness();
+    if (!h.catalog) throw new Error("The catalog provider was not registered");
+    expect((h.catalog as unknown as { id: string }).id).toBe("github-copilot");
+    expect((h.catalog as unknown as { refreshModelsAuth?: string }).refreshModelsAuth).toBe("credential");
+    expect((h.catalog as unknown as { getModels: () => { id: string }[] }).getModels().map((model) => model.id))
+      .toEqual([physical.id]);
+    expect((h.catalog as unknown as Record<symbol, unknown>)[Symbol.for("pi-config.copilot.catalog-base")]).toBe(h.native);
+  });
+
   test("registers the virtual model under the short Fusion/Standard name", () => {
     const h = harness();
     expect((h.getVirtual() as unknown as { name?: string }).name).toBe("Fusion/Standard");
@@ -126,9 +178,9 @@ describe("Copilot Fusion Pi provider", () => {
     await Promise.all([first.result(), second.result()]);
     expect(h.calls.map((call) => (call.options.headers as Record<string, string>)["Copilot-Session-Token"]).sort()).toEqual(["token-first", "token-second"]);
     expect(h.provider.filterModels(h.provider.getModels())).toEqual([]);
-    h.handlers.session_shutdown(undefined, h.ctx);
+    fire(h.handlers, "session_shutdown", { reason: "quit" }, h.ctx);
     expect(h.provider.getModels()).toHaveLength(1);
-    h.handlers.session_shutdown(undefined, { ...h.ctx, sessionManager: { getSessionId: () => "two" } });
+    fire(h.handlers, "session_shutdown", { reason: "quit" }, { ...h.ctx, sessionManager: { getSessionId: () => "two" } });
     expect(h.provider.getModels()).toEqual([]);
   });
 
@@ -171,7 +223,7 @@ describe("Copilot Fusion Pi provider", () => {
     expect(h.provider.getModels()).toHaveLength(1000);
     expect(h.provider.filterModels(h.provider.getModels())).toEqual([]);
     expect(JSON.stringify(h.provider.getModels())).not.toContain("secret-");
-    h.handlers.session_shutdown(undefined, h.ctx);
+    fire(h.handlers, "session_shutdown", { reason: "quit" }, h.ctx);
     expect(h.provider.getModels()).toEqual([]);
   });
 
@@ -193,7 +245,7 @@ describe("Copilot Fusion Pi provider", () => {
     stubRouter(); const h = harness();
     const [first, second] = await Promise.all([route(h, "first"), route(h, "first")]);
     expect(first.model.id).not.toBe(second.model.id);
-    const hook = () => h.handlers.session_before_compact({ reason: "threshold" }, h.ctx);
+    const hook = () => compact(h, "threshold");
     await h.provider.streamSimple(first.model, message("first"), { sessionId: "one" }).result();
     expect(hook()).toBeUndefined();
     await h.provider.streamSimple(second.model, message("first"), { sessionId: "one" }).result();
@@ -208,8 +260,8 @@ describe("Copilot Fusion Pi provider", () => {
 
   test("compacts only after the current turn has selected a model", async () => {
     stubRouter(); const h = harness();
-    const hook = (reason: string) => h.handlers.session_before_compact({ reason }, h.ctx);
-    h.handlers.input({ streamingBehavior: undefined }, h.ctx);
+    const hook = (reason: string) => compact(h, reason);
+    fire(h.handlers, "input", { streamingBehavior: undefined }, h.ctx);
     expect(hook("threshold")).toEqual({ cancel: true });
     expect(hook("overflow")).toEqual({ cancel: true });
     expect(hook("manual")).toBeUndefined();
@@ -218,19 +270,19 @@ describe("Copilot Fusion Pi provider", () => {
     expect(hook("overflow")).toBeUndefined();
     await h.provider.streamSimple(first.model, message("first"), { sessionId: "one" }).result();
     expect(hook("threshold")).toEqual({ cancel: true });
-    h.handlers.input({ streamingBehavior: "followUp" }, h.ctx);
+    fire(h.handlers, "input", { streamingBehavior: "followUp" }, h.ctx);
     expect(hook("threshold")).toEqual({ cancel: true });
     expect(hook("overflow")).toBeUndefined();
     await route(h, "second");
     expect(hook("threshold")).toBeUndefined();
-    h.handlers.agent_settled(undefined, h.ctx);
+    fire(h.handlers, "agent_settled", undefined, h.ctx);
     expect(hook("threshold")).toEqual({ cancel: true });
   });
 
   test("direct summary routes do not permit premature automatic compaction", async () => {
     stubRouter(); const h = harness();
     await route(h, "first", "direct");
-    expect(h.handlers.session_before_compact({ reason: "threshold" }, h.ctx)).toEqual({ cancel: true });
+    expect(compact(h, "threshold")).toEqual({ cancel: true });
   });
 
   test("a summary dispatch cannot consume the main request's compaction marker", async () => {
@@ -239,9 +291,9 @@ describe("Copilot Fusion Pi provider", () => {
     const summary = await route(h, "first", "direct");
     expect(summary.model.id).not.toBe(main.model.id);
     await h.provider.streamSimple(summary.model, message("first"), { sessionId: "one" }).result();
-    expect(h.handlers.session_before_compact({ reason: "threshold" }, h.ctx)).toBeUndefined();
+    expect(compact(h, "threshold")).toBeUndefined();
     await h.provider.streamSimple(main.model, message("first"), { sessionId: "one" }).result();
-    expect(h.handlers.session_before_compact({ reason: "threshold" }, h.ctx)).toEqual({ cancel: true });
+    expect(compact(h, "threshold")).toEqual({ cancel: true });
   });
 
   test("never sends a Fusion token to a different physical endpoint", async () => {

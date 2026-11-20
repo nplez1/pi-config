@@ -10,7 +10,7 @@ import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-EXTENSION = ROOT / "dot-pi/agent/extensions/copilot-fusion.ts"
+EXTENSION = ROOT / "dot-pi/agent/extensions/copilot.ts"
 
 
 @unittest.skipUnless(shutil.which("pi-bolt"), "pi-bolt is not installed")

@@ -32,9 +32,11 @@ class CopilotLongContextIntegration(unittest.TestCase):
             extensions = agent_dir / "extensions"
             extensions.mkdir()
             source = ROOT / "dot-pi/agent/extensions"
-            shutil.copyfile(source / "copilot-long-context.ts", extensions / "copilot-long-context.ts")
+            shutil.copyfile(source / "copilot.ts", extensions / "copilot.ts")
             (extensions / "shared").mkdir()
-            shutil.copyfile(source / "shared/copilot-long-context.ts", extensions / "shared/copilot-long-context.ts")
+            for module in (source / "shared").glob("copilot-*.ts"):
+                if not module.name.endswith(".test.ts"):
+                    shutil.copyfile(module, extensions / "shared" / module.name)
             model_file = agent_dir / "models.json"
             def model(id, api):
                 return {"id": id, "api": api, "contextWindow": 200_000, "maxTokens": 128_000,

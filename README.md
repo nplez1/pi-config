@@ -293,9 +293,18 @@ reports as skipped, and
 [`probe-windows.mjs`](dot-pi/agent/extensions/fast-search/tests/probe-windows.mjs)
 proves inside the real Pi-Bolt runtime that fd/rg run there and match native.
 
+## GitHub Copilot models, long context, and Fusion
+
+One plugin, `extensions/copilot.ts`, covers the account: the live catalog and
+billing on Pi's native Copilot provider, `/long-context`, and Fusion Standard.
+They are one file because they act on one account and one selected model — the
+catalog bounds a model's budget, `/long-context` raises it for the current
+selection only, and Fusion has to know when a compaction check may run at all.
+An empty or missing section below therefore still needs this one plugin.
+
 ## GitHub Copilot models and billing
 
-The default `extensions/copilot.ts` extension builds on Pi's native Copilot
+The plugin builds on Pi's native Copilot
 provider. Keep using `/login` and the `github-copilot` model IDs. The extension
 uses the signed-in account's catalog to populate `/model` with eligible chat
 models that support Pi's transports, including IDs not yet in Pi's bundled
@@ -307,6 +316,18 @@ Pi refreshes the catalog when opening the model picker; `/copilot-refresh`
 forces a refresh. Catalog discovery is in memory. An offline startup or a failed
 lookup falls back to existing model metadata; use `/model` after refresh for
 IDs that weren't in Pi's startup catalog. `models.json` is not rewritten.
+
+The catalog is laid over the provider registered for `github-copilot` on the
+session's first start, rather than replacing it, and `models.json` still applies
+above the result. That registration happens before `/long-context` picks its
+clone, because Pi re-reads the selected model from the registry whenever a
+provider is registered. Another extension that serves Copilot through a
+provider configuration keeps working, layered over the catalog, and a `/reload`
+unwraps to the provider this plugin originally wrapped instead of nesting
+another layer. One versioned `/models` read is shared between the provider's
+priced tiers and the `/long-context` probe for five minutes, so a selection no
+longer sends the same request twice; `/long-context` and `/copilot-refresh`
+always re-read it.
 
 For direct Copilot and Fusion chat responses that report billing, the session
 JSONL stores `usage.copilotBilling.totalNanoAiu` and `usage.copilotBilling.aiCredits`.
@@ -358,7 +379,7 @@ python3 tests/copilot_long_context_test.py
 
 ## GitHub Copilot Fusion Standard
 
-`extensions/copilot-fusion.ts` adds **`copilot-fusion/standard`**. Select it in
+The same plugin adds **`copilot-fusion/standard`**. Select it in
 `/model` or start Pi with `--model copilot-fusion/standard`; keep your existing
 `github-copilot` login. Pi runs its own tools and streams the model GitHub
 selects, with the Fusion routing token passed only in that request's headers.
@@ -619,7 +640,7 @@ Four things touch compaction, and they are deliberately on different halves of i
 | --- | --- | --- |
 | `plugins/pi-vcc` | **how** every compaction is summarized | returns a compaction from `session_before_compact`; adds `vcc_recall` over the raw session file |
 | `plugins/pi-smart-compaction` | **when** an idle session is worth compacting on resume | `input` gate + `ctx.compact()`; no summarizer of its own |
-| `dot-pi/agent/extensions/copilot-fusion.ts` | whether a pre-route check may compact at all | returns `{cancel}` on a `fusion/standard` session before a model was routed; manual `/compact` passes through |
+| `dot-pi/agent/extensions/copilot.ts` | whether a pre-route check may compact at all | returns `{cancel}` on a `fusion/standard` session before a model was routed; manual `/compact` passes through |
 | `plugins/pi-codex-goal` | what a goal loop's control messages look like | filters `preparation` in the same hook, returns no compaction |
 
 `plugins/pi-todo` / `npm:opensec-pi-todo` replays its task list from the branch
