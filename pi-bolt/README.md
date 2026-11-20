@@ -165,7 +165,7 @@ It looked disproportionate, so it was measured rather than assumed. The cost is 
 | extension | modules | size | warm, Pi-Bolt | warm, `pi` |
 |---|---:|---:|---:|---:|
 | `extensions/orca-agent-status.ts` | **1** | **62 KB** | **0 ms** | 1 ms |
-| `extensions/model-manager.ts` | 1 | 14 KB | 0 ms | 2 ms |
+| `extensions/model-manager.ts` | 1 | 19 KB | 0 ms | 2 ms |
 | `plugins/pi-todo` (as TS) | 17 | 75 KB | — | 33 ms |
 | `plugins/pi-subagents` (as TS) | 65 | 1048 KB | — | 189 ms |
 

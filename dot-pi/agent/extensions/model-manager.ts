@@ -10,20 +10,25 @@
  *  - Enable/disable -> ~/.pi/agent/settings.json (enabledModels patterns)
  *
  * Both files are read fresh on every invocation, so multiple edits in one
- * session never clobber each other. Structural changes (names, scope) are
- * picked up by pi at next startup.
+ * session never clobber each other, and both are pushed into the *running*
+ * session so `/model` and Ctrl+P agree with them without a restart:
+ *  - names:    `ctx.modelRegistry.refresh()` re-reads models.json;
+ *  - scope:    the session's model scope is rewritten in place (see
+ *              applyLiveScope — pi has no extension API for this).
+ * When either push is not possible, the edit still lands on disk and the
+ * notice says a restart is needed.
  *
  * Usage: /model-manager
  * Keys in the model list: space / d = toggle enable, enter = actions, esc = back
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { DynamicBorder } from "@earendil-works/pi-coding-agent";
 import { Container, type SelectItem, SelectList, Text } from "@earendil-works/pi-tui";
 import { readFile, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { Model } from "@earendil-works/pi-ai";
+import type { Api, Model } from "@earendil-works/pi-ai";
 
 const CFG_DIR = join(homedir(), ".pi", "agent");
 const SETTINGS_PATH = join(CFG_DIR, "settings.json");
@@ -106,6 +111,105 @@ interface ManagerState {
   settings: AnyJson;
   fullIds: Map<string, Model>;
   activeId: string | null;
+  /** `--models` on the command line also scopes the session; see applyLiveScope. */
+  cliScoped: boolean;
+}
+
+/** A session-scope entry, as `ctx.scopedModels` holds it. */
+type LiveScopedModel = { model: Model<Api>; thinkingLevel?: string };
+
+function modelKey(model: Model<Api>): string {
+  return `${model.provider}/${model.id}`;
+}
+
+/** Models the current patterns enable. `null` = every model is in scope. */
+function enabledModels(state: ManagerState): Model<Api>[] | null {
+  const all = [...state.fullIds.values()];
+  if (state.patterns.length === 0) return null;
+  const enabled = all.filter((model) =>
+    isModelEnabled(modelKey(model), model.id, state.patterns)
+  );
+  // An allowlist that happens to name everything means the same as no allowlist.
+  return enabled.length === all.length ? null : enabled;
+}
+
+/**
+ * Rewrite the running session's model scope in place.
+ *
+ * pi resolves `enabledModels` once, at startup, into the session's scope — the
+ * list `/model` and Ctrl+P use — and the extension API exposes no setter for
+ * it. The array it does hand us (`ctx.scopedModels`) *is* that scope array,
+ * though (`getScopedModels: () => this._scopedModels` on the session), so
+ * replacing its contents is the one way to re-scope a live session.
+ *
+ * Every step is guarded and verified: a pi that starts copying or freezing the
+ * array makes this report "restart" rather than break the command, and a
+ * `--models` CLI scope is left alone (the session was scoped deliberately, and
+ * settings are not the authority for it).
+ *
+ * Returns "live" when the session now matches settings, "restart" otherwise.
+ */
+function applyLiveScope(
+  ctx: ExtensionCommandContext,
+  state: ManagerState
+): "live" | "restart" {
+  if (state.cliScoped) return "restart";
+
+  let scope: LiveScopedModel[];
+  try {
+    scope = ctx.scopedModels as unknown as LiveScopedModel[];
+  } catch {
+    return "restart";
+  }
+  if (!Array.isArray(scope) || Object.isFrozen(scope)) return "restart";
+
+  // Keep per-model thinking levels that a pattern pinned (`provider/model:high`).
+  const levels = new Map(scope.map((entry) => [modelKey(entry.model), entry.thinkingLevel]));
+  const wanted = enabledModels(state);
+  const next: LiveScopedModel[] =
+    wanted === null
+      ? []
+      : wanted.map((model) => {
+          const thinkingLevel = levels.get(modelKey(model));
+          return thinkingLevel ? { model, thinkingLevel } : { model };
+        });
+
+  try {
+    scope.splice(0, scope.length, ...next);
+  } catch {
+    return "restart";
+  }
+
+  // Claim it only after reading the session's scope back.
+  const check = ctx.scopedModels as unknown as readonly LiveScopedModel[];
+  return check.length === next.length &&
+    check.every((entry, i) => entry.model === next[i]?.model)
+    ? "live"
+    : "restart";
+}
+
+/** Re-read models.json so `/model` shows a rename without a restart. */
+async function refreshNames(ctx: ExtensionCommandContext): Promise<boolean> {
+  try {
+    // allowNetwork: false — only the local models.json changed.
+    await ctx.modelRegistry.refresh({ allowNetwork: false });
+  } catch {
+    return false;
+  }
+  // Scope entries still point at the pre-refresh model objects; re-point them so
+  // cycling to one shows the new name too.
+  try {
+    const scope = ctx.scopedModels as unknown as LiveScopedModel[];
+    if (Array.isArray(scope) && !Object.isFrozen(scope)) {
+      for (const entry of scope) {
+        const fresh = ctx.modelRegistry.find(entry.model.provider, entry.model.id);
+        if (fresh) entry.model = fresh;
+      }
+    }
+  } catch {
+    // Names are already refreshed; the scope entries are cosmetic.
+  }
+  return true;
 }
 
 /**
@@ -154,6 +258,17 @@ async function saveSettings(state: ManagerState): Promise<void> {
   await writeJson(SETTINGS_PATH, state.settings);
 }
 
+/** Save the scope, push it into the running session, and say what happened. */
+async function commitSettings(
+  ctx: ExtensionCommandContext,
+  state: ManagerState,
+  what: string
+): Promise<void> {
+  await saveSettings(state);
+  const applied = applyLiveScope(ctx, state);
+  ctx.ui.notify(applied === "live" ? what : `${what} — restart pi to apply`, "info");
+}
+
 /** Persist models.json with the current overrides. */
 async function saveModels(state: ManagerState): Promise<void> {
   state.modelsCfg.providers = state.providers;
@@ -162,7 +277,7 @@ async function saveModels(state: ManagerState): Promise<void> {
 
 /** Generic framed SelectList dialog. Returns item.value or null. */
 function showSelect(
-  ctx: Parameters<Parameters<ExtensionAPI["registerCommand"]>[1]["handler"]>[1],
+  ctx: ExtensionCommandContext,
   title: string,
   items: SelectItem[],
   footer: string,
@@ -200,14 +315,18 @@ function showSelect(
             const handled = toggle(item);
             if (handled instanceof Promise) {
               void handled.then((h) => {
-                if (!h) {
-                  list.handleInput(data);
-                  tui.requestRender();
-                }
+                if (h) list.invalidate();
+                else list.handleInput(data);
+                tui.requestRender();
               });
               return;
             }
-            if (handled) return;
+            if (handled) {
+              // The toggle rewrote this row's label; repaint it now.
+              list.invalidate();
+              tui.requestRender();
+              return;
+            }
           }
         }
         list.handleInput(data);
@@ -233,6 +352,8 @@ export default function (pi: ExtensionAPI) {
         patterns: settings.enabledModels ? [...(settings.enabledModels as string[])] : [],
         fullIds: new Map(),
         activeId: ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : null,
+        cliScoped:
+          ctx.scopedModels.length > 0 && !(settings.enabledModels as string[] | undefined)?.length,
       };
 
       const items: SelectItem[] = models.map((model) => {
@@ -254,7 +375,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       // Toggle handler used by the space shortcut in the top-level list.
-      const handleSpaceToggle = (item: SelectItem): boolean => {
+      const handleSpaceToggle = async (item: SelectItem): Promise<boolean> => {
         const model = state.fullIds.get(item.value);
         if (!model) return false;
         const currentlyEnabled = isModelEnabled(item.value, model.id, state.patterns);
@@ -268,11 +389,11 @@ export default function (pi: ExtensionAPI) {
           item.value === state.activeId
         );
         item.description = rowDescription(model);
-        ctx.ui.notify(
-          `${nowEnabled ? "Enabled" : "Disabled"} ${model.id} (applies on next start)`,
-          "info"
+        await commitSettings(
+          ctx,
+          state,
+          `${nowEnabled ? "Enabled" : "Disabled"} ${model.id}`
         );
-        void saveSettings(state);
         return true;
       };
 
@@ -285,7 +406,7 @@ export default function (pi: ExtensionAPI) {
           handleSpaceToggle
         );
         if (!pickedValue) {
-          ctx.ui.notify("Saved. Changes take effect on next pi start.", "info");
+          ctx.ui.notify("Saved. `/model` and Ctrl+P follow these changes.", "info");
           return;
         }
 
@@ -347,7 +468,11 @@ export default function (pi: ExtensionAPI) {
             if (Object.keys(ov).length === 0) delete providerCfg.modelOverrides;
           }
           await saveModels(state);
-          ctx.ui.notify(`Renamed to "${trimmed}" (applies on next start)`, "info");
+          const live = await refreshNames(ctx);
+          ctx.ui.notify(
+            `Renamed to "${trimmed}"` + (live ? "" : " — restart pi to apply"),
+            "info"
+          );
         } else if (action === "clear-name") {
           const providerCfg = state.providers[model.provider] as AnyJson | undefined;
           const ov = providerCfg?.modelOverrides as AnyJson | undefined;
@@ -356,20 +481,21 @@ export default function (pi: ExtensionAPI) {
             if (Object.keys(ov).length === 0) delete providerCfg!.modelOverrides;
           }
           await saveModels(state);
-          ctx.ui.notify("Name cleared", "info");
+          const live = await refreshNames(ctx);
+          ctx.ui.notify("Name cleared" + (live ? "" : " — restart pi to apply"), "info");
         } else if (action === "enable" || action === "disable") {
           if (action === "disable" && fullId === state.activeId) {
             const ok = await ctx.ui.confirm(
               "Disable active model",
-              "This is the model currently in use. Disabling it will not affect this session, but it will be outside the model scope after restart."
+              "This is the model currently in use. It stays active for this session; the model list no longer offers it."
             );
             if (!ok) continue;
           }
           applyToggle(state, fullId, model, action === "enable", [...state.fullIds.keys()]);
-          await saveSettings(state);
-          ctx.ui.notify(
-            `${action === "enable" ? "Enabled" : "Disabled"} ${model.id} (applies on next start)`,
-            "info"
+          await commitSettings(
+            ctx,
+            state,
+            `${action === "enable" ? "Enabled" : "Disabled"} ${model.id}`
           );
         } else if (action === "switch") {
           const ok = await pi.setModel(model);
