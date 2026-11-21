@@ -112,7 +112,7 @@ const UNIT_WORDS: Record<string, number> = {
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
-export type LoopMode = "fixed" | "dynamic";
+export type LoopMode = "fixed" | "dynamic" | "once";
 
 export type ParsedLoop =
   | { ok: true; mode: "fixed"; prompt: string; intervalMs: number; intervalText: string }
@@ -153,6 +153,19 @@ export type LoopJob = {
    * without forgetting what it said; resuming arms a fire immediately.
    */
   paused: boolean;
+  /** Stop after this many fires; absent means repeat until cancelled or expired. */
+  maxRuns?: number;
+  /** Epoch ms after which it must not fire; absent means no stop time of its own. */
+  until?: number;
+  /**
+   * What the last fire's turn ended as.
+   *
+   * Lives on the job rather than only in the transcript because a loop that is
+   * failing every time otherwise looks identical to one that is working: `runs`
+   * climbs either way, and a caller has no other way to notice.
+   */
+  lastOutcome?: "ok" | "error";
+  lastError?: string;
   /** The reason the model gave for its last self-paced delay. */
   wakeupReason?: string;
   /** A dynamic loop gets exactly one fallback wakeup before it ends. */
@@ -181,6 +194,57 @@ export function parseIntervalToken(token: string): number | undefined {
   if (!match) return undefined;
   const ms = Number(match[1]) * UNIT_MS[match[2]];
   return ms > 0 ? ms : undefined;
+}
+
+function boundMaxRuns(value: unknown): number | undefined {
+  // `0` is how a caller says "no bound", so it normalizes to absent rather than
+  // being refused as an invalid count.
+  if (value === undefined || value === 0) return undefined;
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
+    throw new Error("`maxRuns` must be a whole number of at least 1, or 0 to clear it.");
+  }
+  return value;
+}
+
+function boundUntil(value: unknown, now: number): number | undefined {
+  if (typeof value !== "string") return undefined;
+  const text = value.trim();
+  if (!text) return undefined; // "" clears an existing stop time
+  const at = Date.parse(text);
+  if (Number.isNaN(at)) throw new Error('`until` must be an ISO timestamp, or "" to clear it.');
+  if (at <= now) throw new Error(`\`until\` ${new Date(at).toISOString()} is in the past, so the loop would never fire.`);
+  return at;
+}
+
+/**
+ * A live loop's schedule: an interval (`5m`) or a one-shot (`+10m` / ISO).
+ *
+ * Cron is refused by name rather than rounded into something else. A live loop
+ * re-enters this conversation, so a wall-clock expression spanning days would
+ * fire into a transcript nobody is watching, and the cold backend already serves
+ * that shape properly.
+ */
+export function parseLiveSchedule(
+  text: string,
+  now: number,
+): { mode: "fixed"; intervalMs: number } | { mode: "once"; fireAt: number } | undefined {
+  const token = text.trim();
+  const interval = parseIntervalToken(token);
+  // The floor is this extension's rule wherever the request comes from.
+  if (interval !== undefined) return { mode: "fixed", intervalMs: Math.max(interval, MIN_INTERVAL_MS) };
+
+  const relative = /^\+(\d+)([smhd])$/.exec(token);
+  if (relative) {
+    const fireAt = now + Number(relative[1]) * UNIT_MS[relative[2]];
+    return fireAt > now ? { mode: "once", fireAt } : undefined;
+  }
+
+  if (/^\d{4}-\d{2}-\d{2}T/.test(token)) {
+    const at = Date.parse(token);
+    return Number.isNaN(at) || at <= now ? undefined : { mode: "once", fireAt: at };
+  }
+
+  return undefined;
 }
 
 /**
@@ -531,8 +595,14 @@ export default function (pi: ExtensionAPI) {
         mode: job.mode,
         intervalMs: job.intervalMs,
         nextAt: job.nextAt,
+        fireAt: job.mode === "once" ? job.nextAt : undefined,
         runs: job.runs,
         paused: job.paused,
+        maxRuns: job.maxRuns,
+        until: job.until,
+        lastRunAt: job.lastRunAt,
+        lastOutcome: job.lastOutcome,
+        lastError: job.lastError,
       };
     }
 
@@ -561,26 +631,28 @@ export default function (pi: ExtensionAPI) {
       bus.on(LIVE_CREATE, (raw) => {
         const reply = replyChannelFor(raw, LIVE_CREATE);
         if (!reply) return;
-        const request = raw as { schedule?: unknown; prompt?: unknown } | undefined;
+        const request = raw as { schedule?: unknown; prompt?: unknown; maxRuns?: unknown; until?: unknown } | undefined;
         try {
           if (!uiCtx) throw new Error("This session has no context yet; try again once it has started.");
           const prompt = typeof request?.prompt === "string" ? request.prompt.trim() : "";
           if (!prompt) throw new Error("`prompt` is required.");
           const schedule = typeof request?.schedule === "string" ? request.schedule.trim() : "";
-          const parsed = parseIntervalToken(schedule);
-          if (parsed === undefined) {
+          const now = Date.now();
+          const shape = parseLiveSchedule(schedule, now);
+          if (shape === undefined) {
             throw new Error(
-              `"${schedule}" is not an interval. A live loop needs one of 5m / 30m / 1h / 2d — cron and one-shot schedules only exist on the cold backend.`,
+              `"${schedule}" is not a live-loop schedule. Use an interval (5m / 30m / 1h / 2d) or a one-shot (+10m or an ISO timestamp); 6-field cron exists on the cold backend only.`,
             );
           }
           if (jobs.size >= MAX_LOOPS) {
             throw new Error(`This session already has ${MAX_LOOPS} live loops; stop one before adding another.`);
           }
-          // The floor is this extension's rule, so it is applied here rather than
-          // left to the caller: a sub-minute loop is a busy-wait with extra
-          // tokens, whoever asked for it.
-          const intervalMs = Math.max(parsed, MIN_INTERVAL_MS);
-          const job = makeJob("fixed", prompt, intervalMs);
+          const job = shape.mode === "fixed" ? makeJob("fixed", prompt, shape.intervalMs) : makeJob("once", prompt);
+          // A one-shot's due instant is the whole of its schedule, so it replaces
+          // the "arm at now" that `makeJob` gives a repeat.
+          if (shape.mode === "once") job.nextAt = shape.fireAt;
+          job.maxRuns = boundMaxRuns(request?.maxRuns);
+          job.until = boundUntil(request?.until, now);
           addJob(job);
           // No `fire(job)` here, unlike the slash command: that runs between
           // turns, whereas this arrives mid-turn from a tool call. `makeJob`
@@ -589,11 +661,22 @@ export default function (pi: ExtensionAPI) {
           // that created it".
           if (uiCtx.hasUI) {
             uiCtx.ui.notify(
-              `Live loop ${job.id} armed by the model · ${formatInterval(intervalMs)} · re-enters this conversation, so each fire spends the main context · stop with /loop stop ${job.id}.`,
+              shape.mode === "once"
+                ? `Live loop ${job.id} armed by the model · fires once into this conversation, spending the main context · stop with /loop stop ${job.id}.`
+                : `Live loop ${job.id} armed by the model · ${formatInterval(shape.intervalMs)} · re-enters this conversation, so each fire spends the main context · stop with /loop stop ${job.id}.`,
               "info",
             );
           }
-          reply({ success: true, data: { id: job.id, intervalMs, nextAt: job.nextAt } });
+          reply({
+            success: true,
+            data: {
+              id: job.id,
+              mode: job.mode,
+              intervalMs: job.intervalMs,
+              nextAt: job.nextAt,
+              fireAt: job.mode === "once" ? job.nextAt : undefined,
+            },
+          });
         } catch (err) {
           reply({ success: false, error: err instanceof Error ? err.message : String(err) });
         }
@@ -618,7 +701,7 @@ export default function (pi: ExtensionAPI) {
         const reply = replyChannelFor(raw, LIVE_UPDATE);
         if (!reply) return;
         const request = raw as
-          | { jobId?: unknown; schedule?: unknown; prompt?: unknown; paused?: unknown }
+          | { jobId?: unknown; schedule?: unknown; prompt?: unknown; paused?: unknown; maxRuns?: unknown; until?: unknown }
           | undefined;
         try {
           const jobId = typeof request?.jobId === "string" ? request.jobId : "";
@@ -628,25 +711,29 @@ export default function (pi: ExtensionAPI) {
 
           if (typeof request?.schedule === "string" && request.schedule.trim()) {
             const text = request.schedule.trim();
-            const parsed = parseIntervalToken(text);
-            if (parsed === undefined) {
+            const shape = parseLiveSchedule(text, Date.now());
+            if (shape === undefined) {
               throw new Error(
-                `"${text}" is not an interval. A live loop needs one of 5m / 30m / 1h / 2d — cron and one-shot schedules only exist on the cold backend.`,
+                `"${text}" is not a live-loop schedule. Use an interval (5m / 30m / 1h / 2d) or a one-shot (+10m or an ISO timestamp); 6-field cron exists on the cold backend only.`,
               );
             }
-            // The floor is applied here for the same reason `create` applies it:
-            // a sub-minute loop is a busy-wait with extra tokens, whoever asks.
-            const intervalMs = Math.max(parsed, MIN_INTERVAL_MS);
-            // Re-sending the cadence it already has is not a change. A caller
+            // Re-sending the schedule it already has is not a change. A caller
             // that cannot tell "applied" from "no-op" will re-send and report
             // success either way, which is how a wrong update goes unnoticed.
-            if (job.mode !== "fixed" || job.intervalMs !== intervalMs) {
+            if (shape.mode === "fixed") {
               // Changing the cadence makes it a fixed loop: the caller chose the
               // rhythm, and a self-paced loop has none to keep.
-              job.mode = "fixed";
-              job.intervalMs = intervalMs;
-              if (!job.paused) job.nextAt = Date.now() + intervalMs;
-              changed.push(formatInterval(intervalMs));
+              if (job.mode !== "fixed" || job.intervalMs !== shape.intervalMs) {
+                job.mode = "fixed";
+                job.intervalMs = shape.intervalMs;
+                if (!job.paused) job.nextAt = Date.now() + shape.intervalMs;
+                changed.push(formatInterval(shape.intervalMs));
+              }
+            } else if (job.mode !== "once" || job.nextAt !== shape.fireAt) {
+              job.mode = "once";
+              job.intervalMs = undefined;
+              if (!job.paused) job.nextAt = shape.fireAt;
+              changed.push(`one-shot at ${new Date(shape.fireAt).toISOString()}`);
             }
           }
 
@@ -661,6 +748,24 @@ export default function (pi: ExtensionAPI) {
           if (typeof request?.paused === "boolean" && request.paused !== job.paused) {
             setPaused(job, request.paused);
             changed.push(request.paused ? "paused" : "resumed");
+          }
+
+          // Bounds are settable and clearable in the same call: `maxRuns: 0` and
+          // an empty `until` mean "no bound", because a loop that was given one
+          // and then told to keep going is a real request.
+          if (typeof request?.maxRuns === "number") {
+            const next = request.maxRuns === 0 ? undefined : boundMaxRuns(request.maxRuns);
+            if (next !== job.maxRuns) {
+              job.maxRuns = next;
+              changed.push(next === undefined ? "maxRuns removed" : `max ${next} runs`);
+            }
+          }
+          if (typeof request?.until === "string") {
+            const next = boundUntil(request.until, Date.now());
+            if (next !== job.until) {
+              job.until = next;
+              changed.push(next === undefined ? "until removed" : `until ${new Date(next).toISOString()}`);
+            }
           }
 
           if (changed.length === 0) {
@@ -752,10 +857,52 @@ export default function (pi: ExtensionAPI) {
     updateFooter();
   }
 
+  /**
+   * The loop whose injected prompt is the current turn's, so `turn_end` can
+   * attribute that turn's outcome to it. Cleared by the first `turn_end` it sees.
+   */
+  let pendingOutcomeId: string | undefined;
+
+  /**
+   * Record how a loop's turn ended.
+   *
+   * A live loop's fire is a normal turn, so a failing model or a broken tool call
+   * leaves no trace on the job itself: `runs` climbs whether the work succeeded
+   * or not, and a caller checking `list` cannot tell a healthy loop from one that
+   * has errored every time. The turn's own stop reason is the honest signal, and
+   * it is the only place it exists.
+   */
+  function recordOutcome(event: unknown): void {
+    const id = pendingOutcomeId;
+    if (id === undefined) return;
+    pendingOutcomeId = undefined;
+    const job = jobs.get(id);
+    if (!job) return;
+    const reason = (event as { message?: { stopReason?: unknown } } | undefined)?.message?.stopReason;
+    const failed = reason === "error" || reason === "aborted";
+    job.lastOutcome = failed ? "error" : "ok";
+    job.lastError = failed ? `turn ended: ${String(reason)}` : undefined;
+    saveLoops();
+  }
+
   /** Inject the loop's prompt as a user message. Only ever called while idle. */
   function fire(job: Job): void {
     if (job.paused) return;
     const now = Date.now();
+    // Bounds are enforced here, not only on the tick: the tick sees a job that is
+    // due, and one whose last fire used up its allowance must not get another.
+    if (job.maxRuns !== undefined && job.runs >= job.maxRuns) {
+      removeJob(job);
+      if (uiCtx?.hasUI) {
+        uiCtx.ui.notify(`Loop ended after its ${job.maxRuns} run${job.maxRuns === 1 ? "" : "s"}: "${truncate(job.prompt)}"`, "info");
+      }
+      return;
+    }
+    if (job.until !== undefined && now >= job.until) {
+      removeJob(job);
+      if (uiCtx?.hasUI) uiCtx.ui.notify(`Loop reached its stop time and ended: "${truncate(job.prompt)}"`, "info");
+      return;
+    }
     // Only a self-paced loop can carry an override, and there is at most one of
     // them, so the override never has to be matched back to a job.
     const prompt = job.mode === "dynamic" && nextPromptOverride ? nextPromptOverride : job.prompt;
@@ -763,6 +910,7 @@ export default function (pi: ExtensionAPI) {
 
     job.runs += 1;
     job.lastRunAt = now;
+    pendingOutcomeId = job.id;
     job.pending = false;
     const manual = job.manualRun === true;
     job.manualRun = false;
@@ -771,6 +919,11 @@ export default function (pi: ExtensionAPI) {
       // `run` means "also now", so the 3:20 fire of a 25m loop still happens.
       const keepArmed = manual && job.nextAt !== undefined && job.nextAt > now;
       job.nextAt = keepArmed ? job.nextAt : nextFixedRun(job.nextAt ?? now, now, job.intervalMs);
+    } else if (job.mode === "once") {
+      // Its fire is the whole schedule, so nothing is re-armed. The job is removed
+      // on the next tick, once this fire has been delivered, rather than here —
+      // this function is mid-delivery.
+      job.nextAt = undefined;
     } else {
       // A dynamic loop has no armed wakeup until the model schedules one at the
       // end of this turn; `agent_settled` is what turns that silence into either
@@ -801,6 +954,27 @@ export default function (pi: ExtensionAPI) {
       if (now >= job.expiresAt) {
         removeJob(job);
         if (uiCtx?.hasUI) uiCtx.ui.notify(`Loop expired after 7 days: "${truncate(job.prompt)}"`, "info");
+        continue;
+      }
+      // Bounds are checked before the paused skip for the same reason expiry is: a
+      // held loop must not outlive its own limits and fire once more on resume.
+      if (job.maxRuns !== undefined && job.runs >= job.maxRuns) {
+        removeJob(job);
+        if (uiCtx?.hasUI) {
+          uiCtx.ui.notify(`Loop ended after its ${job.maxRuns} run${job.maxRuns === 1 ? "" : "s"}: "${truncate(job.prompt)}"`, "info");
+        }
+        continue;
+      }
+      if (job.until !== undefined && now >= job.until) {
+        removeJob(job);
+        if (uiCtx?.hasUI) uiCtx.ui.notify(`Loop reached its stop time and ended: "${truncate(job.prompt)}"`, "info");
+        continue;
+      }
+      // A spent one-shot arms nothing, so the roster would keep reporting it as
+      // "running" forever; it goes once its fire has been delivered.
+      if (job.mode === "once" && job.runs > 0 && !job.pending) {
+        removeJob(job);
+        if (uiCtx?.hasUI) uiCtx.ui.notify(`One-shot loop fired and ended: "${truncate(job.prompt)}"`, "info");
         continue;
       }
       if (job.paused) continue;
@@ -855,6 +1029,12 @@ export default function (pi: ExtensionAPI) {
         expiresAt: job.expiresAt,
         runs: job.runs,
         paused: job.paused,
+        nextAt: job.mode === "once" ? job.nextAt : undefined,
+        maxRuns: job.maxRuns,
+        until: job.until,
+        lastRunAt: job.lastRunAt,
+        lastOutcome: job.lastOutcome,
+        lastError: job.lastError,
       })),
     };
     try {
@@ -889,21 +1069,30 @@ export default function (pi: ExtensionAPI) {
       const restored: Job = {
         id: saved.id,
         prompt: saved.prompt,
-        mode: saved.mode === "dynamic" ? "dynamic" : "fixed",
+        mode: saved.mode === "dynamic" ? "dynamic" : saved.mode === "once" ? "once" : "fixed",
         intervalMs: saved.intervalMs,
         // A paused loop comes back paused: the store records the decision, not
         // just the cadence, and re-arming it would undo what someone asked for.
+        // A one-shot comes back at the instant it was waiting for, not "now":
+        // a resume is not a reason to fire it early.
         nextAt: saved.paused
           ? undefined
           : saved.mode === "dynamic"
             ? now + FALLBACK_WAKEUP_MS
-            : now + (saved.intervalMs ?? MIN_INTERVAL_MS),
+            : saved.mode === "once"
+              ? (saved.nextAt ?? now)
+              : now + (saved.intervalMs ?? MIN_INTERVAL_MS),
         createdAt: saved.createdAt,
         expiresAt: saved.expiresAt,
         runs: saved.runs ?? 0,
         quietStreak: 0,
         pending: false,
         paused: saved.paused === true,
+        maxRuns: saved.maxRuns,
+        until: saved.until,
+        lastRunAt: saved.lastRunAt,
+        lastOutcome: saved.lastOutcome,
+        lastError: saved.lastError,
         fallbackArmed: false,
         stopped: false,
       };
@@ -934,14 +1123,28 @@ export default function (pi: ExtensionAPI) {
   }
 
   function describe(job: Job): string {
-    const cadence = job.mode === "fixed" && job.intervalMs ? formatInterval(job.intervalMs) : "self-paced";
+    const cadence =
+      job.mode === "once"
+        ? "one-shot"
+        : job.mode === "fixed" && job.intervalMs
+          ? formatInterval(job.intervalMs)
+          : "self-paced";
     const next = job.paused
       ? "paused"
       : job.nextAt === undefined
-        ? "awaiting wakeup"
+        ? job.mode === "once"
+          ? "spent"
+          : "awaiting wakeup"
         : `next in ${formatDuration(Math.max(0, job.nextAt - Date.now()))}`;
     const expiresIn = formatDuration(Math.max(0, job.expiresAt - Date.now()));
-    return `◷ ${job.id} · ${cadence} · ${next} · runs ${job.runs} · expires in ${expiresIn} · "${truncate(job.prompt)}"`;
+    const bounds = [
+      job.maxRuns !== undefined ? `max ${job.maxRuns} runs` : undefined,
+      job.until !== undefined ? `until ${new Date(job.until).toISOString()}` : undefined,
+      job.lastOutcome ? `last: ${job.lastOutcome}` : undefined,
+    ]
+      .filter(Boolean)
+      .join(" · ");
+    return `◷ ${job.id} · ${cadence} · ${next} · runs ${job.runs}${bounds ? ` · ${bounds}` : ""} · expires in ${expiresIn} · "${truncate(job.prompt)}"`;
   }
 
   /** `.pi/loop.md` (project) wins over `~/.pi/agent/loop.md` (user), like Claude. */
@@ -1250,8 +1453,9 @@ export default function (pi: ExtensionAPI) {
     updateFooter();
   });
 
-  pi.on("turn_end", async (_event, ctx) => {
+  pi.on("turn_end", async (event, ctx) => {
     uiCtx = ctx;
+    recordOutcome(event);
     drain();
   });
 
@@ -1310,6 +1514,13 @@ type PersistedLoops = {
     runs: number;
     /** Absent in stores written before pausing existed; absent means armed. */
     paused?: boolean;
+    /** A one-shot's due instant, so a resumed session restores what it was waiting for. */
+    nextAt?: number;
+    maxRuns?: number;
+    until?: number;
+    lastRunAt?: number;
+    lastOutcome?: "ok" | "error";
+    lastError?: string;
   }>;
 };
 

@@ -702,8 +702,54 @@ test('the live backend refuses a schedule it cannot honour, naming where it belo
   const reply = ask(h, LIVE_CREATE, 'r1', { schedule: '0 0 9 * * 1', prompt: 'x' });
 
   assert.equal(reply.success, false);
-  assert.match(reply.error, /not an interval/);
+  assert.match(reply.error, /not a live-loop schedule/);
   assert.match(reply.error, /cold backend/);
+  h.handlers.get('session_shutdown')();
+});
+
+test('a live loop can be a one-shot, armed at the instant it was given', async () => {
+  const h = await started();
+  const reply = ask(h, LIVE_CREATE, 'r1', { schedule: '+30m', prompt: 'check once' });
+
+  assert.equal(reply.success, true);
+  assert.equal(reply.data.mode, 'once');
+  // The due instant is the whole of its schedule, so it must be the future the
+  // caller asked for rather than "now".
+  assert.ok(reply.data.fireAt > Date.now());
+  h.handlers.get('session_shutdown')();
+});
+
+test('a bound set at create is reported, so the loop can say when it ends', async () => {
+  const h = await started();
+  const made = ask(h, LIVE_CREATE, 'r1', { schedule: '5m', prompt: 'x', maxRuns: 3 });
+  const list = ask(h, LIVE_LIST, 'r2', {});
+  const job = list.data.jobs.find((entry) => entry.id === made.data.id);
+
+  assert.equal(job.maxRuns, 3);
+  h.handlers.get('session_shutdown')();
+});
+
+test('a bound can be cleared, because keeping going is a real request', async () => {
+  const h = await started();
+  const made = ask(h, LIVE_CREATE, 'r1', { schedule: '5m', prompt: 'x', maxRuns: 2 });
+  const reply = ask(h, LIVE_UPDATE, 'r2', { jobId: made.data.id, maxRuns: 0 });
+
+  assert.equal(reply.success, true);
+  assert.ok(reply.data.changed.includes('maxRuns removed'));
+  assert.equal(reply.data.job.maxRuns, undefined);
+  h.handlers.get('session_shutdown')();
+});
+
+test('a stop time already in the past is refused rather than armed', async () => {
+  const h = await started();
+  const reply = ask(h, LIVE_CREATE, 'r1', {
+    schedule: '5m',
+    prompt: 'x',
+    until: '2020-01-01T00:00:00Z',
+  });
+
+  assert.equal(reply.success, false);
+  assert.match(reply.error, /in the past/);
   h.handlers.get('session_shutdown')();
 });
 
