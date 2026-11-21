@@ -197,6 +197,7 @@ const jobs = [
     live: path.join(home, ".pi/agent/settings.json"),
     seed: path.join(repo, "dot-pi/agent/settings.json"),
     strip: ["defaultProvider", "defaultModel", "enabledModels", "lastChangelogVersion"],
+    ownPackages: true,
   },
   {
     // Per-agent `model`/`thinking` are this machine's account choices — another
@@ -260,6 +261,27 @@ for (const job of jobs) {
   // Strip from the MERGED result, not just from live: a key the seed already
   // carries would otherwise survive the merge and be republished forever.
   for (const key of job.strip) delete merged[key];
+  // A package this machine added or removed is this machine's choice, so it must
+  // not travel: the overlay is where those live and the seed keeps the baseline.
+  // Without this, the same local edit that prompted the overlay would still reach
+  // every other machine, one capture later.
+  if (job.ownPackages) {
+    try {
+      const out = require("node:child_process").execFileSync(
+        process.execPath,
+        [path.join(repo, "scripts/settings-overlay.mjs"), "--repo", repo, "--strip"],
+        {
+          input: JSON.stringify({ packages: merged.packages ?? [], seed: seed.packages ?? [] }),
+          encoding: "utf8",
+        },
+      );
+      const stripped = JSON.parse(out);
+      merged.packages = stripped.packages;
+      for (const change of stripped.changes ?? []) console.log(`  capture  ${change}`);
+    } catch {
+      console.log("  capture  package overlay skipped (scripts/settings-overlay.mjs)");
+    }
+  }
   if (Array.isArray(merged.piBolt?.packages)) {
     merged.piBolt.packages = toPortableBundles(merged.piBolt.packages);
   }
@@ -405,6 +427,15 @@ if (!changes.length) {
 for (const c of changes) console.log(`  ${mode === "dry-run" ? "would add" : "added   "} ${c}`);
 if (mode !== "dry-run") fs.writeFileSync(livePath, JSON.stringify(live, null, 2) + "\n");
 NODE
+
+echo
+echo "This machine's settings overlay (dot-pi/agent/settings.local.json):"
+if [ -f "$REPO/scripts/settings-overlay.mjs" ]; then
+  node "$REPO/scripts/settings-overlay.mjs" --repo "$REPO" --home "$HOME" --mode "$MODE" \
+    || echo "  SKIP     overlay not applied"
+else
+  echo "  skip     no scripts/settings-overlay.mjs in this clone"
+fi
 
 echo
 echo "Shared keys in an existing subagents.json (additive; per-agent models untouched):"

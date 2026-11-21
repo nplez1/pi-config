@@ -50,6 +50,30 @@ one machine can never rewrite the other's config. When you change something
 ~/Code/pi-config/install.sh capture   # copies them back, stripping account keys
 ```
 
+**A machine's own package choices live in `dot-pi/agent/settings.local.json`.**
+The package list is shared, but not identically: a plugin that needs a provider
+one account does not have, or that a work seat refuses, has to stay at arm's
+length. Editing the seed to drop it publishes that decision to every other
+machine; leaving it only in the live file means the next `capture` publishes it
+anyway. The overlay is the gitignored home for the difference — `install.sh`
+merges it over `settings.json` *after* the shared-key sync, so it wins:
+
+```json
+{ "packages": ["npm:some-plugin@1.0.0"], "packagesRemove": ["npm:pi-system-one"] }
+```
+
+A plain object merges key by key (so `piBolt` need not be restated), anything else
+replaces what the seed had, `packages` unions by name so a machine adds without
+restating the baseline, and `packagesRemove` subtracts from it. `capture` reads
+the same file and undoes both directions before writing the seed, so neither
+choice can travel — which is the whole reason it is its own file rather than a
+convention about which keys in `settings.json` count as shared. To see what it
+would apply without touching anything:
+
+```sh
+node scripts/settings-overlay.mjs --repo . --home ~ --dry-run
+```
+
 `capture` always deletes the account keys listed above before writing the seed,
 so they cannot leak into the repo. The shared keys travel back the other way
 too: `install.sh` additively syncs them into an existing machine-owned file
@@ -742,12 +766,14 @@ infer and no reason to hand a command back to you:
 
 | action | what it does |
 | --- | --- |
-| `create` | arm a job — `schedule` + `prompt`, plus `backend` and, for cold, `name` / `subagent_type` / `model` / `thinking` / `max_turns` |
-| `list` | every job in the session, both homes, with cadence, next run, runs, paused state, agent and prompt |
-| `update` | change cadence, prompt, name, agent type, model, thinking or turn cap |
+| `create` | arm a job — `schedule` + `prompt`, plus `backend` and, for cold, `name` / `subagent_type` / `model` / `thinking` / `max_turns` / `maxRuns` / `until` / `timezone` |
+| `list` | every job in the session, both homes, with cadence, next run, runs, paused state, bounds, agent and prompt |
+| `get` | one job by id, without paying for the roster |
+| `update` | change cadence, prompt, name, agent type, model, thinking, turn cap, or the bounds |
 | `run` | fire it now, leaving its own schedule armed (an extra iteration, not a replacement) |
 | `pause` / `resume` | hold it (timer disarmed, row and history kept) / let it fire on its own cadence again |
 | `cancel` | remove it for good |
+| `pause_all` / `cancel_all` | stop everything in the session without listing it first, optionally narrowed with `backend` |
 
 Every verb works on **both** homes, because a door that can arm a job but not
 see, change or stop it is half a door — and half a door is exactly what made a
@@ -767,6 +793,18 @@ Cold is the default because it is the safe one — a wrong cold job wastes token
 a wrong live job also spends your context. Either way the job the model creates
 is the same object `/loop list` shows and `/loop stop` disarms, and `live` is
 refused cleanly (naming `/loop`) when that extension is not loaded.
+
+A repeating job can be **bounded**, which is what makes one safe to leave armed:
+`maxRuns` stops it after N fires, `until` stops it at an instant, and both are
+clearable on `update` (`maxRuns: 0`, empty `until`) because "keep going" is a
+real request and a cancel-and-recreate would lose the id and the history. A bound
+reached by a fire is applied by that fire, so the job is already disabled when
+the next caller looks. A **cron** expression also records the zone it is read in
+(the job's own `timezone`, defaulting to this machine's), because an implicit
+zone follows the machine that armed the job and slips by an hour across a DST
+change. A fire that is still running is skipped rather than stacked: scheduled
+fires bypass the concurrency queue, so a 5-minute interval whose fires take 15
+minutes would otherwise put three subagents on one prompt.
 
 The Agent tool has **no** `schedule` param and no setting adds one back: it was
 retired because it and `/loop` shared one scheduler, so the louder guideline

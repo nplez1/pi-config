@@ -598,7 +598,8 @@ That makes the compiled-in set "everything installed, minus that file", which as
 of 2026-10-24 is ten: `orca-prefill`, `orca-agent-status`,
 `pi-picker-patch-guard`, `nice-model-footer`, `model-manager`,
 `orca-titlebar-spinner`, `deepseek-pricing`, `pi-codex-goal`,
-`pi-smart-compaction`, `pi-system-one`. Excluded:
+`pi-smart-compaction`, `pi-system-one` (nine on this machine, which opts out of
+it — see below). Excluded:
 `juicesharp-rpiv-ask-user-question` (11 ms from its files instead).
 `plugins/pi-vcc` joined the set the same way `plugins/pi-smart-compaction` did
 (a plain path, not a `git:` spec), and appears in `--status` under its
@@ -620,9 +621,31 @@ every run for exactly that reason.
 
 `pi-system-one` was added 2026-10-18, pinned to `pi-system-one@1.3.4` in the
 settings `packages` list; it registers the `system_one` judge tool (Jev through
-Pi's native classifier or TypeSafe HTTP). Revert the whole thing with
-`pi-bolt compile --off`: the replaced build is kept and `pi-bolt update --rollback`
-restores it.
+Pi's native classifier or TypeSafe HTTP). **This machine dropped it on
+2026-11-20**, so the set above is nine here: nothing on this account can answer
+a `system_one` call. `mode: "auto"` routes through Pi's native classifier, which
+`pi-system-one`'s own `src/provider.ts` pins to `typesafe/jev-latest` — there is
+no `/login typesafe`
+here and no `TYPESAFE_API_KEY`, so every call died with "Pi native classifier
+failed". The only classifier the account lists is
+`github-copilot/microsoft-decision-1`, and it refuses too
+(`model_not_available_for_integrator "vscode-chat"` from `classify()`, and
+"not authorized to use this Copilot feature" from the endpoint directly), so
+this is an account limit, not a misconfiguration.
+
+The removal is **machine-local**, which is what `dot-pi/agent/settings.local.json`
+is for: `{ "packagesRemove": ["npm:pi-system-one"] }` keeps it out of this
+machine's `packages` without taking it off anyone else's list. The seed still
+ships `npm:pi-system-one@1.3.4`, so a personal box that can reach TypeSafe gets
+the tool by default — a decision that belongs to the machine, not to the shared
+config. This machine additionally needs `pi remove npm:pi-system-one` plus
+`pi-bolt compile` so the extension leaves the binary. That last step is why the
+overlay is not enough on its own: `install.sh` and `install.ps1` additively re-add
+every `packages` entry the seed still lists, so a local `pi remove` comes back on
+the next install — which is how it kept getting re-enabled.
+
+Revert the whole thing with `pi-bolt compile --off`: the replaced build is kept
+and `pi-bolt update --rollback` restores it.
 
 Compiling in works on the `-jit` build too, and keeps the JIT: verified 2026-10-19
 by building to a throwaway `--out` directory and probing `bun:ffi`'s `dlopen` from

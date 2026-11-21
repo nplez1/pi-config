@@ -303,7 +303,8 @@ const home = os.homedir();
 const jobs = [
   { live: path.join(home, ".pi/agent/settings.json"),
     seed: path.join(repo, "dot-pi/agent/settings.json"),
-    strip: ["defaultProvider","defaultModel","enabledModels","lastChangelogVersion"] },
+    strip: ["defaultProvider","defaultModel","enabledModels","lastChangelogVersion"],
+    ownPackages: true },
   { live: path.join(home, ".pi/agent/subagents.json"),
     seed: path.join(repo, "dot-pi/agent/subagents.json"),
     strip: [],
@@ -335,6 +336,20 @@ for (const job of jobs) {
   if (typeof job.transform === "function") job.transform(live);
   const merged = { ...seed, ...live };
   for (const key of job.strip) delete merged[key];
+  if (job.ownPackages) {
+    try {
+      const out = require("node:child_process").execFileSync(
+        process.execPath,
+        [path.join(repo, "scripts/settings-overlay.mjs"), "--repo", repo, "--strip"],
+        { input: JSON.stringify({ packages: merged.packages ?? [], seed: seed.packages ?? [] }),
+          encoding: "utf8" });
+      const stripped = JSON.parse(out);
+      merged.packages = stripped.packages;
+      for (const change of stripped.changes ?? []) console.log(`  capture  ${change}`);
+    } catch {
+      console.log("  capture  package overlay skipped (scripts/settings-overlay.mjs)");
+    }
+  }
   if (Array.isArray(merged.piBolt?.packages)) merged.piBolt.packages = toPortableBundles(merged.piBolt.packages);
   fs.writeFileSync(job.seed, JSON.stringify(merged, null, 2) + "\n");
   console.log(`  wrote    ${job.seed}`);
@@ -432,6 +447,17 @@ Write-Output ''
 Write-Output 'Machine-owned files (seeded once):'
 foreach ($pair in (Get-SeedTargets)) {
   Invoke-Seed $pair.Rel (Join-Path $HomeDir ($pair.Target -replace '/', '\'))
+}
+
+Write-Output ''
+Write-Output "This machine's settings overlay (dot-pi/agent/settings.local.json):"
+$overlayScript = Join-Path $Repo 'scripts/settings-overlay.mjs'
+if (Test-Path -LiteralPath $overlayScript) {
+  $overlayArgs = @($overlayScript, '--repo', $Repo, '--home', $HomeDir)
+  if ($Mode -eq 'dry-run') { $overlayArgs += '--dry-run' }
+  & node @overlayArgs
+} else {
+  Write-Line 'skip' 'no scripts/settings-overlay.mjs in this clone'
 }
 
 Write-Output ''

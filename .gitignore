@@ -16,3 +16,7 @@ pi-bolt/*/dist-bun/
 pi-bolt/*/build-info.json
 pi-bolt/.pi-swap-state
 pi-bolt/*/node_modules
+
+# This machine's own settings (packages it can run, providers it has).
+# Merged over dot-pi/agent/settings.json by install.sh; never published.
+dot-pi/agent/settings.local.json
