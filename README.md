@@ -407,8 +407,27 @@ python3 tests/fusion_auth_test.py
 python3 tests/fusion_compaction_test.py
 node --test tests/nice-model-footer.test.mjs
 node --test tests/loop.test.mjs
+node --test tests/continue.test.mjs
 (cd plugins/pi-smart-compaction && npm test)
 ```
+
+## `/continue` — resume a stopped session without sending anything
+
+`extensions/continue.ts`. After a dropped connection, a killed terminal, or a
+run that stopped mid-work, `/continue` runs the model on the transcript as it
+stands. No text is added to the context.
+
+Pi has no public call to start a run from an existing transcript, so the command
+appends a hidden, empty custom message (`continue-run`) and triggers a turn. A
+`context` handler removes that marker from every request. It also omits an
+interrupted tail the way pi's auto-retry does: an errored or aborted reply, or
+tool calls with no result, along with the results after them. The command
+refuses when the agent is busy, when the session is empty, or when the last
+reply already finished (`stop` / `length`), since nothing is pending then.
+
+Limit: a session killed mid-tool-call can leave an unpaired tool call in the
+transcript. `/continue` omits it for its own request, but later turns send it
+as pi does today, which some providers reject.
 
 ## DeepSeek V4.1 Flash provider routing
 
