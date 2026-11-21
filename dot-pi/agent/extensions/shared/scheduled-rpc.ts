@@ -44,6 +44,8 @@ export const RPC_REMOVE = "subagents:rpc:schedules:remove";
  */
 export const LIVE_CREATE = "loop:rpc:schedules:create";
 export const LIVE_LIST = "loop:rpc:schedules:list";
+export const LIVE_UPDATE = "loop:rpc:schedules:update";
+export const LIVE_RUN = "loop:rpc:schedules:run";
 export const LIVE_REMOVE = "loop:rpc:schedules:remove";
 
 /** Scheduler lifecycle events on the same bus. */

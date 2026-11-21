@@ -637,13 +637,15 @@ test('an expired persisted loop is not restored', async () => {
 // ── The live backend's RPC surface ──────────────────────────────────────────
 //
 // The model reaches live loops through pi-subagents' `manage_schedules` →
-// `backend: "live"`, which lands on these three channels. The literals are
+// `backend: "live"`, which lands on these five channels. The literals are
 // hardcoded here on purpose: they are the wire contract with
 // `plugins/pi-subagents/src/schedule-live-rpc.ts`, and a test that imported the
 // constant would pass even after both sides were renamed apart.
 
 const LIVE_CREATE = 'loop:rpc:schedules:create';
 const LIVE_LIST = 'loop:rpc:schedules:list';
+const LIVE_UPDATE = 'loop:rpc:schedules:update';
+const LIVE_RUN = 'loop:rpc:schedules:run';
 const LIVE_REMOVE = 'loop:rpc:schedules:remove';
 
 /** The reply a channel answered with, or undefined when it stayed silent. */
@@ -677,6 +679,10 @@ test('a model-created live loop is armed, and the user is told what it costs', a
   assert.ok(
     h.notices.some((n) => n.message.includes('armed by the model') && n.message.includes('main context')),
     'the user is told a live loop appeared and that it costs main context'
+  );
+  assert.ok(
+    h.notices.some((n) => n.message.includes('· every 5m ·')),
+    'and the cadence reads once, not "every every 5m"'
   );
   h.handlers.get('session_shutdown')();
 });
@@ -765,5 +771,230 @@ test('a session with no event bus registers no live channels, and still works', 
   // Nothing to emit on; the point is that wiring is a no-op rather than a crash.
   await run(h, '5m check the deploy');
   assert.deepEqual(h.sent, ['check the deploy']);
+  h.handlers.get('session_shutdown')();
+});
+
+// ── The same channels cover the whole lifecycle ─────────────────────────────
+//
+// A model that can arm a loop but cannot change, pause or fire it has half a
+// door, and a half door is what makes a model tell the user to type a command.
+// Every verb answers with the job's own view, so a caller never has to re-list
+// to learn what its own call did.
+
+test('update moves the cadence, and the countdown restarts from the new one', async () => {
+  const h = await started();
+  const created = ask(h, LIVE_CREATE, 'r1', { schedule: '5m', prompt: 'check the deploy' });
+
+  const updated = ask(h, LIVE_UPDATE, 'r2', { jobId: created.data.id, schedule: '25m' });
+
+  assert.equal(updated.success, true);
+  assert.equal(updated.data.job.intervalMs, 1_500_000);
+  // A list, and exactly the cadence: `formatInterval` already says "every", so a
+  // caller repeating that string back to the user would stutter ("every every
+  // 25m"), and one shape for "what changed" keeps both backends aligned.
+  assert.deepEqual(updated.data.changed, ['every 25m']);
+  assert.match(h.statuses.get('loop'), /next in 25m/);
+  h.handlers.get('session_shutdown')();
+});
+
+test('update replaces the text a loop will fire', async () => {
+  const h = await started();
+  const created = ask(h, LIVE_CREATE, 'r1', { schedule: '5m', prompt: 'old text' });
+
+  ask(h, LIVE_UPDATE, 'r2', { jobId: created.data.id, prompt: 'Still alive.' });
+
+  assert.equal(ask(h, LIVE_LIST, 'r3').data.jobs[0].prompt, 'Still alive.');
+  ask(h, LIVE_RUN, 'r4', { jobId: created.data.id });
+  h.handlers.get('turn_end')({}, h.ctx);
+  assert.deepEqual(h.sent, ['Still alive.']);
+  h.handlers.get('session_shutdown')();
+});
+
+test('pause unarms a loop without forgetting it, and the footer says why it is quiet', async () => {
+  const h = await started();
+  const created = ask(h, LIVE_CREATE, 'r1', { schedule: '5m', prompt: 'check the deploy' });
+
+  const paused = ask(h, LIVE_UPDATE, 'r2', { jobId: created.data.id, paused: true });
+
+  assert.equal(paused.success, true);
+  assert.equal(paused.data.job.paused, true);
+  assert.equal(paused.data.job.nextAt, undefined, 'nothing armed');
+  assert.equal(h.statuses.get('loop'), '◷ 1 loop · paused');
+  assert.deepEqual(h.sent, []);
+  h.handlers.get('session_shutdown')();
+});
+
+test('resume re-arms the cadence, and run is how it fires now', async () => {
+  const h = await started();
+  const created = ask(h, LIVE_CREATE, 'r1', { schedule: '5m', prompt: 'Still alive.' });
+  ask(h, LIVE_UPDATE, 'r2', { jobId: created.data.id, paused: true });
+
+  const resumed = ask(h, LIVE_UPDATE, 'r3', { jobId: created.data.id, paused: false });
+
+  assert.equal(resumed.data.job.paused, false);
+  assert.match(h.statuses.get('loop'), /next in 5m/);
+  // Resume means "let it run again", not "run it now" — otherwise the two homes
+  // would need two meanings for the same word, and the cold one cannot fire on
+  // resume at all (its timer restarts one interval out).
+  h.handlers.get('turn_end')({}, h.ctx);
+  assert.deepEqual(h.sent, []);
+
+  ask(h, LIVE_RUN, 'r4', { jobId: created.data.id });
+  h.handlers.get('turn_end')({}, h.ctx);
+  assert.deepEqual(h.sent, ['Still alive.']);
+  h.handlers.get('session_shutdown')();
+});
+
+test('run-now queues the fire for the next idle window instead of steering this turn', async () => {
+  const h = await started();
+  const created = ask(h, LIVE_CREATE, 'r1', { schedule: '25m', prompt: 'Still alive.' });
+
+  const ran = ask(h, LIVE_RUN, 'r2', { jobId: created.data.id });
+  assert.equal(ran.success, true);
+  assert.equal(ran.data.queuedForNextIdle, true);
+  assert.deepEqual(h.sent, [], 'nothing injected while the asking turn is in flight');
+
+  h.ctx.isIdle = () => false;
+  h.handlers.get('turn_end')({}, h.ctx);
+  assert.deepEqual(h.sent, [], 'still mid-turn');
+
+  h.ctx.isIdle = () => true;
+  h.handlers.get('turn_end')({}, h.ctx);
+  assert.deepEqual(h.sent, ['Still alive.']);
+  h.handlers.get('session_shutdown')();
+});
+
+test('a paused loop cannot be run, and says which verb comes first', async () => {
+  const h = await started();
+  const created = ask(h, LIVE_CREATE, 'r1', { schedule: '5m', prompt: 'x' });
+  ask(h, LIVE_UPDATE, 'r2', { jobId: created.data.id, paused: true });
+
+  const ran = ask(h, LIVE_RUN, 'r3', { jobId: created.data.id });
+
+  assert.equal(ran.success, false);
+  assert.match(ran.error, /is paused\. Resume it first/);
+  assert.deepEqual(h.sent, []);
+  h.handlers.get('session_shutdown')();
+});
+
+test('an update that changes nothing is an error, not a silent success', async () => {
+  const h = await started();
+  const created = ask(h, LIVE_CREATE, 'r1', { schedule: '5m', prompt: 'x' });
+
+  const empty = ask(h, LIVE_UPDATE, 'r2', { jobId: created.data.id });
+  assert.equal(empty.success, false);
+  assert.match(empty.error, /Nothing changed/);
+
+  // Re-sending the cadence it already has is nothing too: a caller that cannot
+  // tell "applied" from "no-op" will report a change that never happened.
+  const same = ask(h, LIVE_UPDATE, 'r3', { jobId: created.data.id, schedule: '5m' });
+  assert.equal(same.success, false);
+  assert.match(same.error, /Nothing changed/);
+  h.handlers.get('session_shutdown')();
+});
+
+test('update and run name the id they could not find instead of failing silently', async () => {
+  const h = await started();
+  assert.match(ask(h, LIVE_UPDATE, 'r1', { jobId: 'nope', schedule: '5m' }).error, /No live loop with id "nope"/);
+  assert.match(ask(h, LIVE_RUN, 'r2', { jobId: 'nope' }).error, /No live loop with id "nope"/);
+  h.handlers.get('session_shutdown')();
+});
+
+test('a paused loop comes back paused from the session store', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-loop-paused-'));
+  const sessionId = 'session-paused';
+  fs.mkdirSync(path.join(dir, '.pi', 'loops'), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, '.pi', 'loops', `${sessionId}.json`),
+    JSON.stringify({
+      version: 1,
+      loops: [
+        {
+          id: 'held',
+          prompt: 'check the deploy',
+          mode: 'fixed',
+          intervalMs: 300_000,
+          createdAt: Date.now() - 60_000,
+          expiresAt: Date.now() + 86_400_000,
+          runs: 2,
+          paused: true,
+        },
+      ],
+    })
+  );
+
+  const h = harness({ cwd: dir, sessionId });
+  await h.handlers.get('session_start')({}, h.ctx);
+
+  // Restoring a paused loop must not resume it: the store recorded a decision,
+  // and a session restart is not a request to undo it.
+  assert.equal(h.statuses.get('loop'), '◷ 1 loop · paused');
+  assert.deepEqual(h.sent, []);
+  h.handlers.get('session_shutdown')();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('a paused self-paced loop is not settled away, and gains no fallback wakeup', async () => {
+  const h = await started();
+  await run(h, 'check the deploy');            // self-paced: fires immediately
+  const id = /Loop (\S+) armed/.exec(h.notices.at(-1).message)?.[1];
+
+  ask(h, LIVE_UPDATE, 'r1', { jobId: id, paused: true });
+  h.sent.length = 0;
+
+  // A settle is what turns a silent dynamic turn into a grace wakeup or the end
+  // of the loop. A paused loop was told to stop, so it must get neither: no
+  // countdown for a loop that cannot fire, and no ending of a loop only held.
+  h.handlers.get('agent_settled')({}, h.ctx);
+  h.handlers.get('agent_settled')({}, h.ctx);
+
+  assert.equal(h.statuses.get('loop'), '◷ 1 loop · paused');
+  assert.equal(ask(h, LIVE_LIST, 'r2').data.jobs[0].paused, true);
+  h.handlers.get('session_shutdown')();
+});
+
+test('a paused cold job reads as paused, not as one mid-fire', async () => {
+  const h = harness();
+  await h.handlers.get('session_start')({}, h.ctx);
+  // Announced the way the scheduler announces a restored job: `enabled: false`
+  // travels with it, because a paused row is a fact and not an absence.
+  h.bus.emit('subagents:scheduled', { type: 'added', job: coldJob({ enabled: false, nextRun: undefined }) });
+  assert.equal(h.statuses.get('loop'), '◷ 1 job · paused');
+  h.handlers.get('session_shutdown')();
+});
+
+test('run-now is an extra iteration, so the armed slot still fires', async () => {
+  const h = await started();
+  const created = ask(h, LIVE_CREATE, 'r1', { schedule: '25m', prompt: 'Still alive.' });
+
+  // Push the armed slot into the future, then fire by hand: without the
+  // manual-run flag, `nextFixedRun` would advance from this fire and swallow the
+  // 25m slot entirely.
+  ask(h, LIVE_UPDATE, 'r2', { jobId: created.data.id, schedule: '30m' });
+  ask(h, LIVE_RUN, 'r3', { jobId: created.data.id });
+  h.handlers.get('turn_end')({}, h.ctx);
+  assert.deepEqual(h.sent, ['Still alive.']);
+
+  const after = ask(h, LIVE_LIST, 'r4').data.jobs[0];
+  const remaining = after.nextAt - Date.now();
+  assert.ok(
+    remaining > 24 * 60_000 && remaining <= 30 * 60_000,
+    `the 30m slot must survive a manual fire, got ${Math.round(remaining / 60000)}m`
+  );
+  h.handlers.get('session_shutdown')();
+});
+
+test('ScheduleWakeup cannot pace a paused loop back to life', async () => {
+  const h = await started();
+  await run(h, 'check the deploy');
+  const id = /Loop (\S+) armed/.exec(h.notices.at(-1).message)?.[1];
+  ask(h, LIVE_UPDATE, 'r1', { jobId: id, paused: true });
+
+  const result = await tool(h).execute('call-1', { delaySeconds: 600, reason: 'keep going' });
+
+  assert.match(result.content[0].text, /is paused/);
+  assert.match(result.content[0].text, /action: "resume"/);
+  assert.equal(ask(h, LIVE_LIST, 'r2').data.jobs[0].nextAt, undefined);
+  assert.equal(h.statuses.get('loop'), '◷ 1 loop · paused');
   h.handlers.get('session_shutdown')();
 });

@@ -710,48 +710,80 @@ live tick look nearly free.
 /loop list · /loop stop [id|all] both backends; cold rows are tagged [cold]
 ```
 
-The Agent tool has **no** `schedule` param, and no setting adds one back.
-Recurring work has exactly two doors, one per audience: the user types `/loop`,
-the model calls `manage_schedules`. A job created through either is the same
-object in the same store, so `/loop list` shows what the model scheduled and the
-model can cancel what you started. The Agent param was retired because it and
-`/loop` shared one scheduler — the louder guideline decided where a job landed,
-and a job created from a turn ended up somewhere the user was not looking.
+Recurring work has exactly **two doors — one per audience**, and neither one is
+the other's job:
 
-`manage_schedules` takes `create` (a `schedule` and a `prompt`, plus a
-`backend` and, for cold jobs, optional `name`, `subagent_type`, `model`,
-`thinking`, `max_turns`), `list`, and `cancel` with a job id. `list` and
-`cancel` cover **both** backends, and `create` picks one:
+| audience | door | what it covers |
+| --- | --- | --- |
+| you | `/loop` | arm/list/stop, and `--cold` to pick the execution home |
+| the model | `manage_schedules` | the whole lifecycle, both homes |
+
+The model's door is one tool with one verb per intent, so there is nothing to
+infer and no reason to hand a command back to you:
+
+| action | what it does |
+| --- | --- |
+| `create` | arm a job — `schedule` + `prompt`, plus `backend` and, for cold, `name` / `subagent_type` / `model` / `thinking` / `max_turns` |
+| `list` | every job in the session, both homes, with cadence, next run, runs, paused state, agent and prompt |
+| `update` | change cadence, prompt, name, agent type, model, thinking or turn cap |
+| `run` | fire it now, leaving its own schedule armed (an extra iteration, not a replacement) |
+| `pause` / `resume` | hold it (timer disarmed, row and history kept) / let it fire on its own cadence again |
+| `cancel` | remove it for good |
+
+Every verb works on **both** homes, because a door that can arm a job but not
+see, change or stop it is half a door — and half a door is exactly what made a
+model narrate `/loop` commands at the user instead of acting. `create` picks a
+home:
 
 - `backend: "cold"` (the default) — a job in pi-subagents' scheduler; each fire
   spawns a fresh subagent session. Cheap in this conversation: nothing is added
-  to your transcript.
+  to your transcript, and the result arrives as a notification.
 - `backend: "live"` — a loop in `/loop`'s own table; each fire re-enters **this**
   session as a user message, inheriting the conversation, model and tools. It
   pays for the whole transcript every fire and leaves its own turns behind, so
-  it is the one to use when you asked for the repeat to happen *here*, and not
-  something to arm off a vague "monitor X".
+  it is the one to use when the repeat has to happen *here*, and not something
+  to arm off a vague "monitor X".
 
 Cold is the default because it is the safe one — a wrong cold job wastes tokens,
-a wrong live job also spends your context. Either way a job the model creates is
-the same object `/loop list` shows and `/loop stop` disarms, and `live` is refused
-cleanly (naming `/loop`) when that extension is not loaded.
+a wrong live job also spends your context. Either way the job the model creates
+is the same object `/loop list` shows and `/loop stop` disarms, and `live` is
+refused cleanly (naming `/loop`) when that extension is not loaded.
 
-The two backends are reached the same way: live loops arm an in-process timer,
-cold ones go over the `subagents:rpc:schedules:{list,create,remove}` channels
-(`plugins/pi-subagents/src/schedule-rpc.ts`). The scheduler announces restored
-and changed jobs on `subagents:scheduled`, which is how `/loop` mirrors them
-without knowing where the scheduler keeps its store. The live backend runs the
-mirror image of that wiring — `loop:rpc:schedules:{list,create,remove}`, served
-by `loop.ts` and called from `plugins/pi-subagents/src/schedule-live-rpc.ts` —
-because live jobs are a closure inside `loop.ts` and nothing else can add to
-them.
+The Agent tool has **no** `schedule` param and no setting adds one back: it was
+retired because it and `/loop` shared one scheduler, so the louder guideline
+decided where a job landed and a job created from a turn ended up somewhere the
+user was not looking — with no model-side way to list or cancel it. A stale
+caller that still sends `schedule` is answered with `manage_schedules` by name
+rather than silently spawning an agent now.
+
+The two homes are reached differently, because they live in different processes'
+worth of state. A **cold** job is in pi-subagents' own scheduler, so the model's
+tool calls it in-process; other extensions reach it over
+`subagents:rpc:schedules:{list,create,remove}`
+(`plugins/pi-subagents/src/schedule-rpc.ts`). A **live** loop is a closure inside
+`loop.ts`, so the tool reaches it over the bus —
+`loop:rpc:schedules:{list,create,update,run,remove}`, served by `loop.ts` and
+called from `plugins/pi-subagents/src/schedule-live-rpc.ts`. The scheduler
+announces restored and changed jobs on `subagents:scheduled`, which is how
+`/loop` mirrors them without knowing where the scheduler keeps its store.
+
+Both sides refuse a call that changes nothing, so "did it work?" is answerable
+rather than assumed; `run` never fires inside the turn that asked for it; and a
+cold fire that fails synchronously is reported as a failure instead of as a run
+that started.
 
 Self-paced mode is driven by the `ScheduleWakeup` tool, which the model calls at
 the end of each turn with `delaySeconds` (clamped to `[60, 3600]`), a `reason`,
 and `noop` for a tick that changed nothing. A turn that ends without scheduling
-one gets a single 20-minute grace wakeup; a second silent turn ends the loop.
-It is live-only: a cold loop has no session to pace itself in.
+one gets a single 20-minute grace wakeup; a second silent turn ends the loop. It
+is live-only — a cold loop has no session to pace itself in.
+
+It is also the one deliberate exception to "one door": it **paces** a loop that
+already exists, and is refused on a paused one, but it cannot arm, cancel or
+re-time anything. Its description says that outright and points at
+`manage_schedules`, because a model that reads "schedule" in a tool name is a
+model that tries to create a 25-minute job with it — and only finds out, a turn
+later, that nothing was armed.
 
 The count and the soonest fire ride on the footer's **path/branch row** —
 `~/Code/pi-config (main) • ◷ 1 loop · 1 job · next in 4m 30s` — naming each
@@ -772,6 +804,7 @@ Rules carried over from Claude, each of which is a lesson rather than a detail:
 | 60 s floor | anything faster is a busy-wait with extra tokens |
 | First iteration runs at creation | a loop you cannot see start is one you cannot trust |
 | Max 50 live loops, one self-paced loop | a pending wakeup is a per-session slot |
+| Pause is persisted, not session state | a restart is not a request to resume something you held |
 
 Session-scoped, restored on `/resume`, never standing: live loops are written to
 `.pi/loops/<sessionId>.json` and cold jobs to `.pi/subagent-schedules/<sessionId>.json`.

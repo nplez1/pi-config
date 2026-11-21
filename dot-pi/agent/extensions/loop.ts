@@ -63,6 +63,8 @@ import {
   LIVE_CREATE,
   LIVE_LIST,
   LIVE_REMOVE,
+  LIVE_RUN,
+  LIVE_UPDATE,
   reduceColdJobs,
   RPC_CREATE,
   RPC_LIST,
@@ -135,6 +137,22 @@ export type LoopJob = {
   quietStreak: number;
   /** Set once a due fire is waiting for the current turn to end. */
   pending: boolean;
+  /**
+   * Set by a run-now request, cleared by the fire it causes.
+   *
+   * `nextFixedRun` advances from the *scheduled* slot, so a manual fire at 3:00
+   * of a loop due at 3:20 would push the next fire to 3:45 and silently swallow
+   * the 3:20 one. A manual fire is an extra iteration, not a replacement, so the
+   * armed slot survives it. Transient on purpose: it describes one pending fire,
+   * and a restart has nothing to carry it for.
+   */
+  manualRun?: boolean;
+  /**
+   * A paused loop keeps its id, its prompt and its cadence but arms nothing, so
+   * it is neither running nor gone. Pausing is how a caller holds a repeat still
+   * without forgetting what it said; resuming arms a fire immediately.
+   */
+  paused: boolean;
   /** The reason the model gave for its last self-paced delay. */
   wakeupReason?: string;
   /** A dynamic loop gets exactly one fallback wakeup before it ends. */
@@ -151,6 +169,8 @@ export type LoopJob = {
   mode: LoopMode;
   nextAt?: number;
   quietStreak: number;
+  /** A paused entry arms nothing, which is why the countdown alone cannot say why. */
+  paused?: boolean;
 };
 
 // ── Parsing (pure) ───────────────────────────────────────────────────────────
@@ -262,13 +282,18 @@ export function formatFooter(views: readonly LoopFooterView[], now: number): str
   const live = views.filter((view) => view.kind === "live").length;
   const cold = views.length - live;
   const nextAt = views.reduce<number | undefined>((soonest, view) => {
-    if (view.nextAt === undefined) return soonest;
+    // A paused entry arms nothing, whatever a stale `nextAt` says (a cold job's
+    // stored next run outlives its timer). Counting it would print a countdown
+    // for work nobody is waiting on.
+    if (view.paused === true || view.nextAt === undefined) return soonest;
     return soonest === undefined || view.nextAt < soonest ? view.nextAt : soonest;
   }, undefined);
   const parts = [`◷ ${countLabel(live, cold)}`];
   // A dynamic loop mid-turn has no armed wakeup yet: "running" is honest, where
-  // "next in 0s" would not be.
-  parts.push(nextAt === undefined ? "running" : `next in ${formatDuration(Math.max(0, nextAt - now))}`);
+  // "next in 0s" would not be. Every entry paused is a third state: nothing is
+  // armed and nothing is in flight, and the roster explains the empty countdown.
+  if (nextAt !== undefined) parts.push(`next in ${formatDuration(Math.max(0, nextAt - now))}`);
+  else parts.push(views.every((view) => view.paused === true) ? "paused" : "running");
   const quiet = Math.max(0, ...views.map((view) => view.quietStreak));
   if (quiet >= 2) parts.push(`quiet ×${quiet}`);
   return parts.join(" · ");
@@ -323,14 +348,21 @@ export type SettleDecision = "wait" | "arm-fallback" | "end-loop";
  * that ends silent is ambiguous — the model may simply have forgotten — so the
  * first one buys a single grace wakeup and the second ends the loop. A loop that
  * never ran has nothing to judge yet.
+ *
+ * A paused loop is not silent, it was told to stop: pausing *is* an armed no-op,
+ * so a settle decides nothing for it. Without this the next turn to end would
+ * buy it a grace wakeup — the footer would grow a countdown for a loop that can
+ * never fire, and the settle after that would end a loop the user only held.
  */
 export function decideDynamicSettle(input: {
   stopped: boolean;
+  paused?: boolean;
   runs: number;
   nextAt: number | undefined;
   fallbackArmed: boolean;
 }): SettleDecision {
   if (input.stopped) return "wait";
+  if (input.paused === true) return "wait";
   if (input.nextAt !== undefined) return "wait";
   if (input.runs === 0) return "wait";
   return input.fallbackArmed ? "end-loop" : "arm-fallback";
@@ -402,6 +434,7 @@ export default function (pi: ExtensionAPI) {
         mode: job.mode,
         nextAt: job.nextAt,
         quietStreak: job.quietStreak,
+        paused: job.paused,
       })),
       ...[...coldJobs.values()].map((job) => ({
         kind: "cold" as const,
@@ -410,6 +443,9 @@ export default function (pi: ExtensionAPI) {
         mode: "fixed" as const,
         nextAt: coldNextAt(job),
         quietStreak: 0,
+        // Paused cold jobs arm nothing either, and `running` for one would read
+        // as a job mid-fire. `enabled: false` is this backend's word for it.
+        paused: !job.enabled,
       })),
     ];
     uiCtx.ui.setStatus(STATUS_KEY, formatFooter(views, Date.now()));
@@ -464,15 +500,17 @@ export default function (pi: ExtensionAPI) {
   // ── The live backend's RPC surface ────────────────────────────────────────
   //
   // `jobs` is a closure in this file, so no other extension can arm a live loop
-  // by writing to a store — the only way in was the slash command. These three
-  // channels are the way in for the model, via `manage_schedules` →
-  // `backend: "live"`. They mirror the cold channels pi-subagents serves, so a
-  // caller sees one symmetric pair: create/list/remove on both backends.
+  // by writing to a store — the only way in was the slash command. These
+  // channels are the way in for the model, via pi-subagents' `manage_schedules`
+  // → `backend: "live"`. They cover the whole lifecycle that tool offers:
+  // create, list, update (cadence / prompt / paused), run-now, remove.
   //
   // Deliberately NOT a second model-facing tool registered here. The repo's
   // rule is one door per audience — the user types `/loop`, the model calls
   // `manage_schedules` — and a tool here would be the second model door the
-  // Agent tool's retired `schedule` param used to be.
+  // Agent tool's retired `schedule` param used to be. A model that can pause a
+  // loop but not cancel it, or cancel one it cannot see, has half a door; that
+  // is why every verb lands on the same channels rather than a subset.
   function wireLiveBackend(): void {
     if (!bus?.on || liveWired) return;
     liveWired = true;
@@ -483,6 +521,40 @@ export default function (pi: ExtensionAPI) {
       if (typeof requestId !== "string") return undefined;
       const replyChannel = `${channel}:reply:${requestId}`;
       return (payload) => bus?.emit(replyChannel, payload);
+    }
+
+    /** One job as every caller sees it, so list/update/run answer the same shape. */
+    function jobView(job: Job) {
+      return {
+        id: job.id,
+        prompt: job.prompt,
+        mode: job.mode,
+        intervalMs: job.intervalMs,
+        nextAt: job.nextAt,
+        runs: job.runs,
+        paused: job.paused,
+      };
+    }
+
+    /**
+     * Pause or resume, in one place so both the RPC and any future caller mean
+     * the same thing. Pausing unarms; resuming arms a fire at now rather than
+     * one interval out — the caller asked for it to run again, not to wait.
+     */
+    function setPaused(job: Job, paused: boolean): void {
+      job.paused = paused;
+      job.pending = false;
+      job.manualRun = false;
+      job.fallbackArmed = false;
+      if (paused) {
+        job.nextAt = undefined;
+        return;
+      }
+      // Resuming re-arms the cadence, it does not fire: `run` is the verb for
+      // "do it now", and the cold backend's resume means exactly this too
+      // (its timer restarts one interval out). A self-paced loop has no cadence
+      // to restart, so it is armed to fire and pace itself again.
+      job.nextAt = job.mode === "fixed" && job.intervalMs ? Date.now() + job.intervalMs : Date.now();
     }
 
     unsubscribes.push(
@@ -517,7 +589,7 @@ export default function (pi: ExtensionAPI) {
           // that created it".
           if (uiCtx.hasUI) {
             uiCtx.ui.notify(
-              `Live loop ${job.id} armed by the model · every ${formatInterval(intervalMs)} · re-enters this conversation, so each fire spends the main context · stop with /loop stop ${job.id}.`,
+              `Live loop ${job.id} armed by the model · ${formatInterval(intervalMs)} · re-enters this conversation, so each fire spends the main context · stop with /loop stop ${job.id}.`,
               "info",
             );
           }
@@ -534,17 +606,99 @@ export default function (pi: ExtensionAPI) {
         if (!reply) return;
         reply({
           success: true,
-          data: {
-            jobs: [...jobs.values()].map((job) => ({
-              id: job.id,
-              prompt: job.prompt,
-              mode: job.mode,
-              intervalMs: job.intervalMs,
-              nextAt: job.nextAt,
-              runs: job.runs,
-            })),
-          },
+          data: { jobs: [...jobs.values()].map(jobView) },
         });
+      }),
+    );
+
+    // Update: cadence, prompt, and paused in one call, because "change the
+    // interval and keep it paused" is one intention, not two round trips.
+    unsubscribes.push(
+      bus.on(LIVE_UPDATE, (raw) => {
+        const reply = replyChannelFor(raw, LIVE_UPDATE);
+        if (!reply) return;
+        const request = raw as
+          | { jobId?: unknown; schedule?: unknown; prompt?: unknown; paused?: unknown }
+          | undefined;
+        try {
+          const jobId = typeof request?.jobId === "string" ? request.jobId : "";
+          const job = jobs.get(jobId);
+          if (!job) throw new Error(`No live loop with id "${jobId}".`);
+          const changed: string[] = [];
+
+          if (typeof request?.schedule === "string" && request.schedule.trim()) {
+            const text = request.schedule.trim();
+            const parsed = parseIntervalToken(text);
+            if (parsed === undefined) {
+              throw new Error(
+                `"${text}" is not an interval. A live loop needs one of 5m / 30m / 1h / 2d — cron and one-shot schedules only exist on the cold backend.`,
+              );
+            }
+            // The floor is applied here for the same reason `create` applies it:
+            // a sub-minute loop is a busy-wait with extra tokens, whoever asks.
+            const intervalMs = Math.max(parsed, MIN_INTERVAL_MS);
+            // Re-sending the cadence it already has is not a change. A caller
+            // that cannot tell "applied" from "no-op" will re-send and report
+            // success either way, which is how a wrong update goes unnoticed.
+            if (job.mode !== "fixed" || job.intervalMs !== intervalMs) {
+              // Changing the cadence makes it a fixed loop: the caller chose the
+              // rhythm, and a self-paced loop has none to keep.
+              job.mode = "fixed";
+              job.intervalMs = intervalMs;
+              if (!job.paused) job.nextAt = Date.now() + intervalMs;
+              changed.push(formatInterval(intervalMs));
+            }
+          }
+
+          if (typeof request?.prompt === "string" && request.prompt.trim()) {
+            const prompt = request.prompt.trim();
+            if (prompt !== job.prompt) {
+              job.prompt = prompt;
+              changed.push(`prompt "${truncate(prompt)}"`);
+            }
+          }
+
+          if (typeof request?.paused === "boolean" && request.paused !== job.paused) {
+            setPaused(job, request.paused);
+            changed.push(request.paused ? "paused" : "resumed");
+          }
+
+          if (changed.length === 0) {
+            throw new Error(
+              "Nothing changed. Pass one of `schedule`, `prompt` or `paused` with a value that differs from what the loop already has. (Pausing and resuming go through the `pause` and `resume` actions.)",
+            );
+          }
+          saveLoops();
+          updateFooter();
+          reply({ success: true, data: { job: jobView(job), changed } });
+        } catch (err) {
+          reply({ success: false, error: err instanceof Error ? err.message : String(err) });
+        }
+      }),
+    );
+
+    // Run-now: mark it due and let drain() deliver it. Firing inside this call
+    // would steer the very turn that asked for it, which is the one thing a
+    // loop must never do.
+    unsubscribes.push(
+      bus.on(LIVE_RUN, (raw) => {
+        const reply = replyChannelFor(raw, LIVE_RUN);
+        if (!reply) return;
+        const jobId = (raw as { jobId?: unknown } | undefined)?.jobId;
+        const job = typeof jobId === "string" ? jobs.get(jobId) : undefined;
+        if (!job) {
+          reply({ success: false, error: `No live loop with id "${String(jobId)}".` });
+          return;
+        }
+        if (job.paused) {
+          reply({ success: false, error: `Loop ${job.id} is paused. Resume it first, then run it.` });
+          return;
+        }
+        job.pending = true;
+        job.manualRun = true;
+        job.nextAt = job.nextAt ?? Date.now();
+        updateFooter();
+        reply({ success: true, data: { job: jobView(job), queuedForNextIdle: true } });
       }),
     );
 
@@ -600,6 +754,7 @@ export default function (pi: ExtensionAPI) {
 
   /** Inject the loop's prompt as a user message. Only ever called while idle. */
   function fire(job: Job): void {
+    if (job.paused) return;
     const now = Date.now();
     // Only a self-paced loop can carry an override, and there is at most one of
     // them, so the override never has to be matched back to a job.
@@ -609,8 +764,13 @@ export default function (pi: ExtensionAPI) {
     job.runs += 1;
     job.lastRunAt = now;
     job.pending = false;
+    const manual = job.manualRun === true;
+    job.manualRun = false;
     if (job.mode === "fixed" && job.intervalMs) {
-      job.nextAt = nextFixedRun(job.nextAt ?? now, now, job.intervalMs);
+      // A manual fire that lands before the armed slot leaves that slot alone:
+      // `run` means "also now", so the 3:20 fire of a 25m loop still happens.
+      const keepArmed = manual && job.nextAt !== undefined && job.nextAt > now;
+      job.nextAt = keepArmed ? job.nextAt : nextFixedRun(job.nextAt ?? now, now, job.intervalMs);
     } else {
       // A dynamic loop has no armed wakeup until the model schedules one at the
       // end of this turn; `agent_settled` is what turns that silence into either
@@ -634,6 +794,16 @@ export default function (pi: ExtensionAPI) {
     const now = Date.now();
     for (const job of [...jobs.values()]) {
       if (job.stopped) continue;
+      // Expiry is checked before the paused skip: a paused loop arms nothing, so
+      // it would otherwise outlive the 7-day TTL in this session and fire once
+      // more on resume — a forgotten loop running forever, which is the one thing
+      // the TTL exists to prevent.
+      if (now >= job.expiresAt) {
+        removeJob(job);
+        if (uiCtx?.hasUI) uiCtx.ui.notify(`Loop expired after 7 days: "${truncate(job.prompt)}"`, "info");
+        continue;
+      }
+      if (job.paused) continue;
       if (job.nextAt !== undefined && job.nextAt <= now) job.pending = true;
     }
     updateFooter();
@@ -645,7 +815,7 @@ export default function (pi: ExtensionAPI) {
     if (!uiCtx) return;
     if (!uiCtx.isIdle()) return;
     const due = [...jobs.values()]
-      .filter((job) => job.pending && !job.stopped)
+      .filter((job) => job.pending && !job.stopped && !job.paused)
       .sort((a, b) => (a.nextAt ?? 0) - (b.nextAt ?? 0))[0];
     if (!due) return;
     fire(due);
@@ -684,6 +854,7 @@ export default function (pi: ExtensionAPI) {
         createdAt: job.createdAt,
         expiresAt: job.expiresAt,
         runs: job.runs,
+        paused: job.paused,
       })),
     };
     try {
@@ -720,13 +891,19 @@ export default function (pi: ExtensionAPI) {
         prompt: saved.prompt,
         mode: saved.mode === "dynamic" ? "dynamic" : "fixed",
         intervalMs: saved.intervalMs,
-        nextAt:
-          saved.mode === "dynamic" ? now + FALLBACK_WAKEUP_MS : now + (saved.intervalMs ?? MIN_INTERVAL_MS),
+        // A paused loop comes back paused: the store records the decision, not
+        // just the cadence, and re-arming it would undo what someone asked for.
+        nextAt: saved.paused
+          ? undefined
+          : saved.mode === "dynamic"
+            ? now + FALLBACK_WAKEUP_MS
+            : now + (saved.intervalMs ?? MIN_INTERVAL_MS),
         createdAt: saved.createdAt,
         expiresAt: saved.expiresAt,
         runs: saved.runs ?? 0,
         quietStreak: 0,
         pending: false,
+        paused: saved.paused === true,
         fallbackArmed: false,
         stopped: false,
       };
@@ -750,6 +927,7 @@ export default function (pi: ExtensionAPI) {
       runs: 0,
       quietStreak: 0,
       pending: false,
+      paused: false,
       fallbackArmed: false,
       stopped: false,
     };
@@ -757,8 +935,9 @@ export default function (pi: ExtensionAPI) {
 
   function describe(job: Job): string {
     const cadence = job.mode === "fixed" && job.intervalMs ? formatInterval(job.intervalMs) : "self-paced";
-    const next =
-      job.nextAt === undefined
+    const next = job.paused
+      ? "paused"
+      : job.nextAt === undefined
         ? "awaiting wakeup"
         : `next in ${formatDuration(Math.max(0, job.nextAt - Date.now()))}`;
     const expiresIn = formatDuration(Math.max(0, job.expiresAt - Date.now()));
@@ -786,10 +965,13 @@ export default function (pi: ExtensionAPI) {
     name: "ScheduleWakeup",
     label: "Schedule Wakeup",
     description:
-      "Schedule when to resume work in /loop dynamic mode. Call it at the end of each turn to keep a self-paced loop alive; call it with `stop: true` to end the loop immediately.",
+      "Pace an existing self-paced /loop: say when to resume this loop's next turn, or end it with `stop: true`. " +
+      "This is NOT how scheduled work is created — for anything recurring or delayed (a job that fires every 25 minutes, a check you want run later) call manage_schedules { action: \"create\" } instead. " +
+      "This tool only applies inside a /loop that was created without an interval; outside one it does nothing.",
     promptSnippet: "Self-pace a dynamic /loop by scheduling the next iteration, or end it with stop",
     promptGuidelines: [
       "Use ScheduleWakeup only when a /loop was created without an interval (dynamic mode); a fixed-interval loop arms itself and does not need it.",
+      "To create scheduled or recurring work — including a prompt that should repeat every N minutes — use manage_schedules, never this tool, and never by asking the user to type a command.",
       "Call ScheduleWakeup as the last thing in a dynamic loop's turn: without it the loop falls back to one 20-minute wakeup and then ends.",
       "Prefer delays of 1200-1800 seconds when the tick is a quiet check, and under 270 seconds only when actively polling something that changes quickly.",
       "Use ScheduleWakeup with `stop: true` when the loop's work is finished; do not keep a loop alive to keep watching.",
@@ -825,6 +1007,10 @@ export default function (pi: ExtensionAPI) {
         return text(
           "Wakeup not scheduled — no dynamic loop is running. ScheduleWakeup only drives a /loop created without an interval; a fixed-interval loop arms its own timer.",
         );
+      }
+
+      if (job.paused) {
+        return text(`Wakeup not scheduled — loop ${job.id} is paused. Resume it with manage_schedules { action: "resume", id: "${job.id}" } if it should keep going.`);
       }
 
       const clamped = clampWakeupSeconds(params.delaySeconds);
@@ -1010,9 +1196,11 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      if (parsed.mode === "dynamic" && dynamicJob()) {
+      const existingDynamic = parsed.mode === "dynamic" ? dynamicJob() : undefined;
+      if (existingDynamic) {
+        const state = existingDynamic.paused ? "paused" : "running";
         ctx.ui.notify(
-          "A self-paced loop is already running. Stop it first (/loop stop) or give this one an interval: /loop 5m <prompt>.",
+          `A self-paced loop is already ${state} (${existingDynamic.id}). Resume it (/loop stop ${existingDynamic.id} and re-arm, or ask for it back with the model's manage_schedules) or give this one an interval: /loop 5m <prompt>.`,
           "warning",
         );
         return;
@@ -1120,6 +1308,8 @@ type PersistedLoops = {
     createdAt: number;
     expiresAt: number;
     runs: number;
+    /** Absent in stores written before pausing existed; absent means armed. */
+    paused?: boolean;
   }>;
 };
 
