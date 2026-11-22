@@ -1308,7 +1308,8 @@ export default function (pi: ExtensionAPI) {
       let fixedNext = now + interval;
       let closedSkips = 0;
       if (saved.mode === "fixed" && !saved.paused && typeof saved.nextAt === "number") {
-        if (saved.nextAt > now) fixedNext = saved.nextAt;
+        // A slot landing exactly on now is due, not missed.
+        if (saved.nextAt >= now) fixedNext = saved.nextAt;
         else {
           // The saved slot itself passed unfired, and so did every slot after it up to now.
           closedSkips = missedSlots(saved.nextAt, now, interval) + 1;
