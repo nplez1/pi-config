@@ -37,9 +37,9 @@
  *     asleep through a 2-hourly job is visible rather than silent. The cadence
  *     stays anchored to its original phase instead of restarting from the late
  *     fire, so "every 2h" does not drift.
- *   - Unbounded recurring loops expire 7 days after creation: one final fire,
- *     then gone. A forgotten loop cannot run forever. A loop given `maxRuns` or
- *     `until` already has an end, so the TTL does not apply to it.
+ *   - Unbounded recurring loops expire 7 days after creation: removed at the mark, and only a fire
+ *     already waiting for the session still lands. A forgotten loop cannot run forever. A loop given
+ *     `maxRuns` or `until` already has an end, so the TTL does not apply to it.
  *   - A loop pauses itself after `pauseAfterFailures` (default 3) failed fires in
  *     a row, so a broken loop stops billing every fire.
  *   - The first iteration runs immediately at creation rather than waiting for
@@ -88,7 +88,7 @@ export const MIN_INTERVAL_MS = 60_000;
 /** `ScheduleWakeup` clamps here, like Claude's [60, 3600]. */
 export const MIN_WAKEUP_SECONDS = 60;
 export const MAX_WAKEUP_SECONDS = 3600;
-/** Recurring loops expire: one final fire, then self-delete. */
+/** Recurring loops expire: removed at the mark, so only a fire already waiting still lands. */
 export const LOOP_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 /** A tick that neither reschedules nor stops gets this one grace wakeup. */
 export const FALLBACK_WAKEUP_MS = 20 * 60 * 1000;
@@ -1148,7 +1148,7 @@ export default function (pi: ExtensionAPI) {
       );
     }
 
-    // Expiry: the final fire still happens, then the loop is gone.
+    // Expiry: a fire already waiting still lands; the loop itself is gone.
     if (isExpired(job, now)) {
       removeJob(job);
       if (uiCtx?.hasUI) uiCtx.ui.notify(`Loop expired after 7 days: "${truncate(prompt)}"`, "info");

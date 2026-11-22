@@ -864,7 +864,7 @@ Rules carried over from Claude, each of which is a lesson rather than a detail:
 | Fires land between turns, never mid-response | a due loop waits for the run to settle, and says `1 due · waiting for idle` meanwhile |
 | No catch-up | N missed fires become one fire, not N — the N−1 are counted (`skipped`) and the fire records how late it was |
 | The cadence keeps its phase | a late fire does not restart the clock, so "every 2h" stays on its original rhythm |
-| 7-day expiry for an unbounded loop, one final fire | a forgotten loop cannot run forever; one with `maxRuns`/`until` has its own end and is exempt |
+| 7-day expiry for an unbounded loop, no final fire | a forgotten loop cannot run forever; one with `maxRuns`/`until` has its own end and is exempt |
 | 3 failed fires in a row pause it (`pauseAfterFailures`) | a broken loop stops spending the main context every fire |
 | 60 s floor | anything faster is a busy-wait with extra tokens |
 | First iteration runs at creation | a loop you cannot see start is one you cannot trust |
