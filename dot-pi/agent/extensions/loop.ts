@@ -30,10 +30,18 @@
  * Behaviour carried over on purpose (each is a lesson Claude's version encodes):
  *
  *   - Fires land between turns. A loop that came due mid-response waits for the
- *     turn to end; it never steers a turn that is already in flight.
- *   - No catch-up. N missed fires become one fire, not N.
- *   - Recurring loops expire 7 days after creation: one final fire, then gone.
- *     A forgotten loop cannot run forever.
+ *     turn to end; it never steers a turn that is already in flight. While it
+ *     waits it is reported as due (footer and `list`), not as "next in 0s".
+ *   - No catch-up. N missed fires become one fire, not N — but the N-1 are
+ *     counted (`skipped`) and the fire records how late it was, so a laptop
+ *     asleep through a 2-hourly job is visible rather than silent. The cadence
+ *     stays anchored to its original phase instead of restarting from the late
+ *     fire, so "every 2h" does not drift.
+ *   - Unbounded recurring loops expire 7 days after creation: one final fire,
+ *     then gone. A forgotten loop cannot run forever. A loop given `maxRuns` or
+ *     `until` already has an end, so the TTL does not apply to it.
+ *   - A loop pauses itself after `pauseAfterFailures` (default 3) failed fires in
+ *     a row, so a broken loop stops billing every fire.
  *   - The first iteration runs immediately at creation rather than waiting for
  *     the first timer tick.
  *   - `/loop` with no prompt falls back to `.pi/loop.md` (project) then
@@ -85,6 +93,12 @@ export const LOOP_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 /** A tick that neither reschedules nor stops gets this one grace wakeup. */
 export const FALLBACK_WAKEUP_MS = 20 * 60 * 1000;
 export const MAX_LOOPS = 50;
+/** Fires kept per loop: enough to answer "what did it find lately", small enough to persist every fire. */
+export const HISTORY_MAX = 10;
+/** Failed fires in a row that pause a loop when the caller set no policy; `0` disables. */
+export const DEFAULT_PAUSE_AFTER_FAILURES = 3;
+/** A fire's summary is the head of its last reply — a pointer back into the transcript, not a copy. */
+const SUMMARY_MAX = 280;
 /** loop.md past this is truncated — it lands in every tick's context. */
 export const MAX_LOOP_FILE_BYTES = 25_000;
 /** Footer refresh cadence: the countdown is the feature, so this is per-second. */
@@ -113,6 +127,26 @@ const UNIT_WORDS: Record<string, number> = {
 // ── Types ────────────────────────────────────────────────────────────────────
 
 export type LoopMode = "fixed" | "dynamic" | "once";
+
+/** One fire, as `get` reports it. */
+export type FireRecord = {
+  /** Epoch ms the fire was delivered. */
+  at: number;
+  /**
+   * `running` until the fire's first turn ends; an error in any later turn of
+   * the same fire sticks. `unknown` is a fire the session closed under.
+   */
+  outcome: "running" | "ok" | "error" | "unknown";
+  error?: string;
+  /** A `run` request, not the cadence. */
+  manual?: boolean;
+  /** How long after its slot it was delivered — a busy session or a sleeping machine. */
+  lateMs?: number;
+  /** Slots that passed unfired before this one, because there is no catch-up. */
+  skipped?: number;
+  /** Head of the fire's last assistant text. */
+  summary?: string;
+};
 
 export type ParsedLoop =
   | { ok: true; mode: "fixed"; prompt: string; intervalMs: number; intervalText: string }
@@ -170,9 +204,22 @@ export type LoopJob = {
   wakeupReason?: string;
   /** A dynamic loop gets exactly one fallback wakeup before it ends. */
   fallbackArmed: boolean;
+  /** Slots that passed without a fire, across the loop's life (asleep, busy, or closed). */
+  skipped: number;
+  /** When the waiting fire came due; set only while `pending`. */
+  dueSince?: number;
+  /** Newest last, at most `HISTORY_MAX`. */
+  history: FireRecord[];
+  /** Failed fires in a row before it pauses itself; absent = the default, `0` = never. */
+  pauseAfterFailures?: number;
+  /** Failed fires since the last good one; reset by a good fire or a resume. */
+  failureStreak: number;
+  /** Why it is paused when nobody asked — the failure policy tripped. */
+  pausedReason?: string;
 };
 
-/** What the footer needs, so formatting stays pure and testable. */export type LoopFooterView = {
+/** What the footer needs, so formatting stays pure and testable. */
+export type LoopFooterView = {
   /**
    * Which backend this entry came from. The two are counted separately because
    * they cost different things: a live tick pays the main context again, a cold
@@ -184,6 +231,8 @@ export type LoopJob = {
   quietStreak: number;
   /** A paused entry arms nothing, which is why the countdown alone cannot say why. */
   paused?: boolean;
+  /** Due, but held until the current turn ends. */
+  due?: boolean;
 };
 
 // ── Parsing (pure) ───────────────────────────────────────────────────────────
@@ -202,6 +251,14 @@ function boundMaxRuns(value: unknown): number | undefined {
   if (value === undefined || value === 0) return undefined;
   if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
     throw new Error("`maxRuns` must be a whole number of at least 1, or 0 to clear it.");
+  }
+  return value;
+}
+
+function boundPauseAfterFailures(value: unknown): number | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+    throw new Error("`pauseAfterFailures` must be a whole number: N pauses after N failed fires in a row, 0 never pauses.");
   }
   return value;
 }
@@ -349,15 +406,19 @@ export function formatFooter(views: readonly LoopFooterView[], now: number): str
     // A paused entry arms nothing, whatever a stale `nextAt` says (a cold job's
     // stored next run outlives its timer). Counting it would print a countdown
     // for work nobody is waiting on.
-    if (view.paused === true || view.nextAt === undefined) return soonest;
+    if (view.paused === true || view.due === true || view.nextAt === undefined) return soonest;
     return soonest === undefined || view.nextAt < soonest ? view.nextAt : soonest;
   }, undefined);
   const parts = [`◷ ${countLabel(live, cold)}`];
+  // A due fire held behind a busy turn is its own state: "next in 0s" for a
+  // minute reads as a stuck timer, when the truth is that the session is busy.
+  const due = views.filter((view) => view.due === true && view.paused !== true).length;
+  if (due > 0) parts.push(`${due} due · waiting for idle`);
   // A dynamic loop mid-turn has no armed wakeup yet: "running" is honest, where
   // "next in 0s" would not be. Every entry paused is a third state: nothing is
   // armed and nothing is in flight, and the roster explains the empty countdown.
   if (nextAt !== undefined) parts.push(`next in ${formatDuration(Math.max(0, nextAt - now))}`);
-  else parts.push(views.every((view) => view.paused === true) ? "paused" : "running");
+  else if (due === 0) parts.push(views.every((view) => view.paused === true) ? "paused" : "running");
   const quiet = Math.max(0, ...views.map((view) => view.quietStreak));
   if (quiet >= 2) parts.push(`quiet ×${quiet}`);
   return parts.join(" · ");
@@ -379,13 +440,42 @@ export function formatInterval(intervalMs: number): string {
 /**
  * Advance a fixed loop's next fire.
  *
- * No catch-up: when the timer came due while a turn was running, the next slot
- * is one interval after *now*, not one interval after the missed slot — otherwise
- * a long turn would queue a burst of fires to drain afterwards.
+ * No catch-up: a fire that comes late (a long turn, a sleeping laptop) is one
+ * fire, and the slots it ran past are dropped rather than queued as a burst. The
+ * next fire is the first slot *on the original phase* after now — not one
+ * interval after the late fire, which made "every 2h" slide off the clock by
+ * however late each fire happened to be.
  */
 export function nextFixedRun(previousNextAt: number, now: number, intervalMs: number): number {
-  const drifted = previousNextAt + intervalMs;
-  return drifted > now ? drifted : now + intervalMs;
+  return previousNextAt + (missedSlots(previousNextAt, now, intervalMs) + 1) * intervalMs;
+}
+
+/** Slots after `previousNextAt` that are already at or before `now` — the fires a late one stands in for. */
+export function missedSlots(previousNextAt: number, now: number, intervalMs: number): number {
+  if (!(intervalMs > 0) || now <= previousNextAt) return 0;
+  return Math.floor((now - previousNextAt) / intervalMs);
+}
+
+/** The newest-last fire log, trimmed to `HISTORY_MAX`. */
+export function pushHistory(history: readonly FireRecord[], record: FireRecord): FireRecord[] {
+  return [...history, record].slice(-HISTORY_MAX);
+}
+
+/** The text a fire's turn ended with, collapsed to one line. Undefined for a tool-only turn. */
+export function summarizeTurn(message: unknown): string | undefined {
+  const content = (message as { content?: unknown } | undefined)?.content;
+  const text =
+    typeof content === "string"
+      ? content
+      : Array.isArray(content)
+        ? content
+            .filter((part) => (part as { type?: unknown })?.type === "text")
+            .map((part) => String((part as { text?: unknown }).text ?? ""))
+            .join(" ")
+        : "";
+  const single = text.replace(/\s+/g, " ").trim();
+  if (!single) return undefined;
+  return single.length > SUMMARY_MAX ? `${single.slice(0, SUMMARY_MAX - 1)}…` : single;
 }
 
 /** Clamp a self-paced delay into Claude's [60, 3600] window. */
@@ -422,7 +512,7 @@ export function decideDynamicSettle(input: {
   stopped: boolean;
   paused?: boolean;
   runs: number;
-  nextAt: number | undefined;
+  nextAt?: number;
   fallbackArmed: boolean;
 }): SettleDecision {
   if (input.stopped) return "wait";
@@ -462,6 +552,35 @@ export default function (pi: ExtensionAPI) {
 
   const dynamicJob = (): Job | undefined => [...jobs.values()].find((job) => job.mode === "dynamic");
 
+  /** A loop with an end of its own (`maxRuns` / `until`) is not forgotten, so the TTL backstop skips it. */
+  const hasBound = (job: LoopJob): boolean => job.maxRuns !== undefined || job.until !== undefined;
+  const isExpired = (job: LoopJob, now: number): boolean => !hasBound(job) && now >= job.expiresAt;
+
+  /**
+   * Pause or resume, in one place so the RPC, the failure policy and any future
+   * caller mean the same thing. Pausing unarms; resuming re-arms the cadence.
+   */
+  function setPaused(job: Job, paused: boolean): void {
+    job.paused = paused;
+    job.pending = false;
+    job.dueSince = undefined;
+    job.manualRun = false;
+    job.fallbackArmed = false;
+    if (paused) {
+      job.nextAt = undefined;
+      return;
+    }
+    // A resume is the caller vouching for the loop again, so the failure policy
+    // starts counting afresh rather than re-tripping on the next single error.
+    job.pausedReason = undefined;
+    job.failureStreak = 0;
+    // Resuming re-arms the cadence, it does not fire: `run` is the verb for
+    // "do it now", and the cold backend's resume means exactly this too
+    // (its timer restarts one interval out). A self-paced loop has no cadence
+    // to restart, so it is armed to fire and pace itself again.
+    job.nextAt = job.mode === "fixed" && job.intervalMs ? Date.now() + job.intervalMs : Date.now();
+  }
+
   /**
    * Publish every armed next fire, live and cold, so cache-keepalive can hold the
    * prompt cache across a settled wait. Cold fires count too: a cold run's result
@@ -499,6 +618,7 @@ export default function (pi: ExtensionAPI) {
         nextAt: job.nextAt,
         quietStreak: job.quietStreak,
         paused: job.paused,
+        due: job.pending,
       })),
       ...[...coldJobs.values()].map((job) => ({
         kind: "cold" as const,
@@ -598,40 +718,31 @@ export default function (pi: ExtensionAPI) {
         fireAt: job.mode === "once" ? job.nextAt : undefined,
         runs: job.runs,
         paused: job.paused,
+        pausedReason: job.pausedReason,
         maxRuns: job.maxRuns,
         until: job.until,
+        // Only an unbounded loop expires; a bounded one reports no TTL it will not hit.
+        expiresAt: hasBound(job) ? undefined : job.expiresAt,
         lastRunAt: job.lastRunAt,
         lastOutcome: job.lastOutcome,
         lastError: job.lastError,
+        // Due but held: the session has not gone idle since it came due.
+        waitingForIdle: job.pending && !job.paused ? true : undefined,
+        dueSince: job.pending ? job.dueSince : undefined,
+        skipped: job.skipped,
+        pauseAfterFailures: job.pauseAfterFailures ?? DEFAULT_PAUSE_AFTER_FAILURES,
+        failureStreak: job.failureStreak,
+        history: job.history,
       };
-    }
-
-    /**
-     * Pause or resume, in one place so both the RPC and any future caller mean
-     * the same thing. Pausing unarms; resuming arms a fire at now rather than
-     * one interval out — the caller asked for it to run again, not to wait.
-     */
-    function setPaused(job: Job, paused: boolean): void {
-      job.paused = paused;
-      job.pending = false;
-      job.manualRun = false;
-      job.fallbackArmed = false;
-      if (paused) {
-        job.nextAt = undefined;
-        return;
-      }
-      // Resuming re-arms the cadence, it does not fire: `run` is the verb for
-      // "do it now", and the cold backend's resume means exactly this too
-      // (its timer restarts one interval out). A self-paced loop has no cadence
-      // to restart, so it is armed to fire and pace itself again.
-      job.nextAt = job.mode === "fixed" && job.intervalMs ? Date.now() + job.intervalMs : Date.now();
     }
 
     unsubscribes.push(
       bus.on(LIVE_CREATE, (raw) => {
         const reply = replyChannelFor(raw, LIVE_CREATE);
         if (!reply) return;
-        const request = raw as { schedule?: unknown; prompt?: unknown; maxRuns?: unknown; until?: unknown } | undefined;
+        const request = raw as
+          | { schedule?: unknown; prompt?: unknown; maxRuns?: unknown; until?: unknown; pauseAfterFailures?: unknown }
+          | undefined;
         try {
           if (!uiCtx) throw new Error("This session has no context yet; try again once it has started.");
           const prompt = typeof request?.prompt === "string" ? request.prompt.trim() : "";
@@ -653,6 +764,7 @@ export default function (pi: ExtensionAPI) {
           if (shape.mode === "once") job.nextAt = shape.fireAt;
           job.maxRuns = boundMaxRuns(request?.maxRuns);
           job.until = boundUntil(request?.until, now);
+          job.pauseAfterFailures = boundPauseAfterFailures(request?.pauseAfterFailures);
           addJob(job);
           // No `fire(job)` here, unlike the slash command: that runs between
           // turns, whereas this arrives mid-turn from a tool call. `makeJob`
@@ -701,13 +813,22 @@ export default function (pi: ExtensionAPI) {
         const reply = replyChannelFor(raw, LIVE_UPDATE);
         if (!reply) return;
         const request = raw as
-          | { jobId?: unknown; schedule?: unknown; prompt?: unknown; paused?: unknown; maxRuns?: unknown; until?: unknown }
+          | {
+              jobId?: unknown;
+              schedule?: unknown;
+              prompt?: unknown;
+              paused?: unknown;
+              maxRuns?: unknown;
+              until?: unknown;
+              pauseAfterFailures?: unknown;
+            }
           | undefined;
         try {
           const jobId = typeof request?.jobId === "string" ? request.jobId : "";
           const job = jobs.get(jobId);
           if (!job) throw new Error(`No live loop with id "${jobId}".`);
           const changed: string[] = [];
+          const boundedBefore = hasBound(job);
 
           if (typeof request?.schedule === "string" && request.schedule.trim()) {
             const text = request.schedule.trim();
@@ -768,13 +889,36 @@ export default function (pi: ExtensionAPI) {
             }
           }
 
-          if (changed.length === 0) {
+          if (request?.pauseAfterFailures !== undefined) {
+            const next = boundPauseAfterFailures(request.pauseAfterFailures);
+            if (next !== (job.pauseAfterFailures ?? DEFAULT_PAUSE_AFTER_FAILURES)) {
+              job.pauseAfterFailures = next;
+              changed.push(next === 0 ? "never pauses on failure" : `pauses after ${next} failed fires`);
+            }
+          }
+
+          // Clearing the last bound makes it an unbounded loop again, which is
+          // what the TTL exists for — counted from now, not from creation, so a
+          // loop unbounded on day 8 is not expired on the spot.
+          if (boundedBefore && !hasBound(job)) job.expiresAt = Date.now() + LOOP_TTL_MS;
+
+          // An empty request is a caller mistake worth naming. A request whose
+          // values the loop already has is not: re-asserting a desired state is
+          // how an idempotent caller works, and `changed: []` already tells it
+          // that nothing moved.
+          const supplied = ["schedule", "prompt", "paused", "maxRuns", "until", "pauseAfterFailures"].some((field) => {
+            const value = (request as Record<string, unknown> | undefined)?.[field];
+            return typeof value === "string" ? field === "until" || value.trim() !== "" : value !== undefined;
+          });
+          if (!supplied) {
             throw new Error(
-              "Nothing changed. Pass one of `schedule`, `prompt` or `paused` with a value that differs from what the loop already has. (Pausing and resuming go through the `pause` and `resume` actions.)",
+              "Nothing to change: pass at least one of `schedule`, `prompt`, `paused`, `maxRuns`, `until` or `pauseAfterFailures`.",
             );
           }
-          saveLoops();
-          updateFooter();
+          if (changed.length > 0) {
+            saveLoops();
+            updateFooter();
+          }
           reply({ success: true, data: { job: jobView(job), changed } });
         } catch (err) {
           reply({ success: false, error: err instanceof Error ? err.message : String(err) });
@@ -800,6 +944,7 @@ export default function (pi: ExtensionAPI) {
           return;
         }
         job.pending = true;
+        job.dueSince = job.dueSince ?? Date.now();
         job.manualRun = true;
         job.nextAt = job.nextAt ?? Date.now();
         updateFooter();
@@ -858,8 +1003,10 @@ export default function (pi: ExtensionAPI) {
   }
 
   /**
-   * The loop whose injected prompt is the current turn's, so `turn_end` can
-   * attribute that turn's outcome to it. Cleared by the first `turn_end` it sees.
+   * The loop whose injected prompt started the run in flight, so every
+   * `turn_end` of that run is attributed to its fire. Held until the run
+   * settles (or the next fire), because a fire that calls tools spans several
+   * turns, and its first one is rarely where it says what it found.
    */
   let pendingOutcomeId: string | undefined;
 
@@ -870,19 +1017,63 @@ export default function (pi: ExtensionAPI) {
    * leaves no trace on the job itself: `runs` climbs whether the work succeeded
    * or not, and a caller checking `list` cannot tell a healthy loop from one that
    * has errored every time. The turn's own stop reason is the honest signal, and
-   * it is the only place it exists.
+   * it is the only place it exists. An error in any turn of the fire sticks.
    */
   function recordOutcome(event: unknown): void {
     const id = pendingOutcomeId;
     if (id === undefined) return;
-    pendingOutcomeId = undefined;
     const job = jobs.get(id);
-    if (!job) return;
-    const reason = (event as { message?: { stopReason?: unknown } } | undefined)?.message?.stopReason;
+    const entry = job?.history.at(-1);
+    if (!job || !entry) return;
+    const message = (event as { message?: { stopReason?: unknown } } | undefined)?.message;
+    const reason = message?.stopReason;
     const failed = reason === "error" || reason === "aborted";
-    job.lastOutcome = failed ? "error" : "ok";
-    job.lastError = failed ? `turn ended: ${String(reason)}` : undefined;
+    const summary = summarizeTurn(message);
+    if (summary) entry.summary = summary;
+    if (failed && entry.outcome !== "error") {
+      entry.outcome = "error";
+      entry.error = `turn ended: ${String(reason)}`;
+      job.lastOutcome = "error";
+      job.lastError = entry.error;
+      job.failureStreak += 1;
+      applyFailurePolicy(job);
+    } else if (!failed && entry.outcome === "running") {
+      entry.outcome = "ok";
+      job.lastOutcome = "ok";
+      job.lastError = undefined;
+    }
     saveLoops();
+  }
+
+  /** A fire's run is over: a good one ends the failure streak. */
+  function closeOutcome(): void {
+    const id = pendingOutcomeId;
+    pendingOutcomeId = undefined;
+    const job = id === undefined ? undefined : jobs.get(id);
+    if (job && job.history.at(-1)?.outcome === "ok" && job.failureStreak !== 0) {
+      job.failureStreak = 0;
+      saveLoops();
+    }
+  }
+
+  /**
+   * Pause a loop that keeps failing, instead of letting it bill every fire.
+   *
+   * Pause rather than cancel: the id, the prompt and the history survive, so the
+   * caller can read what went wrong and `resume` once it is fixed.
+   */
+  function applyFailurePolicy(job: Job): void {
+    const limit = job.pauseAfterFailures ?? DEFAULT_PAUSE_AFTER_FAILURES;
+    if (limit <= 0 || job.failureStreak < limit || job.paused) return;
+    setPaused(job, true);
+    job.pausedReason = `paused after ${job.failureStreak} failed fires in a row`;
+    updateFooter();
+    if (uiCtx?.hasUI) {
+      uiCtx.ui.notify(
+        `Loop ${job.id} ${job.pausedReason} (last: ${job.lastError ?? "error"}). Resume it with manage_schedules { action: "resume", id: "${job.id}" } once fixed, or cancel it.`,
+        "warning",
+      );
+    }
   }
 
   /** Inject the loop's prompt as a user message. Only ever called while idle. */
@@ -908,17 +1099,27 @@ export default function (pi: ExtensionAPI) {
     const prompt = job.mode === "dynamic" && nextPromptOverride ? nextPromptOverride : job.prompt;
     nextPromptOverride = undefined;
 
+    // The previous fire's run is over by now (fires only land when idle).
+    closeOutcome();
     job.runs += 1;
     job.lastRunAt = now;
     pendingOutcomeId = job.id;
     job.pending = false;
+    job.dueSince = undefined;
     const manual = job.manualRun === true;
     job.manualRun = false;
+    const slot = job.nextAt;
+    // Lateness is measured against the slot this fire stands in for. A manual
+    // fire has no slot of its own, so it is never "late".
+    const onSlot = !manual || (slot !== undefined && slot <= now);
+    const lateMs = onSlot && slot !== undefined && now - slot >= 1000 ? now - slot : undefined;
+    let skipped = 0;
     if (job.mode === "fixed" && job.intervalMs) {
       // A manual fire that lands before the armed slot leaves that slot alone:
       // `run` means "also now", so the 3:20 fire of a 25m loop still happens.
-      const keepArmed = manual && job.nextAt !== undefined && job.nextAt > now;
-      job.nextAt = keepArmed ? job.nextAt : nextFixedRun(job.nextAt ?? now, now, job.intervalMs);
+      const keepArmed = manual && slot !== undefined && slot > now;
+      if (!keepArmed) skipped = missedSlots(slot ?? now, now, job.intervalMs);
+      job.nextAt = keepArmed ? slot : nextFixedRun(slot ?? now, now, job.intervalMs);
     } else if (job.mode === "once") {
       // Its fire is the whole schedule, so nothing is re-armed. The job is removed
       // on the next tick, once this fire has been delivered, rather than here —
@@ -931,8 +1132,24 @@ export default function (pi: ExtensionAPI) {
       job.nextAt = undefined;
     }
 
+    job.skipped += skipped;
+    job.history = pushHistory(job.history, {
+      at: now,
+      outcome: "running",
+      ...(manual ? { manual: true } : {}),
+      ...(lateMs !== undefined ? { lateMs } : {}),
+      ...(skipped > 0 ? { skipped } : {}),
+    });
+    // Said once, at the fire that noticed: the counter on the job is the durable record.
+    if (skipped > 0 && uiCtx?.hasUI) {
+      uiCtx.ui.notify(
+        `Loop ${job.id} fired ${formatDuration(lateMs ?? 0)} late and skipped ${skipped} slot${skipped === 1 ? "" : "s"} (no catch-up: the machine slept or the session was busy).`,
+        "info",
+      );
+    }
+
     // Expiry: the final fire still happens, then the loop is gone.
-    if (now >= job.expiresAt) {
+    if (isExpired(job, now)) {
       removeJob(job);
       if (uiCtx?.hasUI) uiCtx.ui.notify(`Loop expired after 7 days: "${truncate(prompt)}"`, "info");
     } else {
@@ -951,7 +1168,7 @@ export default function (pi: ExtensionAPI) {
       // it would otherwise outlive the 7-day TTL in this session and fire once
       // more on resume — a forgotten loop running forever, which is the one thing
       // the TTL exists to prevent.
-      if (now >= job.expiresAt) {
+      if (isExpired(job, now)) {
         removeJob(job);
         if (uiCtx?.hasUI) uiCtx.ui.notify(`Loop expired after 7 days: "${truncate(job.prompt)}"`, "info");
         continue;
@@ -978,7 +1195,10 @@ export default function (pi: ExtensionAPI) {
         continue;
       }
       if (job.paused) continue;
-      if (job.nextAt !== undefined && job.nextAt <= now) job.pending = true;
+      if (job.nextAt !== undefined && job.nextAt <= now && !job.pending) {
+        job.pending = true;
+        job.dueSince = job.nextAt;
+      }
     }
     updateFooter();
     drain();
@@ -1029,16 +1249,29 @@ export default function (pi: ExtensionAPI) {
         expiresAt: job.expiresAt,
         runs: job.runs,
         paused: job.paused,
-        nextAt: job.mode === "once" ? job.nextAt : undefined,
+        // A fixed loop's slot is kept too, so a resume lands back on its phase
+        // and can count the slots that passed while the session was closed.
+        nextAt: job.mode === "dynamic" ? undefined : job.nextAt,
         maxRuns: job.maxRuns,
         until: job.until,
         lastRunAt: job.lastRunAt,
         lastOutcome: job.lastOutcome,
         lastError: job.lastError,
+        skipped: job.skipped,
+        history: job.history,
+        pauseAfterFailures: job.pauseAfterFailures,
+        failureStreak: job.failureStreak,
+        pausedReason: job.pausedReason,
       })),
     };
     try {
       mkdirSync(dirname(path), { recursive: true });
+      // The store sits under the session's cwd, which is usually somebody's
+      // repository, and that repository has no reason to know this directory.
+      // A self-ignoring folder keeps per-session state out of `git add -A`
+      // without editing every repo pi is ever run in.
+      const ignore = join(dirname(path), ".gitignore");
+      if (!existsSync(ignore)) writeFileSync(ignore, "# pi /loop per-session state\n*\n");
       const tmp = `${path}.tmp`;
       writeFileSync(tmp, JSON.stringify(data, null, 2));
       renameSync(tmp, path);
@@ -1049,9 +1282,11 @@ export default function (pi: ExtensionAPI) {
   }
 
   /**
-   * Re-arm the loops a resumed session had. No catch-up: a fixed loop resumes one
-   * interval from now, and a self-paced one gets the fallback wakeup, so a
-   * session that was closed overnight does not open with a burst of fires.
+   * Re-arm the loops a resumed session had. No catch-up: a fixed loop resumes at
+   * its next slot on the original phase (one interval from now for a store that
+   * predates saved slots), and a self-paced one gets the fallback wakeup, so a
+   * session that was closed overnight does not open with a burst of fires. The
+   * slots it slept through are added to `skipped` and said once.
    */
   function loadLoops(ctx: ExtensionContext): void {
     const path = loopsPathFor(ctx);
@@ -1063,9 +1298,24 @@ export default function (pi: ExtensionAPI) {
       return;
     }
     const now = Date.now();
+    const missedWhileClosed: string[] = [];
     for (const saved of data.loops ?? []) {
-      if (!saved?.id || !saved.prompt || now >= saved.expiresAt) continue;
+      if (!saved?.id || !saved.prompt) continue;
+      const bounded = saved.maxRuns !== undefined || saved.until !== undefined;
+      if (!bounded && now >= saved.expiresAt) continue;
       if (jobs.has(saved.id)) continue;
+      const interval = saved.intervalMs ?? MIN_INTERVAL_MS;
+      let fixedNext = now + interval;
+      let closedSkips = 0;
+      if (saved.mode === "fixed" && !saved.paused && typeof saved.nextAt === "number") {
+        if (saved.nextAt > now) fixedNext = saved.nextAt;
+        else {
+          // The saved slot itself passed unfired, and so did every slot after it up to now.
+          closedSkips = missedSlots(saved.nextAt, now, interval) + 1;
+          fixedNext = nextFixedRun(saved.nextAt, now, interval);
+          missedWhileClosed.push(`${saved.id} (${closedSkips})`);
+        }
+      }
       const restored: Job = {
         id: saved.id,
         prompt: saved.prompt,
@@ -1081,7 +1331,7 @@ export default function (pi: ExtensionAPI) {
             ? now + FALLBACK_WAKEUP_MS
             : saved.mode === "once"
               ? (saved.nextAt ?? now)
-              : now + (saved.intervalMs ?? MIN_INTERVAL_MS),
+              : fixedNext,
         createdAt: saved.createdAt,
         expiresAt: saved.expiresAt,
         runs: saved.runs ?? 0,
@@ -1095,8 +1345,22 @@ export default function (pi: ExtensionAPI) {
         lastError: saved.lastError,
         fallbackArmed: false,
         stopped: false,
+        skipped: (saved.skipped ?? 0) + closedSkips,
+        history: Array.isArray(saved.history) ? saved.history.slice(-HISTORY_MAX) : [],
+        pauseAfterFailures: saved.pauseAfterFailures,
+        failureStreak: saved.failureStreak ?? 0,
+        pausedReason: saved.pausedReason,
       };
+      // A fire still "running" when the session closed has no turn left to finish it.
+      const last = restored.history.at(-1);
+      if (last?.outcome === "running") last.outcome = "unknown";
       jobs.set(restored.id, restored);
+    }
+    if (missedWhileClosed.length > 0 && ctx.hasUI) {
+      ctx.ui.notify(
+        `Restored live loops missed fires while this session was closed: ${missedWhileClosed.join(", ")}. No catch-up; each resumes at its next slot.`,
+        "info",
+      );
     }
     if (jobs.size > 0) ensureTicker();
     saveLoops();
@@ -1119,6 +1383,9 @@ export default function (pi: ExtensionAPI) {
       paused: false,
       fallbackArmed: false,
       stopped: false,
+      skipped: 0,
+      history: [],
+      failureStreak: 0,
     };
   }
 
@@ -1129,22 +1396,27 @@ export default function (pi: ExtensionAPI) {
         : job.mode === "fixed" && job.intervalMs
           ? formatInterval(job.intervalMs)
           : "self-paced";
+    const now = Date.now();
     const next = job.paused
-      ? "paused"
-      : job.nextAt === undefined
-        ? job.mode === "once"
-          ? "spent"
-          : "awaiting wakeup"
-        : `next in ${formatDuration(Math.max(0, job.nextAt - Date.now()))}`;
-    const expiresIn = formatDuration(Math.max(0, job.expiresAt - Date.now()));
+      ? job.pausedReason ?? "paused"
+      : job.pending
+        ? `due ${formatDuration(Math.max(0, now - (job.dueSince ?? now)))} ago, waiting for idle`
+        : job.nextAt === undefined
+          ? job.mode === "once"
+            ? "spent"
+            : "awaiting wakeup"
+          : `next in ${formatDuration(Math.max(0, job.nextAt - now))} (${formatClockTime(job.nextAt).slice(0, 5)})`;
     const bounds = [
       job.maxRuns !== undefined ? `max ${job.maxRuns} runs` : undefined,
       job.until !== undefined ? `until ${new Date(job.until).toISOString()}` : undefined,
       job.lastOutcome ? `last: ${job.lastOutcome}` : undefined,
+      job.skipped > 0 ? `skipped ${job.skipped}` : undefined,
+      // The TTL only binds an unbounded loop, so a bounded one does not claim it.
+      hasBound(job) ? undefined : `expires in ${formatDuration(Math.max(0, job.expiresAt - now))}`,
     ]
       .filter(Boolean)
       .join(" · ");
-    return `◷ ${job.id} · ${cadence} · ${next} · runs ${job.runs}${bounds ? ` · ${bounds}` : ""} · expires in ${expiresIn} · "${truncate(job.prompt)}"`;
+    return `◷ ${job.id} · ${cadence} · ${next} · runs ${job.runs}${bounds ? ` · ${bounds}` : ""} · "${truncate(job.prompt)}"`;
   }
 
   /** `.pi/loop.md` (project) wins over `~/.pi/agent/loop.md` (user), like Claude. */
@@ -1247,7 +1519,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerCommand("loop", {
     description:
-      "Run a prompt repeatedly in this session: /loop [interval] [--cold] <prompt> · /loop list · /loop stop [id|all]",
+      "Run a prompt repeatedly in this session: /loop [interval] [--cold] <prompt> · /loop list · /loop stop|cancel [id|all]",
     getArgumentCompletions: (prefix: string) => {
       const values = ["list", "stop", "stop all", "5m", "10m", "30m", "1h"];
       const items = values
@@ -1271,7 +1543,8 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      if (head === "stop") {
+      // `cancel` is the tool's word for the same act, so both spellings work here.
+      if (head === "stop" || head === "cancel") {
         const target = rest.join(" ").trim();
         if (!target || target === "all") {
           // The mirror can lag a session start, and `stop all` must not report
@@ -1461,6 +1734,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("agent_settled", async (_event, ctx) => {
     uiCtx = ctx;
+    closeOutcome();
     const job = dynamicJob();
     if (job) {
       const decision = decideDynamicSettle(job);
@@ -1514,13 +1788,19 @@ type PersistedLoops = {
     runs: number;
     /** Absent in stores written before pausing existed; absent means armed. */
     paused?: boolean;
-    /** A one-shot's due instant, so a resumed session restores what it was waiting for. */
+    /** The armed slot: a one-shot's instant, or a fixed loop's next slot (absent in older stores). */
     nextAt?: number;
     maxRuns?: number;
     until?: number;
     lastRunAt?: number;
     lastOutcome?: "ok" | "error";
     lastError?: string;
+    /** Absent in stores written before missed-fire accounting. */
+    skipped?: number;
+    history?: FireRecord[];
+    pauseAfterFailures?: number;
+    failureStreak?: number;
+    pausedReason?: string;
   }>;
 };
 

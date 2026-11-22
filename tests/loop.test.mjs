@@ -180,6 +180,17 @@ test('nextFixedRun does not catch up missed slots', () => {
   assert.equal(loop.nextFixedRun(previous, now, 300_000), now + 300_000);
 });
 
+test('a late fire stays on the original phase, and counts the slots it ran past', () => {
+  // Due at 1,000,000 on a 5m cadence, delivered 12.5 minutes late: the slots at
+  // +5m and +10m passed unfired, and the next fire is the +15m slot — not 5m
+  // after the late fire, which is how "every 2h" used to slide off the clock.
+  const previous = 1_000_000;
+  const now = previous + 750_000;
+  assert.equal(loop.missedSlots(previous, now, 300_000), 2);
+  assert.equal(loop.nextFixedRun(previous, now, 300_000), previous + 900_000);
+  assert.equal(loop.missedSlots(previous, previous + 1_000, 300_000), 0);
+});
+
 test('clampWakeupSeconds holds the [60, 3600] window', () => {
   assert.deepEqual(loop.clampWakeupSeconds(270), { seconds: 270, clamped: false });
   assert.deepEqual(loop.clampWakeupSeconds(5), { seconds: 60, clamped: true });
@@ -409,7 +420,7 @@ test('/loop list reports each armed loop', async () => {
   h.notices.length = 0;
   await run(h, 'list');
   assert.equal(h.notices.length, 1);
-  assert.match(h.notices[0].message, /^◷ [a-z0-9]+ · every 30m · next in 30m · runs 1 · expires in 7d · "sweep the queue"$/);
+  assert.match(h.notices[0].message, /^◷ [a-z0-9]+ · every 30m · next in 30m \(\d\d:\d\d\) · runs 1 · expires in 7d · "sweep the queue"$/);
   h.handlers.get('session_shutdown')();
 });
 
@@ -515,7 +526,7 @@ test('/loop list shows both backends, each tagged with its execution home', asyn
   h.notices.length = 0;
   await run(h, 'list');
   assert.equal(h.notices.length, 2);
-  assert.match(h.notices[0].message, /^◷ [a-z0-9]+ · every 30m · next in 30m · runs 1 · expires in 7d · "sweep the queue"$/);
+  assert.match(h.notices[0].message, /^◷ [a-z0-9]+ · every 30m · next in 30m \(\d\d:\d\d\) · runs 1 · expires in 7d · "sweep the queue"$/);
   assert.match(h.notices[1].message, /^◷ cold-a · \[cold\] every 1m · next in 1m · runs 0 · "say hello"$/);
   h.handlers.get('session_shutdown')();
 });
@@ -923,19 +934,19 @@ test('a paused loop cannot be run, and says which verb comes first', async () =>
   h.handlers.get('session_shutdown')();
 });
 
-test('an update that changes nothing is an error, not a silent success', async () => {
+test('an empty update is an error, and re-asserting current values succeeds with nothing changed', async () => {
   const h = await started();
   const created = ask(h, LIVE_CREATE, 'r1', { schedule: '5m', prompt: 'x' });
 
   const empty = ask(h, LIVE_UPDATE, 'r2', { jobId: created.data.id });
   assert.equal(empty.success, false);
-  assert.match(empty.error, /Nothing changed/);
+  assert.match(empty.error, /Nothing to change/);
 
-  // Re-sending the cadence it already has is nothing too: a caller that cannot
-  // tell "applied" from "no-op" will report a change that never happened.
-  const same = ask(h, LIVE_UPDATE, 'r3', { jobId: created.data.id, schedule: '5m' });
-  assert.equal(same.success, false);
-  assert.match(same.error, /Nothing changed/);
+  // An idempotent caller re-asserts the state it wants; `changed: []` is how it
+  // tells "already so" from "applied", without having to treat it as a failure.
+  const same = ask(h, LIVE_UPDATE, 'r3', { jobId: created.data.id, schedule: '5m', prompt: 'x' });
+  assert.equal(same.success, true);
+  assert.deepEqual(same.data.changed, []);
   h.handlers.get('session_shutdown')();
 });
 
@@ -1043,4 +1054,147 @@ test('ScheduleWakeup cannot pace a paused loop back to life', async () => {
   assert.equal(ask(h, LIVE_LIST, 'r2').data.jobs[0].nextAt, undefined);
   assert.equal(h.statuses.get('loop'), '◷ 1 loop · paused');
   h.handlers.get('session_shutdown')();
+});
+
+// ── Missed fires, waiting fires, history and the failure policy ─────────────
+
+test('a fire held behind a busy session is reported as due, then fires late with its skipped slots counted', async (t) => {
+  t.mock.timers.enable({ apis: ['setInterval', 'Date'], now: 0 });
+  const h = await started();
+  const created = ask(h, LIVE_CREATE, 'r1', { schedule: '5m', prompt: 'check the deploy' });
+  t.mock.timers.tick(1000);
+  assert.equal(h.sent.length, 1, 'the first fire runs as soon as the session is idle');
+
+  h.ctx.isIdle = () => false;
+  t.mock.timers.tick(16 * 60_000);
+  assert.equal(h.sent.length, 1, 'nothing fires mid-turn');
+  assert.match(h.statuses.get('loop'), /1 due · waiting for idle/);
+  const waiting = ask(h, LIVE_LIST, 'r2').data.jobs[0];
+  assert.equal(waiting.waitingForIdle, true);
+  assert.equal(waiting.dueSince, 300_000);
+
+  h.ctx.isIdle = () => true;
+  t.mock.timers.tick(1000);
+  assert.equal(h.sent.length, 2, 'one late fire, not a burst');
+  const job = ask(h, LIVE_LIST, 'r3').data.jobs[0];
+  assert.equal(job.skipped, 2, 'the +10m and +15m slots passed unfired');
+  assert.equal(job.history.at(-1).skipped, 2);
+  assert.ok(job.history.at(-1).lateMs >= 11 * 60_000);
+  assert.equal(job.nextAt, 1_200_000, 'next fire is the +20m slot on the original phase');
+  assert.ok(h.notices.some((n) => n.message.includes(`Loop ${created.data.id}`) && /skipped 2 slots/.test(n.message)));
+  h.handlers.get('session_shutdown')();
+});
+
+test('a fire records what its run said, and an error in a later turn of the same fire sticks', async () => {
+  const h = await started();
+  const { data } = ask(h, LIVE_CREATE, 'r1', { schedule: '5m', prompt: 'check the deploy', pauseAfterFailures: 0 });
+  ask(h, LIVE_RUN, 'r1b', { jobId: data.id });
+  h.handlers.get('turn_end')({}, h.ctx); // delivers the queued fire
+  h.handlers.get('turn_end')({ message: { stopReason: 'toolUse', content: [{ type: 'toolCall' }] } }, h.ctx);
+  h.handlers.get('turn_end')(
+    { message: { stopReason: 'stop', content: [{ type: 'text', text: 'Deploy is green.\n2 new warnings.' }] } },
+    h.ctx,
+  );
+  let entry = ask(h, LIVE_LIST, 'r2').data.jobs[0].history.at(-1);
+  assert.equal(entry.outcome, 'ok');
+  assert.equal(entry.summary, 'Deploy is green. 2 new warnings.');
+
+  h.handlers.get('turn_end')({ message: { stopReason: 'error' } }, h.ctx);
+  entry = ask(h, LIVE_LIST, 'r3').data.jobs[0].history.at(-1);
+  assert.equal(entry.outcome, 'error');
+  assert.equal(entry.summary, 'Deploy is green. 2 new warnings.', 'the last thing it said survives the error');
+  h.handlers.get('session_shutdown')();
+});
+
+test('a loop that keeps failing pauses itself, and resume gives it a fresh count', async () => {
+  const h = await started();
+  const { data } = ask(h, LIVE_CREATE, 'r1', { schedule: '5m', prompt: 'check the deploy', pauseAfterFailures: 2 });
+  let n = 0;
+  const failedFire = () => {
+    ask(h, LIVE_RUN, `run${++n}`, { jobId: data.id });
+    h.handlers.get('turn_end')({}, h.ctx); // delivers the queued fire
+    h.handlers.get('turn_end')({ message: { stopReason: 'error' } }, h.ctx);
+    h.handlers.get('agent_settled')({}, h.ctx);
+  };
+
+  failedFire();
+  assert.equal(ask(h, LIVE_LIST, 'r2').data.jobs[0].paused, false, 'one failure is not a pattern');
+  failedFire();
+
+  const paused = ask(h, LIVE_LIST, 'r4').data.jobs[0];
+  assert.equal(paused.paused, true);
+  assert.equal(paused.pausedReason, 'paused after 2 failed fires in a row');
+  assert.equal(paused.nextAt, undefined, 'it stops billing');
+  assert.ok(h.notices.some((n) => n.level === 'warning' && n.message.includes('paused after 2 failed fires')));
+
+  const resumed = ask(h, LIVE_UPDATE, 'r5', { jobId: data.id, paused: false }).data.job;
+  assert.equal(resumed.pausedReason, undefined);
+  assert.equal(resumed.failureStreak, 0);
+  h.handlers.get('session_shutdown')();
+});
+
+test('a resumed session lands back on its phase and counts the fires it slept through', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-loop-phase-'));
+  const sessionId = 'session-phase';
+  const now = Date.now();
+  fs.mkdirSync(path.join(dir, '.pi', 'loops'), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, '.pi', 'loops', `${sessionId}.json`),
+    JSON.stringify({
+      version: 1,
+      loops: [
+        {
+          id: 'slept',
+          prompt: 'p',
+          mode: 'fixed',
+          intervalMs: 300_000,
+          createdAt: now - 3_600_000,
+          expiresAt: now + 86_400_000,
+          runs: 3,
+          nextAt: now - 720_000,
+        },
+      ],
+    }),
+  );
+  const h = await started({ cwd: dir, sessionId });
+  const job = ask(h, LIVE_LIST, 'r1').data.jobs[0];
+  // Slots at -12m, -7m and -2m passed with the session closed; the next is +3m.
+  assert.equal(job.skipped, 3);
+  assert.equal(job.nextAt, now - 720_000 + 900_000);
+  assert.deepEqual(h.sent, [], 'still no catch-up burst');
+  assert.ok(h.notices.some((n) => n.message.includes('slept (3)')));
+  h.handlers.get('session_shutdown')();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('a bounded loop outlives the 7-day TTL, because it already has an end', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-loop-bounded-'));
+  const sessionId = 'session-bounded';
+  const now = Date.now();
+  fs.mkdirSync(path.join(dir, '.pi', 'loops'), { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, '.pi', 'loops', `${sessionId}.json`),
+    JSON.stringify({
+      version: 1,
+      loops: [
+        { id: 'bounded', prompt: 'p', mode: 'fixed', intervalMs: 86_400_000, createdAt: now - 8 * 86_400_000, expiresAt: now - 86_400_000, runs: 8, until: now + 7 * 86_400_000 },
+        { id: 'unbounded', prompt: 'p', mode: 'fixed', intervalMs: 86_400_000, createdAt: now - 8 * 86_400_000, expiresAt: now - 86_400_000, runs: 8 },
+      ],
+    }),
+  );
+  const h = await started({ cwd: dir, sessionId });
+  const jobs = ask(h, LIVE_LIST, 'r1').data.jobs;
+  assert.deepEqual(jobs.map((job) => job.id), ['bounded']);
+  assert.equal(jobs[0].expiresAt, undefined, 'a bounded loop reports no TTL it will not hit');
+  h.handlers.get('session_shutdown')();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test('the loop store ignores itself, so per-session state never reaches a commit', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pi-loop-ignore-'));
+  const h = await started({ cwd: dir, sessionId: 'session-ignore' });
+  ask(h, LIVE_CREATE, 'r1', { schedule: '5m', prompt: 'p' });
+  assert.equal(fs.readFileSync(path.join(dir, '.pi', 'loops', '.gitignore'), 'utf8').trim().split('\n').at(-1), '*');
+  h.handlers.get('session_shutdown')();
+  fs.rmSync(dir, { recursive: true, force: true });
 });

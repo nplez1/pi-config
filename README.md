@@ -751,7 +751,12 @@ live tick look nearly free.
 /loop                            self-paced on .pi/loop.md (or ~/.pi/agent/loop.md)
 /loop 5m                         that file at a fixed cadence
 /loop list · /loop stop [id|all] both backends; cold rows are tagged [cold]
+/loop cancel [id|all]            the same as stop — `cancel` is the tool's word for it
 ```
+
+The full contract both doors share — grammar per home, when a fire really
+happens, what survives what, every bound — is
+[`plugins/pi-subagents/docs/scheduling.md`](plugins/pi-subagents/docs/scheduling.md).
 
 Recurring work has exactly **two doors — one per audience**, and neither one is
 the other's job:
@@ -824,10 +829,11 @@ called from `plugins/pi-subagents/src/schedule-live-rpc.ts`. The scheduler
 announces restored and changed jobs on `subagents:scheduled`, which is how
 `/loop` mirrors them without knowing where the scheduler keeps its store.
 
-Both sides refuse a call that changes nothing, so "did it work?" is answerable
-rather than assumed; `run` never fires inside the turn that asked for it; and a
-cold fire that fails synchronously is reported as a failure instead of as a run
-that started.
+Both sides refuse an update that names no field, and answer one whose values
+already hold with `changed: []` rather than an error, so re-asserting a desired
+state is safe and "did anything move?" is still answerable; `run` never fires
+inside the turn that asked for it; and a cold fire that fails synchronously is
+reported as a failure instead of as a run that started.
 
 Self-paced mode is driven by the `ScheduleWakeup` tool, which the model calls at
 the end of each turn with `delaySeconds` (clamped to `[60, 3600]`), a `reason`,
@@ -855,9 +861,11 @@ Rules carried over from Claude, each of which is a lesson rather than a detail:
 
 | Rule | Why |
 | --- | --- |
-| Fires land between turns, never mid-response | a due loop waits for the run to settle |
-| No catch-up | N missed fires become one fire, not N |
-| 7-day expiry, one final fire | a forgotten loop cannot run forever |
+| Fires land between turns, never mid-response | a due loop waits for the run to settle, and says `1 due · waiting for idle` meanwhile |
+| No catch-up | N missed fires become one fire, not N — the N−1 are counted (`skipped`) and the fire records how late it was |
+| The cadence keeps its phase | a late fire does not restart the clock, so "every 2h" stays on its original rhythm |
+| 7-day expiry for an unbounded loop, one final fire | a forgotten loop cannot run forever; one with `maxRuns`/`until` has its own end and is exempt |
+| 3 failed fires in a row pause it (`pauseAfterFailures`) | a broken loop stops spending the main context every fire |
 | 60 s floor | anything faster is a busy-wait with extra tokens |
 | First iteration runs at creation | a loop you cannot see start is one you cannot trust |
 | Max 50 live loops, one self-paced loop | a pending wakeup is a per-session slot |
@@ -865,8 +873,10 @@ Rules carried over from Claude, each of which is a lesson rather than a detail:
 
 Session-scoped, restored on `/resume`, never standing: live loops are written to
 `.pi/loops/<sessionId>.json` and cold jobs to `.pi/subagent-schedules/<sessionId>.json`.
-A new session starts empty, a resumed one re-arms its own work one interval out
-(no replay of missed slots), and closing the terminal stops everything — there is
+Each directory writes a `*` `.gitignore` into itself, so neither reaches a commit
+in whatever repository pi runs in. A new session starts empty, a resumed one
+re-arms its own work at its next slot (a live loop counts the slots that passed
+while closed and says so once — no replay), and closing the terminal stops everything — there is
 no durable flag to set, because a schedule nobody is listening to is not a
 feature.
 
