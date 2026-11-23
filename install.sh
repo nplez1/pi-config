@@ -25,6 +25,23 @@
 # target that is still a symlink is converted into a local copy. BACKUP_ROOT and
 # backup_slot below are the implementation.
 #
+# Linking only ever adds. Two things therefore have to be PRUNED when this repo
+# stops carrying what they name, because neither can be recognised by a file
+# that was just written:
+#
+#   a dangling symlink        the entry point of a file this repo removed (an
+#                             agent .md, an extension .ts). Left in place it is a
+#                             load error on every launch.
+#   a package entry in the    what a removed plugin or bundle left behind in the
+#   machine-owned settings     one file that is never overwritten. Left in place,
+#                             pi fails to load the extension and `pi-bolt compile`
+#                             refuses the whole build (2026-11-23, rpiv-advisor).
+#
+# Both are pruned on evidence, never on "it looks old": a link only when it
+# points into this clone and its target is gone, an entry only when what it names
+# cannot resolve here. `prune_dir` and `scripts/prune-stale.mjs` are the
+# implementation, and `--dry-run` reports both without touching anything.
+#
 # Usage:
 #   ./install.sh              link + seed, fetch submodules, npm install plugins,
 #                             then install/compile Pi-Bolt and swap `pi` to it
@@ -123,6 +140,49 @@ seed() {
     echo "  seed     $dst (copy of $rel)"
     CHANGED=$((CHANGED + 1))
   fi
+}
+
+# ---- prune: links whose target in this repo is gone -------------------------
+
+# A file this repo removes leaves its symlink behind. install.sh cannot know a
+# file was removed — nothing local records what was linked last run — but the
+# link says so itself: it points into this clone and its target is not there.
+#
+# Only that case is pruned. A link that points somewhere else (another tool's),
+# a link whose target still exists (stale for some other reason), and a real file
+# are all left exactly as they are, and a dangling link costs nothing to delete:
+# it is not a real file, so nothing can be lost in the backup tree.
+prune_dir() {
+  local dir="$1" l target
+  [ -d "$dir" ] || return 0
+  for l in "$dir"/*; do
+    [ -L "$l" ] || continue
+    target="$(readlink "$l")"
+    case "$target" in "$REPO"/*) ;; *) continue ;; esac
+    [ -e "$target" ] && continue
+    local shown="${target#"$REPO"/}"
+    if [ "$MODE" = "dry-run" ]; then
+      echo "  would prune  $l (target gone: $shown)"
+    elif ! rm -f "$l" 2>/dev/null; then
+      echo "  SKIP     $l (cannot remove a dangling symlink)"; continue
+    else
+      echo "  prune    $l (target gone: $shown)"
+    fi
+    CHANGED=$((CHANGED + 1))
+  done
+}
+
+# Every directory a portable target is linked into. A directory listed twice is
+# harmless: the second pass finds nothing to prune.
+prune_dirs() {
+  local _rel dst
+  while IFS=$'\t' read -r _rel dst; do dirname "$dst"; done < <(portable_targets)
+  # The three directories this clone fills by globbing are named rather than
+  # derived from portable_targets: a directory whose every entry this clone
+  # dropped is exactly the case whose dangling link has to be pruned, and it has
+  # nothing left to derive from. A directory scanned twice costs one extra pass
+  # over its entries and finds nothing the second time.
+  printf '%s\n' "$HOME/.pi/agent/agents" "$HOME/.pi/agent/extensions" "$HOME/.agents/skills"
 }
 
 unlink_one() {
@@ -429,6 +489,18 @@ if (mode !== "dry-run") fs.writeFileSync(livePath, JSON.stringify(live, null, 2)
 NODE
 
 echo
+echo "Package entries whose source this clone no longer has:"
+# A package entry in the machine-owned settings outlives what it names, and a
+# bundle entry whose package.json is gone stops `pi-bolt compile` outright. The
+# rule lives in scripts/prune-stale.mjs so the Windows port runs the same one.
+if [ -f "$REPO/scripts/prune-stale.mjs" ]; then
+  node "$REPO/scripts/prune-stale.mjs" --repo "$REPO" --home "$HOME" --mode "$MODE" \
+    || echo "  SKIP     prune not applied"
+else
+  echo "  skip     no scripts/prune-stale.mjs in this clone"
+fi
+
+echo
 echo "This machine's settings overlay (dot-pi/agent/settings.local.json):"
 if [ -f "$REPO/scripts/settings-overlay.mjs" ]; then
   node "$REPO/scripts/settings-overlay.mjs" --repo "$REPO" --home "$HOME" --mode "$MODE" \
@@ -493,7 +565,9 @@ echo
 echo "Plugins directory (settings.json references plugins/<name>):"
 dst="$HOME/.pi/agent/plugins"; src="$REPO/plugins"
 [ "$MODE" = "dry-run" ] || mkdir -p "$(dirname "$dst")"
-if [ -L "$dst" ] && [ "$(readlink "$dst")" = "$src" ]; then
+if [ ! -d "$src" ]; then
+  echo "  skip     $dst (this clone has no plugins/)"
+elif [ -L "$dst" ] && [ "$(readlink "$dst")" = "$src" ]; then
   echo "  ok       $dst"
 else
   if [ -e "$dst" ] && [ ! -L "$dst" ]; then
@@ -514,7 +588,9 @@ echo
 echo "Pi-Bolt bundles directory (piBolt.packages references pi-bolt-bundles/<name>):"
 dst="$HOME/.pi/agent/pi-bolt-bundles"; src="$REPO/pi-bolt"
 [ "$MODE" = "dry-run" ] || mkdir -p "$(dirname "$dst")"
-if [ -L "$dst" ] && [ "$(readlink "$dst")" = "$src" ]; then
+if [ ! -d "$src" ]; then
+  echo "  skip     $dst (this clone has no pi-bolt/)"
+elif [ -L "$dst" ] && [ "$(readlink "$dst")" = "$src" ]; then
   echo "  ok       $dst"
 else
   if [ -e "$dst" ] && [ ! -L "$dst" ]; then
@@ -530,6 +606,15 @@ else
     CHANGED=$((CHANGED + 1))
   fi
 fi
+
+echo
+echo "Links whose target this clone no longer has:"
+# After the two directory links above, so a link this script just made is not
+# reported as dangling, and one whose source this clone dropped is removed rather
+# than recreated.
+pruned_slot="$CHANGED"
+while IFS= read -r prune_target; do prune_dir "$prune_target"; done < <(prune_dirs)
+if [ "$CHANGED" = "$pruned_slot" ]; then echo "  ok       nothing dangling"; fi
 
 if [ "$MODE" = "install" ] && [ "${PI_CONFIG_SKIP_PLUGINS:-0}" != "1" ]; then
   echo

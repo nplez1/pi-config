@@ -13,8 +13,10 @@ const plugin = fileURLToPath(new URL('../plugins/pi-codex-goal/', import.meta.ur
 fs.cpSync(path.join(plugin, 'src'), path.join(root, 'src'), { recursive: true });
 fs.writeFileSync(path.join(root, 'package.json'), '{"type":"module"}');
 for (const [name, code] of [
-  ['pi-tui', 'import { stripVTControlCharacters } from "node:util"; export const stripTerminalSequences = stripVTControlCharacters;'],
-  ['pi-ai', 'export function isContextOverflow() { return false; }'],
+  // The fork imports two sanitisers from pi-tui: terminal sequences, then any
+  // remaining control character (a newline in an objective becomes a space).
+  ['pi-tui', 'import { stripVTControlCharacters } from "node:util";\nexport const stripTerminalSequences = stripVTControlCharacters;\nexport const replaceControlCharacters = (text) => text.replace(/[\\x00-\\x1f\\x7f-\\x9f]/g, " ");'],
+  ['pi-ai', 'export function isContextOverflow() { return false; }\nexport function isRetryableAssistantError() { return false; }'],
 ]) {
   const dir = path.join(root, 'node_modules', '@earendil-works', name);
   fs.mkdirSync(dir, { recursive: true });

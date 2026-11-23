@@ -15,6 +15,16 @@ const bash = ['/bin/bash', '/usr/bin/bash'].find((candidate) => fs.existsSync(ca
 const posix = (name, fn) => test(name,
   { skip: bash ? false : 'install.sh is POSIX: this test needs /bin/bash and its system utilities' }, fn);
 
+// The submodule-leftover prune asks git what this clone still carries, so those
+// cases need git on the fixture's PATH as well.
+const gitBinary = ['/usr/bin/git', '/bin/git', '/opt/homebrew/bin/git', '/usr/local/bin/git']
+  .find((candidate) => fs.existsSync(candidate)) ?? null;
+const posixGit = (name, fn) => test(name, {
+  skip: !bash ? 'install.sh is POSIX: this test needs /bin/bash and its system utilities'
+    : !gitBinary ? 'these prunes read git, which is not installed here'
+      : false,
+}, fn);
+
 // Run the entire installer against a disposable repo and HOME. PATH contains
 // only explicitly linked system utilities and the commands each test supplies.
 function fixture(t, { brew = true, fd = false, rg = false, failure = false, noInstall = false } = {}) {
@@ -29,15 +39,25 @@ function fixture(t, { brew = true, fd = false, rg = false, failure = false, noIn
   }
   fs.copyFileSync(installer, path.join(repo, 'install.sh'));
   fs.writeFileSync(path.join(repo, 'patches/model-picker.mjs'), '');
+  // The stale-package prune install.sh calls by path; without it every run prints
+  // the fallback skip instead of pruning.
+  fs.mkdirSync(path.join(repo, 'scripts'), { recursive: true });
+  fs.copyFileSync(fileURLToPath(new URL('../scripts/prune-stale.mjs', import.meta.url)),
+    path.join(repo, 'scripts/prune-stale.mjs'));
   for (const name of ['settings.json', 'subagents.json']) {
     fs.writeFileSync(path.join(repo, 'dot-pi/agent', name), '{}\n');
   }
+  // A plugin this clone carries, so a `plugins/<name>` entry in settings.json is
+  // not pruned as stale by the fixture being empty.
+  fs.mkdirSync(path.join(repo, 'plugins/pi-codex-goal'), { recursive: true });
+  fs.writeFileSync(path.join(repo, 'plugins/pi-codex-goal/package.json'), '{}\n');
   for (const name of ['date', 'dirname', 'basename', 'mkdir', 'cp', 'ln', 'readlink', 'rm', 'ls', 'head', 'sed', 'cat']) {
     const source = ['/usr/bin', '/bin'].map(dir => path.join(dir, name)).find(fs.existsSync);
     assert.ok(source, `system utility ${name} is needed for this test`);
     fs.symlinkSync(source, path.join(bin, name));
   }
   fs.symlinkSync(process.execPath, path.join(bin, 'node'));
+  if (gitBinary) fs.symlinkSync(gitBinary, path.join(bin, 'git'));
   for (const [name, present] of [['fd', fd], ['rg', rg]]) {
     if (present) fs.symlinkSync('/usr/bin/true', path.join(bin, name));
   }
@@ -191,4 +211,108 @@ posix('capture and uninstall never invoke brew, even with missing commands', t =
   }
   assert.match(f.run('uninstall'), /Removing symlinks/);
   assert.deepEqual(f.calls(), []);
+});
+
+// ---- pruning -----------------------------------------------------------------
+//
+// Linking only ever adds, so a file this repo stops carrying leaves its symlink
+// behind, and the machine-owned settings.json keeps naming a plugin or bundle
+// that is gone. Both are load errors on every launch, and a bundle that no longer
+// resolves stops `pi-bolt compile` outright (2026-11-23, rpiv-advisor).
+
+posix('prunes a link whose file this clone dropped, and never one that is not ours', t => {
+  const f = fixture(t, { fd: true, rg: true });
+  const agentSource = path.join(f.repo, 'dot-pi/agent/agents/helper.md');
+  fs.mkdirSync(path.dirname(agentSource), { recursive: true });
+  fs.writeFileSync(agentSource, '# helper\n');
+  f.run();
+  const linked = path.join(f.home, '.pi/agent/agents/helper.md');
+  assert.ok(fs.lstatSync(linked).isSymbolicLink(), 'a repo agent is linked');
+  // Dangling for someone else's reason: not pointing into this clone, so it stays.
+  const foreign = path.join(f.home, '.pi/agent/agents/foreign.md');
+  fs.symlinkSync(path.join(f.home, 'missing.md'), foreign);
+
+  fs.rmSync(agentSource);
+  const out = f.run();
+  assert.match(out, /prune\s+\S*helper\.md \(target gone: dot-pi\/agent\/agents\/helper\.md\)/);
+  assert.equal(fs.existsSync(linked), false, 'the dangling link is gone');
+  assert.ok(fs.lstatSync(foreign).isSymbolicLink(), 'a link that points elsewhere is kept');
+  // Nothing left to prune, so a second run says so instead of repeating itself.
+  assert.match(f.run(), /ok\s+nothing dangling/);
+});
+
+posix('--dry-run reports a dangling link without removing it', t => {
+  const f = fixture(t, { fd: true, rg: true });
+  const agentSource = path.join(f.repo, 'dot-pi/agent/agents/helper.md');
+  fs.mkdirSync(path.dirname(agentSource), { recursive: true });
+  fs.writeFileSync(agentSource, '# helper\n');
+  f.run();
+  fs.rmSync(agentSource);
+  const out = f.run('--dry-run');
+  assert.match(out, /would prune\s+\S*helper\.md \(target gone: dot-pi\/agent\/agents\/helper\.md\)/);
+  assert.ok(fs.lstatSync(path.join(f.home, '.pi/agent/agents/helper.md')).isSymbolicLink(),
+    'a dry run changes nothing');
+});
+
+posix('prunes package entries this clone no longer has, and only those', t => {
+  const f = fixture(t, { fd: true, rg: true });
+  // A plugin and a bundle this clone still carries, one of each it dropped.
+  for (const [rel, body] of [
+    ['plugins/pi-todo/package.json', '{}\n'],
+    ['pi-bolt/pi-bolt-subagents/package.json', '{}\n'],
+    ['pi-bolt/pi-bolt-half-built/README', 'only ignored output is left\n'],
+  ]) {
+    fs.mkdirSync(path.dirname(path.join(f.repo, rel)), { recursive: true });
+    fs.writeFileSync(path.join(f.repo, rel), body);
+  }
+  const live = path.join(f.home, '.pi/agent/settings.json');
+  fs.mkdirSync(path.dirname(live), { recursive: true });
+  fs.writeFileSync(live, JSON.stringify({
+    packages: ['plugins/pi-todo', 'plugins/pi-advisor-subagent', 'npm:pi-web-access', '-plugins/pi-todo'],
+    piBolt: {
+      packages: [
+        'pi-bolt-bundles/pi-bolt-subagents',
+        'pi-bolt-bundles/pi-bolt-advisor-subagent',
+        'pi-bolt-bundles/pi-bolt-half-built',
+        '-plugins/pi-todo',
+      ],
+    },
+  }, null, 2) + '\n');
+
+  const out = f.run();
+  assert.match(out, /prune\s+packages: plugins\/pi-advisor-subagent \(the directory is gone\)/);
+  assert.match(out, /prune\s+piBolt\.packages: pi-bolt-bundles\/pi-bolt-advisor-subagent \(the directory is gone\)/);
+  assert.match(out, /prune\s+piBolt\.packages: pi-bolt-bundles\/pi-bolt-half-built \(no package\.json in it\)/);
+  assert.deepEqual(JSON.parse(fs.readFileSync(live, 'utf8')), {
+    packages: ['plugins/pi-todo', 'npm:pi-web-access', '-plugins/pi-todo'],
+    piBolt: { packages: ['pi-bolt-bundles/pi-bolt-subagents', '-plugins/pi-todo'] },
+  });
+  // Removing nothing must not rewrite the file, so an unchanged machine is a
+  // byte-for-byte no-op.
+  const before = fs.readFileSync(live, 'utf8');
+  f.run();
+  assert.equal(fs.readFileSync(live, 'utf8'), before);
+});
+
+posixGit('prunes a checkout git no longer carries as a submodule of this clone', t => {
+  const f = fixture(t, { fd: true, rg: true });
+  execFileSync(gitBinary, ['init', '-q'], { cwd: f.repo });
+  fs.writeFileSync(path.join(f.repo, '.gitmodules'),
+    '[submodule "plugins/pi-todo"]\n\tpath = plugins/pi-todo\n');
+  // Both directories exist with a package.json: only the submodule registration
+  // tells the plugin this clone still carries from a deleted one's leftover,
+  // which `git submodule update` cannot rmdir while node_modules sits inside it.
+  for (const name of ['pi-todo', 'pi-advisor-subagent']) {
+    fs.mkdirSync(path.join(f.repo, 'plugins', name), { recursive: true });
+    fs.writeFileSync(path.join(f.repo, 'plugins', name, 'package.json'), '{}\n');
+  }
+  const live = path.join(f.home, '.pi/agent/settings.json');
+  fs.mkdirSync(path.dirname(live), { recursive: true });
+  fs.writeFileSync(live, JSON.stringify({
+    packages: ['plugins/pi-todo', 'plugins/pi-advisor-subagent'],
+  }, null, 2) + '\n');
+
+  assert.match(f.run(),
+    /prune\s+packages: plugins\/pi-advisor-subagent \(not part of this clone any more\)/);
+  assert.deepEqual(JSON.parse(fs.readFileSync(live, 'utf8')).packages, ['plugins/pi-todo']);
 });

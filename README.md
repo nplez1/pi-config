@@ -81,6 +81,45 @@ too: `install.sh` additively syncs them into an existing machine-owned file
 edit reaches a machine that has already run the install — while never touching a
 model choice that machine made locally.
 
+### When a package leaves this repo
+
+Additive sync can add an entry but never remove one, and a package entry in
+`settings.json` outlives the thing it names. Removing the rpiv-advisor plugin
+(2026-11-23) left `plugins/pi-advisor-subagent` and
+`pi-bolt-bundles/pi-bolt-advisor-subagent` on every machine that had already
+seeded it: pi then failed to load an extension at every launch, and `pi-bolt
+compile` refused the whole build — `Could not resolve:
+"./package-pi-bolt-advisor-subagent/"` — because a bundle entry whose
+`package.json` is gone still names a package the compiler is told to materialize.
+
+`install.sh`, and `install.ps1`, which runs the same
+[`scripts/prune-stale.mjs`](scripts/prune-stale.mjs), now prune on evidence
+rather than on "it looks old":
+
+| Entry | Pruned when |
+| --- | --- |
+| `plugins/<name>` | nothing is on disk under it *and* git carries neither a registered submodule nor a tracked directory for it (a clone whose submodules have not been fetched yet keeps its entries), or git says the clone dropped it — unregistered and untracked, which is what a deleted submodule's checkout looks like while `git submodule update` cannot rmdir it over the `node_modules` inside |
+| `pi-bolt-bundles/<name>` | neither `~/.pi/agent/pi-bolt-bundles/<name>` nor `pi-bolt/<name>` has a `package.json` — that file is tracked, so only a deleted bundle source lacks one |
+
+`npm:` and URL entries, object-form resource filters, and negatives (`-plugins/x`,
+which remove a package another list added) are never touched.
+
+The Unix installer prunes the other half too: a symlink that points into this
+clone whose target is no longer there, which is what a removed agent `.md` or
+extension `.ts` leaves behind — a dangling `~/.pi/agent/agents/rpiv-advisor.md`
+is a load error at every launch, and the same class of noise in
+`~/.pi/agent/extensions`. A link that points elsewhere, or whose target still
+exists, is left alone. Windows links are junctions, hardlinks and copies, where
+"dangling" is not the same question, so that half stays Unix-only.
+
+Both report what they would remove without removing it, and say nothing on a
+machine with nothing stale:
+
+```sh
+~/Code/pi-config/install.sh --dry-run
+node scripts/prune-stale.mjs --repo . --home ~ --dry-run
+```
+
 ### Upgrading a machine that seeded before models moved
 
 `subagents.json` used to be symlinked, so on an older machine its per-agent models
@@ -192,8 +231,10 @@ Re-running it is safe and additive, whether the machine already has pi or ran an
 older version of this script: files it would replace are backed up, machine-owned
 keys (`defaultProvider`, `defaultModel`, `enabledModels`) are never overwritten,
 missing shared keys (codemode, the `piBolt` overrides, the pinned packages) are
-added, and a Pi-Bolt with a different compile set keeps the extensions it already
-had compiled in.
+added, an entry this repo no longer carries is pruned (see
+[When a package leaves this repo](#when-a-package-leaves-this-repo)), and a
+Pi-Bolt with a different compile set keeps the extensions it already had
+compiled in.
 
 Then: `export` any env var `models.json` references (e.g. `OMLX_API_KEY`), run
 `pi` and `/login` for the providers that machine has, and pick a default model

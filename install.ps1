@@ -19,6 +19,13 @@
   %USERPROFILE%\.pi-config-backups\<stamp>\<flattened path>, and a foreign
   symlink is replaced rather than backed up (its old target is printed first).
 
+  Linking only ever adds, so two things this repo stops carrying are pruned, on
+  evidence and never on "it looks old": a package entry in the machine-owned
+  settings.json whose source no longer resolves (scripts/prune-stale.mjs, shared
+  with install.sh, because a bundle entry whose package.json is gone stops
+  `pi-bolt compile` outright), and, on Unix, a link into this clone whose target
+  is gone. -DryRun reports both and changes nothing.
+
   Windows differences from install.sh, all printed as SKIP/note at run time:
     * Links are real symlinks when the process can make them (Developer Mode or
       an elevated prompt); otherwise a directory junction, then a hardlink, then
@@ -447,6 +454,17 @@ Write-Output ''
 Write-Output 'Machine-owned files (seeded once):'
 foreach ($pair in (Get-SeedTargets)) {
   Invoke-Seed $pair.Rel (Join-Path $HomeDir ($pair.Target -replace '/', '\'))
+}
+
+Write-Output ''
+Write-Output 'Package entries whose source this clone no longer has:'
+$pruneScript = Join-Path $Repo 'scripts/prune-stale.mjs'
+if (Test-Path -LiteralPath $pruneScript) {
+  $pruneArgs = @($pruneScript, '--repo', $Repo, '--home', $HomeDir)
+  if ($Mode -eq 'dry-run') { $pruneArgs += '--dry-run' }
+  & node @pruneArgs
+} else {
+  Write-Line 'skip' 'no scripts/prune-stale.mjs in this clone'
 }
 
 Write-Output ''
