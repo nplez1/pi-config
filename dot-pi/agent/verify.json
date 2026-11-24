@@ -1,0 +1,32 @@
+{
+  "byName": {
+    "orca": {
+      "commands": [
+        "pnpm tc",
+        "pnpm run check:code-quality:changed"
+      ],
+      "requires": [
+        "node_modules"
+      ],
+      "timeoutSeconds": 180,
+      "extensions": [
+        ".ts",
+        ".tsx",
+        ".js",
+        ".jsx",
+        ".mjs",
+        ".cjs"
+      ],
+      "ignorePaths": [
+        "node_modules",
+        "dist",
+        "build",
+        ".git"
+      ],
+      "maxPerSession": 300
+    }
+  },
+  "default": {
+    "commands": []
+  }
+}

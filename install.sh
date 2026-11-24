@@ -238,6 +238,7 @@ seed_targets() {
     "dot-pi/agent/settings.json"            "$HOME/.pi/agent/settings.json" \
     "dot-pi/agent/pi-system-one.json"       "$HOME/.pi/agent/pi-system-one.json" \
     "dot-pi/agent/subagents.json"           "$HOME/.pi/agent/subagents.json" \
+    "dot-pi/agent/verify.json"              "$HOME/.pi/agent/verify.json" \
     "dot-config/pi-config/model-roles.json" "$HOME/.config/pi-config/model-roles.json"
 }
 

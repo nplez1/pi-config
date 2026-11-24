@@ -807,6 +807,119 @@ Commands: `/pi-vcc` compacts now (keeping the last user turn, `keep:N [prompt]`
 to choose), `/pi-vcc-recall <query>` runs the recall search as a command, and
 `/smart-compaction [force]` prints the resume gate's status or fires it.
 
+## Loop guards — the turns that buy nothing
+
+Three extensions that came out of auditing 785 session files (62.8k assistant
+turns, 51.4k tool calls). Each closes a seam where the loop spends a whole turn
+to learn something the tooling already knows. Every claim below is a count from
+those transcripts, not an intuition.
+
+### `extensions/loop-guards.ts` — sleeps and subagent polls
+
+314 `sleep` calls burned **26.1 hours** of literal wall-clock, each inside a turn
+that re-read ~212k prompt tokens to discover nothing had changed. 122 of them
+were in the last month alone. Separately, 352 `get_subagent_result` calls: 184
+came back "still running" and 143 were bare `{}` polls, against a tool that
+notifies on completion anyway.
+
+`tool_call` guards, applied before execution:
+
+| shape | action |
+|---|---|
+| `sleep N` with nothing after it, `N > 30` | **blocked**, with a reason naming the bounded-poll and `wait: true` alternatives |
+| `sleep N` in front of a command, `N > 120` | **clamped** to 120s; the command still runs, and the note rides on the tool result |
+| `get_subagent_result` with an `agent_id` and no `wait: true` | **rewritten** to `wait: true` |
+| a sleep inside a pipeline or loop body | untouched — there it is part of the program |
+
+The clamp note appears in the result the model reads next, so the habit is
+corrected in context rather than silently. `/loop-guards` reports what fired.
+
+A short `sleep 2` before a health check is legitimate and is left alone. The
+guards target dead time, not delay.
+
+### `extensions/edit-repair.ts` — a failed edit carries its own correction
+
+Failed edits are the most expensive recoverable error in the loop: nothing is
+written, so the next turn goes on rebuilding the picture (882 `edit -> read`
+recoveries in the transition graph). 579 of 8,565 edits failed (6.8%), and their
+error text splits cleanly:
+
+| share | error | what the agent actually lacks |
+|---|---|---|
+| ~52% | "Found 2 occurrences of edits[N]" | the context that would pick one |
+| ~49% | "Could not find edits[N] / the exact text" | the region as it is now |
+| few | "overlap", "No changes made" | the conflicting ranges, or nothing |
+
+The handler replaces the error text with exactly that: every occurrence with line
+numbers, a **ready-to-use unique `oldText`** grown from the file for each, or —
+when nothing matched — the closest current region plus the lines in the model's
+`oldText` that no longer exist. `No changes made` becomes a success, because the
+file already holds the intended state.
+
+It never applies an edit itself. pi's edit tool already tries whitespace- and
+Unicode-normalised matching, so a miss means the text genuinely changed, and a
+"close enough" block would corrupt files. What it removes is the re-read, not the
+model's judgement.
+
+### `extensions/verify-after-edit.ts` — run the check at the boundary
+
+6,478 verification commands across the corpus (9.9% of all turns): `edit ->
+bash:typecheck` 1,118 times, `edit -> bash:test` 1,401 times, and `pnpm tc` alone
+issued 120 times verbatim. The model ends a turn with an edit and starts the next
+one issuing the same check.
+
+When a turn edits files, this runs the configured command at `turn_end` and
+appends the result, so the next request already contains the outcome: three turns
+(edit / issue check / read result) become two.
+
+**Opt-in.** With no config it does nothing. `dot-pi/agent/verify.json` seeds
+`~/.pi/agent/verify.json` (installed once, never overwritten, so a machine keeps
+its own edits), and it contains **no absolute paths** — projects are matched by
+identity, not location:
+
+```json
+{
+  "byName": {
+    "orca": {
+      "commands": ["pnpm tc", "pnpm run check:code-quality:changed"],
+      "timeoutSeconds": 180,
+      "extensions": [".ts", ".tsx"],
+      "ignorePaths": ["node_modules", "dist", "build"]
+    }
+  },
+  "default": { "commands": [] }
+}
+```
+
+Four ways to match, most specific first, each refining the previous:
+
+| source | covers |
+|---|---|
+| `<repo>/.pi/verify.json` **(tracked)** | every worktree, fork and clone of that repo, on every machine — a worktree is a checkout, so a committed file is already there |
+| `projects` — absolute prefixes **or globs** | one entry covers whatever roots a tool invents, e.g. `/Users/me/wt/*` |
+| `byName` — `package.json` `name` | any checkout anywhere, including a scratch clone in `/tmp` |
+| `default` | the fallback for everything else |
+
+Matching is done from a **discovered project root**, not from the session's
+`cwd`: the extension walks upward to the nearest `.git` (a worktree's `.git` is a
+file, which works) and finds the nearest `.pi/verify.json` on the way. So a
+session opened in `src/main/` still gets the repo's config. The check itself
+then runs at that project root, because `pnpm tc` is root-relative — `runIn:
+"cwd"` opts out.
+
+`ignorePaths` entries are whole path segments, so `dist` skips `src/dist/x.ts`
+and not `src/distribution.ts`. `/verify` prints the active config **and which
+source produced it**; `/verify reload` re-reads after an edit.
+
+Refusals that keep it from becoming ambient noise: the check the model already ran
+this turn is not run again; an identical (command, file-set) pair is skipped
+within 10s; an unfinished turn runs nothing; the chain stops at the first failure;
+`maxPerSession` caps it; and `continue` is never set, so a tool result forces the
+next request as it would have anyway.
+
+Tests: `node --test tests/loop-guards.test.mjs tests/edit-repair.test.mjs \
+tests/verify-after-edit.test.mjs` (92 cases, no session needed).
+
 ## `/loop` — one scheduler, two execution homes
 
 `extensions/loop.ts` owns every recurring prompt in a session. It has two
