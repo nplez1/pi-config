@@ -182,6 +182,8 @@ pi-bolt/                          -> ~/.pi/agent/pi-bolt-bundles
   deps-audit.sh                   pins undici, then `npm audit fix`, in both trees
   pi-swap.sh                      the reversible `pi` -> pi-bolt switch
   pi-bolt-subagents/  pi-bolt-web-access/
+tools/pat/                        -> ~/.local/bin/pat   (see tools/pat/README.md)
+  pat.mjs                         PAT inventory, peer sync, expiry watch
 ```
 
 `settings.json` refers to the forks as `plugins/<name>`, which pi resolves
@@ -196,6 +198,41 @@ upstream history so it can be merged rather than re-forked.
 The installer replaces the old npm package entry on existing machines, preserving
 its resource filters. Restart Pi or run `/reload` after installing; a Pi-Bolt
 recompile can restore compiled-extension startup speed.
+
+## PAT inventory (`pat`)
+
+`tools/pat/pat.mjs` installs as `~/.local/bin/pat`. Work PATs live in several
+portals with 30–60 day lives, and when one lapses the failure is a mystery 401
+somewhere downstream. `pat` keeps one metadata inventory (owner, renewal URL,
+TTL, consumers) plus per-token state, so a lapsed token is a lookup instead of a
+bisect.
+
+Distribution is peer-to-peer with **no canonical machine**: each token carries a
+version counter and a tombstone flag, merged locally on whichever machine you are
+using, transported as a tar stream over ssh (the peer needs only a POSIX shell,
+sshd, tar, grep and stat — not `pat`). Tag targeting means a work token is never
+written to a home machine and never adopted on one; the peer's own sync script
+prunes anything it is not allowed to hold.
+No secrets are stored in this repo, and none go through git at all: values live in
+`~/.config/pat/state/` at mode 600.
+
+```sh
+pat setup --tag work          # scaffolding + shell wiring
+pat setup host add office_m1 --tags work
+pat set github && pat sync    # rotate once, converge everywhere
+pat check                     # expiry + live canary; exit 3 needs a human
+pat rm github                 # retire; the delete propagates on the next sync
+```
+
+Design, merge rules and the Orca automation/preflight hooks are in
+[tools/pat/README.md](tools/pat/README.md).
+
+**Tests.** `node --test tests/pat.test.mjs` runs 49 cases offline: the TOML subset
+(including the duplicate/redefinition forms it refuses), the merge rules, tag
+gating in both directions, tombstones, and the transport against a fake peer that
+runs the real remote script and real `tar`. Every test restores an offline ssh
+runner, so nothing reaches the network — the suite finishes in ~2s even with a
+blocked `ssh` on `PATH`.
 
 ## Install on another machine
 
