@@ -67,6 +67,7 @@
   - a value is worth keeping across calls — `store`/`load` beats re-deriving it.
 - Keep a plain `bash` call when it really is one command: `git status`, `pnpm tc`, a `curl`, a single file read. A one-command script adds a sandbox and a failure mode for no gain.
 - **The sandbox has no Node APIs, filesystem, network or timers.** Reach the outside world through `tools.*` only. A failing call rejects, so wrap independent calls in `Promise.allSettled` and report what settled rather than letting one rejection discard the batch.
+- **The Claude Code backend has this too, when its rollout allows it.** `pi-subagents` reads `CLAUDE_CODE_EXPERIMENTAL_CODE_MODE` and re-sends it to `claude -p` through `--settings` — the only surface a headless run honours, since neither the process environment nor `~/.claude/settings.json` reaches it — and grants `REPL` in the tool allowlist, without which a restricted agent cancels the feature. It needs Claude Code 2.1.323+, a 5.5-tier model, and an account Anthropic has enabled; while the gate is shut a `claude/*` run silently uses the ordinary tools, so the instructions above still stand for it.
 
 Working in an Orca worktree (`/Users/nathanp/orca/workspaces/orca/**`)? That repository's `AGENTS.md`
 carries the fork/PR/verification workflow rules — read them before touching a branch or opening a PR.
