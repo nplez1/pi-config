@@ -54,5 +54,19 @@
 - **Above ~1800, background it deliberately** and hand back the log path, rather than raising the literal to an unbounded number. A long run is not a reason for a missing deadline.
 - **Other Pi tools use other units** (`mcp` timeouts are seconds; some RPC-extension dialog timeouts are milliseconds). Read the tool's own schema rather than generalising from this one.
 
+## Tool selection — codemode, not bash scripting
+
+- **Two in a row is the trigger.** The moment your next step is a *second* `read`, `grep`, or `bash` call for the same purpose, stop and write one `codemode` script that does the whole step. Measured over 785 sessions: 1,490 runs of consecutive `read`/`grep` turns holding 5,489 turns, plus 4,154 of 51,640 `bash` calls that ran a python program inline (1,779 via `python3 -c`, 2,375 via heredoc) and 748 more via `node -e`. Every one of those turns re-sends the entire prompt; a single script sends one.
+- **Python inside `bash` is banned, not discouraged.** No `python3 -c`, no `python3 - <<'PY'`, no `node -e`, no `jq`/`sed`/`awk` program standing in for logic. If the command needs a loop, a conditional, a parse, or a data structure, it is a `codemode` script. The only exceptions are things the sandbox genuinely cannot do: `pip`/venv work, a real TTY, a process you are deliberately backgrounding, or a tool that must run with real filesystem or network access. 'Quicker to type' is not an exception, and neither is habit.
+- **The win is turns, not milliseconds.** From the same transcripts `codemode` averages 207 ms per call against 78 ms for `bash` — a lone command is a wash or a small loss. What pays is collapsing N calls and N prompts into one call. Do not reach for a script to run one command.
+- Use `codemode` when:
+  - the step touches several files — `Promise.allSettled` over `tools.read` / `tools.grep` / `tools.write`;
+  - the answer is a subset of a large result — `tools.bash` returns up to 1 MiB where the `bash` tool shows you 50 KB, so filter in the script and `text()` only what matters;
+  - you would otherwise write a script of any kind — see the ban above;
+  - you are polling several agents, endpoints or files at once — settle them all, then `text()` one line each;
+  - a value is worth keeping across calls — `store`/`load` beats re-deriving it.
+- Keep a plain `bash` call when it really is one command: `git status`, `pnpm tc`, a `curl`, a single file read. A one-command script adds a sandbox and a failure mode for no gain.
+- **The sandbox has no Node APIs, filesystem, network or timers.** Reach the outside world through `tools.*` only. A failing call rejects, so wrap independent calls in `Promise.allSettled` and report what settled rather than letting one rejection discard the batch.
+
 Working in an Orca worktree (`/Users/nathanp/orca/workspaces/orca/**`)? That repository's `AGENTS.md`
 carries the fork/PR/verification workflow rules — read them before touching a branch or opening a PR.
