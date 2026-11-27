@@ -377,6 +377,102 @@ export function priceSide(side: Side, rates: RateSet, promptTokens?: number): nu
   return priceAtMissShare(rates, missShareAt(side, promptTokens));
 }
 
+/**
+ * One band of `LATENCY_BANDS`: each side's wall-clock milliseconds per output
+ * token for prompts up to `upTo` tokens.
+ */
+export interface LatencyBand {
+  upTo: number;
+  msPerOutputToken: Record<Side, number>;
+}
+
+/**
+ * How long each side keeps a turn waiting, as a function of CONTEXT SIZE — the
+ * second input the router ranks by, beside price.
+ *
+ * Median `durationMs / output` over completed turns with 200+ output tokens,
+ * 2026-11-13 to 2026-11-27 (two weeks, 20,552 turns). A whole-request rate, so
+ * queueing, prefill and reasoning are in it — it is what a person waits, not
+ * the decoder's speed:
+ *
+ *   prompt size    DeepSeek      DeepInfra      IsoQuant
+ *   0-65K          5.5 (15)      9.7 (2906)     4.6 (999)
+ *   65K-131K       7.8 (14)     10.0 (4911)     4.4 (2720)
+ *   131K-262K      8.3 (142)    10.1 (2302)     5.2 (3650)
+ *   262K-524K      8.8 (272)    11.4 (632)      7.5 (1675)
+ *   524K-1M        9.5 (42)     12.4 (12)      13.3 (260)
+ *
+ * IsoQuant answers in about half DeepInfra's time below 524K, and DeepSeek
+ * direct is the fastest side past it. DeepSeek's two short bands and
+ * DeepInfra's top band rest on very few turns, so read them as indicative.
+ * Reproduce with `measure-token-mix.mjs --latency --since <date>`; unlike
+ * `CACHE_BANDS`, re-measure on a recent window, because a provider's speed
+ * moves with its load far faster than its cache design does.
+ *
+ * Same `upTo` boundaries as `CACHE_BANDS`, so one prompt size picks the same
+ * band in both tables.
+ */
+export const LATENCY_BANDS: readonly LatencyBand[] = [
+  { upTo: 65_000, msPerOutputToken: { deepseek: 5.5, deepinfra: 9.7, isoquant: 4.6 } },
+  { upTo: 131_000, msPerOutputToken: { deepseek: 7.8, deepinfra: 10.0, isoquant: 4.4 } },
+  { upTo: 262_000, msPerOutputToken: { deepseek: 8.3, deepinfra: 10.1, isoquant: 5.2 } },
+  { upTo: 524_000, msPerOutputToken: { deepseek: 8.8, deepinfra: 11.4, isoquant: 7.5 } },
+  { upTo: Number.POSITIVE_INFINITY, msPerOutputToken: { deepseek: 9.5, deepinfra: 12.4, isoquant: 13.3 } },
+];
+
+/** The latency band covering `promptTokens`; the smallest when unknown, as for cache. */
+export function latencyBandAt(promptTokens?: number): LatencyBand {
+  if (promptTokens === undefined || Number.isNaN(promptTokens)) return LATENCY_BANDS[0];
+  return LATENCY_BANDS.find((band) => promptTokens <= band.upTo) ?? LATENCY_BANDS[LATENCY_BANDS.length - 1];
+}
+
+/**
+ * What an hour of waiting on the model is worth, in USD — the exchange rate that
+ * puts latency and price in one number.
+ *
+ * The price gaps between these three cards are fractions of a cent per million
+ * tokens, while the speed gap is seconds per million: at 131K-262K, choosing
+ * IsoQuant over DeepInfra's 51% promo costs $0.0018 per 1M tokens and saves
+ * 13.8 s. The break-even is ~$0.48/hour, so any rate above that hands the
+ * measured faster side the request, and price still decides between sides of
+ * similar speed. $5/hour is deliberately modest next to what a person's hour
+ * costs; it is a knob, not a measurement.
+ *
+ * `PI_ROUTER_VALUE_OF_TIME` overrides it (USD per hour). `0` restores the
+ * price-only ranking.
+ */
+export const DEFAULT_VALUE_OF_TIME_USD_PER_HOUR = 5;
+
+export function valueOfTimeUsdPerHour(env: Record<string, string | undefined> = process.env): number {
+  const raw = env.PI_ROUTER_VALUE_OF_TIME?.trim();
+  if (!raw) return DEFAULT_VALUE_OF_TIME_USD_PER_HOUR;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_VALUE_OF_TIME_USD_PER_HOUR;
+}
+
+/**
+ * Seconds of waiting per 1M tokens of this machine's usage on `side`: the
+ * `TOKEN_MIX.output` share of those tokens, times the side's measured rate.
+ */
+export function waitSecondsPerMillion(side: Side, promptTokens?: number): number {
+  return (TOKEN_MIX.output * 1_000_000 * latencyBandAt(promptTokens).msPerOutputToken[side]) / 1000;
+}
+
+/**
+ * What one side costs for 1M tokens of this usage once its wait is priced in, in
+ * USD: `priceSide` plus `waitSecondsPerMillion` at `valuePerHour`. This is the
+ * number the router ranks by; `priceSide` stays the number a bill is checked
+ * against.
+ */
+export function scoreSide(
+  side: Side,
+  rates: RateSet,
+  promptTokens?: number,
+  valuePerHour: number = valueOfTimeUsdPerHour(),
+): number {
+  return priceSide(side, rates, promptTokens) + (waitSecondsPerMillion(side, promptTokens) * valuePerHour) / 3600;
+}
+
 /** One candidate: a side and the card it is currently billing at. */
 export interface Quote {
   side: Side;
@@ -402,6 +498,24 @@ export function cheapestSideAt(quotes: readonly Quote[], promptTokens?: number):
     if (cheapest === undefined || price < cheapest.price) cheapest = { side: quote.side, price };
   }
   return cheapest?.side;
+}
+
+/**
+ * The side the router would pick at `promptTokens` among `quotes`: the lowest
+ * `scoreSide`, price and wait together. `cheapestSideAt` with time priced in;
+ * at `valuePerHour` 0 the two agree. Ties keep the earlier entry.
+ */
+export function bestSideAt(
+  quotes: readonly Quote[],
+  promptTokens?: number,
+  valuePerHour: number = valueOfTimeUsdPerHour(),
+): Side | undefined {
+  let best: { side: Side; score: number } | undefined;
+  for (const quote of quotes) {
+    const score = scoreSide(quote.side, quote.rates, promptTokens, valuePerHour);
+    if (best === undefined || score < best.score) best = { side: quote.side, score };
+  }
+  return best?.side;
 }
 
 /** The virtual model that routes between them. */

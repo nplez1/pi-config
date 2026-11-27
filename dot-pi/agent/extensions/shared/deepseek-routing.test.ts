@@ -221,16 +221,23 @@ async function harness(
 }
 
 const previousTier = process.env.PI_DEEPSEEK_TIER;
+const previousValueOfTime = process.env.PI_ROUTER_VALUE_OF_TIME;
 beforeEach(() => {
   // Hermetic by default: a failed fetch leaves the list-price seed in place.
   stubPricing(async () => {
     throw new Error("offline");
   });
+  // Price-only by default: most suites below pin the price arithmetic, which
+  // the measured wait would otherwise outweigh. "router prices the wait" turns
+  // it back on.
+  process.env.PI_ROUTER_VALUE_OF_TIME = "0";
 });
 afterEach(() => {
   globalThis.fetch = realFetch;
   if (previousTier === undefined) delete process.env.PI_DEEPSEEK_TIER;
   else process.env.PI_DEEPSEEK_TIER = previousTier;
+  if (previousValueOfTime === undefined) delete process.env.PI_ROUTER_VALUE_OF_TIME;
+  else process.env.PI_ROUTER_VALUE_OF_TIME = previousValueOfTime;
 });
 
 describe("router recovery", () => {
@@ -613,6 +620,51 @@ async function report(handlers: Record<string, (() => unknown)[]>, message: unkn
  * router kept choosing the side that was producing nothing. These shapes are
  * straight from those transcripts.
  */
+// The suites above pin price with the wait switched off. These pin what the
+// default exchange rate does with the measured speeds in LATENCY_BANDS: a side
+// that answers in half the time wins a fraction-of-a-cent price gap, and price
+// still decides where the speeds are close.
+describe("router prices the wait", () => {
+  beforeEach(() => {
+    delete process.env.PI_ROUTER_VALUE_OF_TIME;
+  });
+
+  test("takes IsoQuant over DeepInfra's deep promo at 200K, where price alone took DeepInfra", async () => {
+    process.env.PI_DEEPSEEK_TIER = "off-peak";
+    stubPricing(async () => pricingResponse(0.2, 0.6, 0.006, 0.51));
+    const { routeAsPi, handlers } = await harness(threeSides);
+    reportPrompt(handlers, 200_000);
+    expect((await routeAsPi()).model.provider).toBe("isoquant");
+  });
+
+  test("keeps DeepSeek over DeepInfra's promo on a machine without IsoQuant", async () => {
+    // The same promo that wins on price off-peak at 200K: DeepSeek direct answers
+    // ~20% faster there, which is worth more than the promo saves.
+    process.env.PI_DEEPSEEK_TIER = "off-peak";
+    stubPricing(async () => pricingResponse(0.098, 0.294, 0.00294, 0));
+    const { routeAsPi, handlers } = await harness(healthy);
+    reportPrompt(handlers, 200_000);
+    expect((await routeAsPi()).model.provider).toBe("deepseek");
+  });
+
+  test("leaves IsoQuant past 524K, where DeepSeek direct is both cheaper and faster", async () => {
+    process.env.PI_DEEPSEEK_TIER = "peak";
+    stubPricing(async () => pricingResponse(0.2, 0.6, 0.006, 0.51));
+    const { routeAsPi, handlers } = await harness(threeSides);
+    reportPrompt(handlers, 600_000, "isoquant");
+    expect((await routeAsPi()).model.provider).toBe("deepseek");
+  });
+
+  test("restores the price-only ranking at a value of time of zero", async () => {
+    process.env.PI_ROUTER_VALUE_OF_TIME = "0";
+    process.env.PI_DEEPSEEK_TIER = "off-peak";
+    stubPricing(async () => pricingResponse(0.2, 0.6, 0.006, 0.51));
+    const { routeAsPi, handlers } = await harness(threeSides);
+    reportPrompt(handlers, 200_000);
+    expect((await routeAsPi()).model.provider).toBe("deepinfra");
+  });
+});
+
 describe("a provider that answers with nothing", () => {
   /** 384K output tokens over 1,465s, arriving as a tool call cut mid-argument. */
   const runaway = answer({

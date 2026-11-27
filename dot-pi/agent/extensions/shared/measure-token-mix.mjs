@@ -10,6 +10,7 @@
 //   node dot-pi/agent/extensions/shared/measure-token-mix.mjs --provider isoquant \
 //     --model deepseek-v4.1-flash-1017-fast
 //   node dot-pi/agent/extensions/shared/measure-token-mix.mjs --penalty
+//   node dot-pi/agent/extensions/shared/measure-token-mix.mjs --latency --since 2026-11-13
 //
 // `--since` / `--until` are parsed by `Date.parse`, so a date-time without a
 // trailing `Z` is read as LOCAL time. Pass the `Z` when the window is a UTC
@@ -199,8 +200,89 @@ async function penaltyReport() {
   console.log("\nA band with few turns is indicative, not measured — check the counts.");
 }
 
+/**
+ * Re-derives `LATENCY_BANDS` in deepseek-schedule.ts: how long each side keeps a
+ * turn waiting, as wall-clock milliseconds per output token, by prompt size.
+ *
+ * Per output token rather than per turn, because that is the unit the token
+ * mix prices in: `TOKEN_MIX.output` output tokens per token of usage turns a
+ * per-output-token latency into seconds per 1M tokens of usage. The figure is a
+ * whole-request rate — `durationMs` covers queueing, prefill and reasoning as
+ * well as decode — which is the point: it is the wait, not the decoder speed.
+ *
+ * Only completed turns (`toolUse` / `stop`) with at least 200 output tokens are
+ * counted; a shorter turn is dominated by fixed overhead and says little about
+ * the rate. Medians, not means, so one stalled 20-minute stream does not set a
+ * side's speed. Use `--since` — providers change speed far faster than they
+ * change cache behaviour, so all-time history is the wrong window here.
+ */
+async function latencyReport() {
+  const BANDS = [
+    [0, 65_000],
+    [65_000, 131_000],
+    [131_000, 262_000],
+    [262_000, 524_000],
+    [524_000, Number.POSITIVE_INFINITY],
+  ];
+  const since = Date.parse(SINCE);
+  const until = Date.parse(UNTIL);
+  const acc = {};
+  for (const provider of ROUTED) acc[provider] = BANDS.map(() => []);
+
+  for await (const path of sessionFiles(SESSIONS)) {
+    for (const message of await sessionMessages(path)) {
+      if (!ROUTED.includes(message.provider)) continue;
+      if (message.model !== DEFAULT_MODEL[message.provider]) continue;
+      const at = timestampOf(message);
+      if (at < since || at >= until) continue;
+      if (message.stopReason !== "toolUse" && message.stopReason !== "stop") continue;
+      const output = message.usage.output ?? 0;
+      const duration = message.durationMs ?? 0;
+      if (output < 200 || duration <= 0) continue;
+      const prompt = (message.usage.input ?? 0) + (message.usage.cacheRead ?? 0);
+      const index = BANDS.findIndex(([lo, hi]) => prompt >= lo && prompt < hi);
+      if (index < 0) continue;
+      acc[message.provider][index].push(duration / output);
+    }
+  }
+
+  const median = (values) => {
+    if (values.length === 0) return Number.NaN;
+    const sorted = [...values].sort((a, b) => a - b);
+    const mid = Math.floor(sorted.length / 2);
+    return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+  };
+  console.log(`wall-clock ms per output token, median, ${SINCE} to ${UNTIL}`);
+  console.log(`\n${"prompt size".padEnd(16)}${ROUTED.map((p) => p.padEnd(20)).join("")}`);
+  const rows = [];
+  BANDS.forEach(([lo, hi], index) => {
+    const label = hi === Number.POSITIVE_INFINITY ? `${lo / 1000}K+` : `${lo / 1000}K-${hi / 1000}K`;
+    const row = {};
+    const cells = ROUTED.map((provider) => {
+      const values = acc[provider][index];
+      row[provider] = median(values);
+      return (values.length === 0 ? "—" : `${row[provider].toFixed(1)} (${values.length})`).padEnd(20);
+    });
+    console.log(`${label.padEnd(16)}${cells.join("")}`);
+    rows.push({ label, row });
+  });
+  console.log("\nLATENCY_BANDS msPerOutputToken for deepseek-schedule.ts:");
+  for (const { label, row } of rows) {
+    const values = ROUTED.map(
+      (provider) => `${provider}: ${Number.isNaN(row[provider]) ? "?" : row[provider].toFixed(1)}`,
+    ).join(", ");
+    console.log(`  ${label}: { ${values} },`);
+  }
+  console.log("\nA band with few turns is indicative, not measured — check the counts.");
+}
+
 if (args.includes("--penalty")) {
   await penaltyReport();
+  process.exit(0);
+}
+
+if (args.includes("--latency")) {
+  await latencyReport();
   process.exit(0);
 }
 

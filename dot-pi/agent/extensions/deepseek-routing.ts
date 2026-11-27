@@ -1,6 +1,7 @@
 // deepseek-routing.ts
 //
-// Keeps DeepSeek V4.1 Flash traffic on whichever provider is cheaper right now.
+// Keeps DeepSeek V4.1 Flash traffic on whichever provider is cheapest right now
+// once its wait is priced in — see "Latency" below.
 //
 // The same checkpoint is sold three ways. DeepSeek direct bills two tiers by
 // wall clock (peak = 2x off-peak, see shared/deepseek-schedule.ts). DeepInfra
@@ -63,6 +64,13 @@
 //    /v1/openai/models, so the extension refetches them each session instead of
 //    trusting a hardcoded number. IsoQuant needs no fetch: its card is flat and
 //    published (see `ISOQUANT_RATES`), so a static reading is the real rate.
+//
+//  - Latency. Price alone sent most traffic to DeepInfra, which answers in about
+//    twice IsoQuant's time for a saving of fractions of a cent per million
+//    tokens. Each side's measured wall-clock rate (`LATENCY_BANDS`) is priced at
+//    `PI_ROUTER_VALUE_OF_TIME` USD/hour (default $5) and added to its card, so
+//    the ranking is price plus wait. `PI_ROUTER_VALUE_OF_TIME=0` restores the
+//    price-only ranking.
 //
 //  - Failover. A retry after a provider-side error (5xx, 429, overload,
 //    network) crosses to the next-cheapest side that is not the one that
@@ -145,8 +153,8 @@ import {
   currentTier,
   deepseekCost,
   effectiveCost,
-  priceSide,
   refFor,
+  scoreSide,
   sideOf,
   type ModelRef,
   type Quote,
@@ -541,9 +549,11 @@ export default function (pi: ExtensionAPI) {
   }
 
   /**
-   * All three sides, cheapest first at this session's prompt size and the cards
-   * in force. This is the router's whole policy: the first entry is the answer
-   * when pi can reach it, and the rest are the fallbacks.
+   * All three sides, best first at this session's prompt size and the cards in
+   * force — "best" being `scoreSide`: the card's price plus the side's measured
+   * wait at `PI_ROUTER_VALUE_OF_TIME`. This is the router's whole policy: the
+   * first entry is the answer when pi can reach it, and the rest are the
+   * fallbacks.
    *
    * A side whose answer just degenerated is demoted to last, so every caller
    * inherits the avoidance — the sticky continuation path, the retry crossing, the
@@ -555,7 +565,7 @@ export default function (pi: ExtensionAPI) {
     const ranked = quotesAt(tier)
       .map((quote) => ({
         ref: refFor(quote.side),
-        price: priceSide(quote.side, quote.rates, promptTokens),
+        price: scoreSide(quote.side, quote.rates, promptTokens),
       }))
       .sort((a, b) => a.price - b.price)
       .map((sorted) => sorted.ref);

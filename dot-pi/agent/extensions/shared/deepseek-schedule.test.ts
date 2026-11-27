@@ -11,9 +11,12 @@ import { describe, expect, test } from "bun:test";
 import {
   CACHE_BANDS,
   DEEPINFRA_LIST,
+  DEFAULT_VALUE_OF_TIME_USD_PER_HOUR,
+  LATENCY_BANDS,
   ISOQUANT_RATES,
   SIDES,
   TOKEN_MIX,
+  bestSideAt,
   blendedPrice,
   cacheBandAt,
   cheapestSideAt,
@@ -24,6 +27,9 @@ import {
   priceAtMissShare,
   priceSide,
   refFor,
+  scoreSide,
+  valueOfTimeUsdPerHour,
+  waitSecondsPerMillion,
   sideOf,
   type RateSet,
   type Side,
@@ -378,5 +384,69 @@ describe("cheaperOnMyMix (aggregate)", () => {
 
   test("rejects DeepInfra list at off-peak", () => {
     expect(cheaperOnMyMix(DEEPINFRA_LIST, deepseekCost("off-peak"))).toBe(false);
+  });
+});
+
+describe("LATENCY_BANDS", () => {
+  test("shares CACHE_BANDS' boundaries, so one prompt size picks the same band in both", () => {
+    expect(LATENCY_BANDS.map((band) => band.upTo)).toEqual(CACHE_BANDS.map((band) => band.upTo));
+  });
+
+  test("has a positive rate for every side in every band", () => {
+    for (const band of LATENCY_BANDS) for (const side of SIDES) expect(band.msPerOutputToken[side]).toBeGreaterThan(0);
+  });
+});
+
+describe("valueOfTimeUsdPerHour", () => {
+  test("defaults when unset, blank or unreadable", () => {
+    for (const raw of [undefined, "", "  ", "fast", "-1", "Infinity"]) {
+      expect(valueOfTimeUsdPerHour({ PI_ROUTER_VALUE_OF_TIME: raw })).toBe(DEFAULT_VALUE_OF_TIME_USD_PER_HOUR);
+    }
+  });
+
+  test("takes a non-negative number, including zero", () => {
+    expect(valueOfTimeUsdPerHour({ PI_ROUTER_VALUE_OF_TIME: "0" })).toBe(0);
+    expect(valueOfTimeUsdPerHour({ PI_ROUTER_VALUE_OF_TIME: "12.5" })).toBe(12.5);
+  });
+});
+
+describe("scoreSide", () => {
+  const promo = effectiveCost(DEEPINFRA_LIST, 0.51);
+
+  test("is the card's price when time is free", () => {
+    expect(scoreSide("deepinfra", promo, MID, 0)).toBe(priceSide("deepinfra", promo, MID));
+  });
+
+  test("adds the measured wait at the given rate", () => {
+    const waitUsd = (waitSecondsPerMillion("isoquant", MID) * 5) / 3600;
+    expect(scoreSide("isoquant", ISOQUANT_RATES, MID, 5)).toBeCloseTo(priceSide("isoquant", ISOQUANT_RATES, MID) + waitUsd, 12);
+  });
+
+  test("pins the module comment: 13.8 s saved and a ~$0.48/hour break-even at 131K-262K", () => {
+    const saved = waitSecondsPerMillion("deepinfra", MID) - waitSecondsPerMillion("isoquant", MID);
+    near(saved, 13.8);
+    const extra = priceSide("isoquant", ISOQUANT_RATES, MID) - priceSide("deepinfra", promo, MID);
+    near((extra / saved) * 3600, 0.48, 0.05);
+  });
+});
+
+describe("bestSideAt", () => {
+  const quotes = [
+    { side: "deepseek" as const, rates: deepseekCost("off-peak") },
+    { side: "deepinfra" as const, rates: effectiveCost(DEEPINFRA_LIST, 0.51) },
+    { side: "isoquant" as const, rates: ISOQUANT_RATES },
+  ];
+
+  test("agrees with cheapestSideAt when time is free", () => {
+    for (const prompt of [SHORT, MID, HUGE]) expect(bestSideAt(quotes, prompt, 0)).toBe(cheapestSideAt(quotes, prompt));
+  });
+
+  test("hands the measured faster side a fraction-of-a-cent price gap", () => {
+    expect(cheapestSideAt(quotes, MID)).toBe("deepinfra");
+    expect(bestSideAt(quotes, MID, DEFAULT_VALUE_OF_TIME_USD_PER_HOUR)).toBe("isoquant");
+  });
+
+  test("takes DeepSeek direct past 524K, where it is the fastest side", () => {
+    expect(bestSideAt(quotes, HUGE, DEFAULT_VALUE_OF_TIME_USD_PER_HOUR)).toBe("deepseek");
   });
 });
