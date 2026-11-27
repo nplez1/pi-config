@@ -194,6 +194,46 @@ posix('removes an old npm goal entry when the local package already exists', t =
   assert.deepEqual(JSON.parse(fs.readFileSync(live)).packages, ['plugins/pi-codex-goal']);
 });
 
+posix('moves the todo extension to the prebuilt bundle and clears the old overlay entries', t => {
+  const f = fixture(t, { fd: true, rg: true });
+  // The bundle this clone ships, so the entry is not pruned as stale.
+  fs.mkdirSync(path.join(f.repo, 'plugins/pi-todo-bundle'), { recursive: true });
+  fs.writeFileSync(path.join(f.repo, 'plugins/pi-todo-bundle/package.json'), '{}\n');
+  // An unrelated Pi-Bolt bundle that must survive the overlay cleanup.
+  fs.mkdirSync(path.join(f.repo, 'pi-bolt/keep'), { recursive: true });
+  fs.writeFileSync(path.join(f.repo, 'pi-bolt/keep/package.json'), '{}\n');
+  fs.writeFileSync(
+    path.join(f.repo, 'dot-pi/agent/settings.json'),
+    JSON.stringify({ packages: ['plugins/pi-todo-bundle'] }),
+  );
+  const live = path.join(f.home, '.pi/agent/settings.json');
+  fs.mkdirSync(path.dirname(live), { recursive: true });
+  const original = {
+    defaultModel: 'local-model',
+    packages: [{ source: 'plugins/pi-todo', extensions: [] }, 'npm:existing'],
+    piBolt: {
+      packages: ['npm:opensec-pi-todo@2.13.1', '-plugins/pi-todo', 'pi-bolt-bundles/keep'],
+      packagesOverlay: true,
+    },
+  };
+  fs.writeFileSync(live, JSON.stringify(original));
+  // Machine-owned: the seed edit alone must not reach it, only the migration.
+  assert.match(f.run('--dry-run'), /plugins\/pi-todo -> plugins\/pi-todo-bundle/);
+  assert.deepEqual(JSON.parse(fs.readFileSync(live)), original);
+
+  f.run();
+  const result = JSON.parse(fs.readFileSync(live));
+  assert.equal(result.defaultModel, 'local-model');
+  // Resource filters survive the move; no second copy is added.
+  assert.deepEqual(result.packages, [{ source: 'plugins/pi-todo-bundle', extensions: [] }, 'npm:existing']);
+  // Both todo entries named a copy that no longer loads.
+  assert.deepEqual(result.piBolt.packages, ['pi-bolt-bundles/keep']);
+  assert.equal(result.piBolt.packagesOverlay, true);
+
+  f.run();
+  assert.deepEqual(JSON.parse(fs.readFileSync(live)), result);
+});
+
 posix('capture and uninstall never invoke brew, even with missing commands', t => {
   const f = fixture(t);
   assert.match(f.run('capture'), /Publishing shared settings/);
@@ -202,6 +242,7 @@ posix('capture and uninstall never invoke brew, even with missing commands', t =
   // returns a failure for absent targets, independently of this brew setup.
   for (const relative of [
     '.pi/agent/models.json', '.pi/agent/AGENTS.md', '.local/bin/pi-auto-project-skills',
+    '.local/bin/pat',
     '.pi/web-search.json', '.config/rpiv-todo/config.json',
     '.config/pi-smart-compaction/config.json', '.pi/agent/plugins', '.pi/agent/pi-bolt-bundles',
   ]) {

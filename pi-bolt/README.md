@@ -20,7 +20,7 @@ seeded `~/.pi/agent/settings.json` under `piBolt`, which stock `pi` ignores.
 | What | Where |
 |---|---|
 | Pi-Bolt 1.0.2, `darwin-arm64` (JIT off), Pi 1.4.0 base | `~/.pi-bolt/pi-bolt-darwin-arm64`, linked as `~/.local/bin/pi-bolt` |
-| `opensec-pi-todo` 2.13.1 | pi-bolt only (`piBolt.packages`) |
+| `plugins/pi-todo-bundle` (built here) | shared `packages`, both runtimes |
 | `@nplez1/pi-bolt-subagents` (built here) | pi-bolt only |
 | `@nplez1/pi-bolt-web-access` (built here) | pi-bolt only |
 
@@ -35,7 +35,7 @@ understood. Putting it back is one line in `piBolt.packages` in the seeded
 
 Pi-Bolt shares `~/.pi/agent` with `pi`, so providers, `auth.json`, `models.json`,
 `settings.json`, sessions, `AGENTS.md`, `subagents.json`, extensions, skills and
-the todo config are inherited as-is. `opensec-pi-todo` reads the same
+the todo config are inherited as-is. `plugins/pi-todo-bundle` reads the same
 `~/.config/rpiv-todo/config.json` pi-config already symlinks, and the web-access
 bundle reads the same `~/.pi/web-search.json`.
 
@@ -51,7 +51,7 @@ This repo forced `arm64-jit` from 2026-10-19 to 2026-10-24, for one reason:
 backend (it also served the web-access bundle). **That reason is gone.**
 `opensec-pi-fff` was dropped from the package list on 2026-10-22, and on
 2026-10-24 a grep of everything this machine actually loads — all four
-`pi-bolt-bundles`, `pi-web-access/dist`, `opensec-pi-todo`, `pi-system-one`,
+`pi-bolt-bundles`, `pi-web-access/dist`, `pi-todo-bundle/dist`, `pi-system-one`,
 `pi-codex-goal` — found **no `bun:ffi` reference at all**. Nothing installed needs
 the JIT to work.
 
@@ -103,8 +103,6 @@ deleting the `-jit` folder is safe.
 ```json
 {
   "packages": [
-    "npm:opensec-pi-todo@2.13.1",
-    "-plugins/pi-todo",
     "-plugins/pi-subagents",
     "pi-bolt-bundles/pi-bolt-subagents",
     "pi-bolt-bundles/pi-bolt-web-access",
@@ -114,10 +112,11 @@ deleting the `-jit` folder is safe.
 }
 ```
 
-So under Pi-Bolt: OpenSec's bun prebuilts replace the local todo fork, and the two
-bundles built here replace the local subagents fork and npm's pi-web-access. Stock
-`pi` still loads `plugins/pi-todo`, `plugins/pi-subagents` and `npm:pi-web-access`
-untouched.
+So under Pi-Bolt: the two bundles built here replace the local subagents fork and
+npm's pi-web-access. Stock `pi` still loads `plugins/pi-subagents` and
+`npm:pi-web-access` untouched. `pi-todo` is different since 2026-11-26: it is
+`plugins/pi-todo-bundle` in the *shared* list, one prebuilt bundle that both
+runtimes load (see "Still on the table" below for why that works now).
 
 ## Results
 
@@ -152,7 +151,7 @@ Cold cost per extension, original → now:
 | `pi-codex-goal` | 216 ms | 0–5 ms (compiled in) |
 | `@juicesharp/rpiv-ask-user-question` | 83 ms | 0–1 ms (compiled in) |
 | seven global extensions | ~115 ms | ~115 ms |
-| `opensec-pi-todo` | — | 0–3 ms |
+| `plugins/pi-todo-bundle` (1 module + entry) | — | 0–3 ms |
 
 What is left is spread thin: `pi-web-access` 12 ms, `orca-prefill` 8 ms,
 `pi-codex-goal` 8 ms, `orca-agent-status` 0 ms, the rest 1–2 ms each.
@@ -204,7 +203,7 @@ on the path for every extension and every bundle. One `npm install` run with
 | | as it should be | with `$HOME/node_modules` present |
 |---|---:|---:|
 | `pi-bolt-subagents` bundle | 8 ms | **239 ms** |
-| `opensec-pi-todo` | 0 ms | **108 ms** |
+| `plugins/pi-todo-bundle` (unmeasured; the number is `opensec-pi-todo`'s) | 0 ms | **108 ms** |
 | `pi-bolt-web-access` bundle | 14 ms | 15 ms |
 | extension load, total | ~42 ms | **~390 ms** |
 | warm `-p` start, `TOTAL` | 39–49 ms | 401–419 ms |
@@ -562,7 +561,9 @@ Three limits bite here (see
 
 - **Only `npm:` packages compile in.** Local checkouts are passed over with
   "only npm: packages can be compiled in (a git: checkout is resolved by Pi)", so
-  `plugins/pi-subagents` and `plugins/pi-todo` never can be. (`plugins/pi-smart-compaction`
+  `plugins/pi-subagents` and `plugins/pi-todo` never can be — and neither can the
+  bundle built from the latter, which is why `plugins/pi-todo-bundle` loads from
+  files in ~2 ms rather than being compiled in. (`plugins/pi-smart-compaction`
   is the exception that proves the rule: the seeded `packages` list names it as a
   plain path, not a `git:` spec, so pi loads it as a local package and it compiles
   in like any `npm:` one.) The two `pi-bolt-bundles/` are passed over for a
@@ -677,13 +678,19 @@ matches this patch (url import anchor missing) … drop this script if it does".
 All three local checkouts and the one npm package that mattered are bundled. What
 is left of the cold start is `pi-web-access` 12 ms, `orca-prefill` 8 ms,
 `pi-codex-goal` 8 ms, and 1–2 ms each from the rest — nothing worth a fourth bundle
-yet. `plugins/pi-todo` is 1 ms because OpenSec's prebuilt already replaces it.
+yet. `plugins/pi-todo-bundle` is 1–3 ms because it is a single prebuilt module,
+not because it was compiled in.
 
-**One idea not tried:** these bundles are plain CommonJS plus a shim, unlike
-OpenSec's (built for Bun, which is why those are `--pi-bolt` only). If they also
-load under Node — untested — then replacing the TypeScript source in the *shared*
-`packages` list would cut the same cost on `pi` (which pays 189 ms for subagents
-alone). Worth a look if `pi` stays in the picture.
+**Bundles can serve both runtimes — settled 2026-11-26.** OpenSec's bundles are
+`--target=bun`, whose `// @bun @bun-cjs` wrapper is an uncalled function expression
+that only Bun executes, so `require()` of one under Node returns `{}` — that, and
+not the code, is why `opensec-pi-todo` refused to run unless `process.versions.bun`.
+A `--target=node --format=cjs` build loads on Node 26 and Bun 1.4 at the same cost
+(`require` + factory: 1.5–1.8 ms on both, against 1.9 ms for OpenSec's Bun-format
+bundle). `plugins/pi-todo-bundle` is that build and `plugins/pi-todo` is now
+source-only, so this repo no longer carries a third-party prebuilt of the todo
+extension. The same trick would cut `pi`'s 189 ms for subagents; not applied there
+yet.
 
 ## Reference clones (analysis only, safe to delete)
 

@@ -173,6 +173,7 @@ dot-agents/
   skills/find-skills/             -> ~/.agents/skills/find-skills   (symlinked)
 plugins/                          -> ~/.pi/agent/plugins   (git submodules)
   pi-subagents/  pi-todo/  pi-smart-compaction/  pi-codex-goal/  pi-vcc/
+  pi-todo-bundle/                 generated: Bun/Node bundle of pi-todo/, both runtimes load it
 pi-bolt/                          -> ~/.pi/agent/pi-bolt-bundles
   rebuild.sh / rebuild.mjs        the staleness check and bundle rebuild driver
   lib/bundle-info.mjs             fingerprint + build-info writer + shim snippet
@@ -279,10 +280,10 @@ with `/model`. Restart pi; `pi list` should show this repo's packages — under
 Pi-Bolt that is the npm entries, `plugins/pi-codex-goal`,
 `plugins/pi-smart-compaction`, `plugins/pi-vcc` and the two
 `pi-bolt-bundles/…` entries, because `piBolt.packages` swaps `pi-subagents` and
-`npm:pi-web-access` for their bundles and `pi-todo`
-for `npm:opensec-pi-todo`; stock pi (`PI_CONFIG_SKIP_PIBOLT=1`) lists all six
-`plugins/…` forks and no bundles. `pi-bolt compile --status` reports the compiled
-set.
+`npm:pi-web-access` for their bundles; `pi-todo` is `plugins/pi-todo-bundle` in
+the shared list, a prebuilt bundle both runtimes load. Stock pi
+(`PI_CONFIG_SKIP_PIBOLT=1`) lists the plugin forks and no bundles. `pi-bolt
+compile --status` reports the compiled set.
 
 `install.sh` is idempotent, moves any file it would replace into
 `~/.pi-config-backups/<timestamp>/` (flattened, deliberately **not** next to the
@@ -749,7 +750,8 @@ Four things touch compaction, and they are deliberately on different halves of i
 | `dot-pi/agent/extensions/copilot.ts` | whether a pre-route check may compact at all | returns `{cancel}` on a `fusion/standard` session before a model was routed; manual `/compact` passes through |
 | `plugins/pi-codex-goal` | what a goal loop's control messages look like | filters `preparation` in the same hook, returns no compaction |
 
-`plugins/pi-todo` / `npm:opensec-pi-todo` replays its task list from the branch
+`plugins/pi-todo-bundle` (built from `plugins/pi-todo`) replays its task list from
+the branch
 on `session_compact` and never summarizes; pi-subagents,
 pi-web-access, pi-system-one, rpiv-ask-user-question, `deepseek-*`, `loop` and
 `orca-*` register no compaction hook at all. The one other request-time

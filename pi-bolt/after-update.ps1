@@ -85,7 +85,8 @@ function Fail([string]$text) {
 # `npm install` in $HOME creates $HOME/node_modules, which sits above
 # ~/.pi/agent and hijacks all four: every extension that imports one then loads a
 # second Pi. Measured on the Unix side on 2026-10-24 - pi-bolt-subagents 239 ms
-# instead of 8 ms, opensec-pi-todo 108 ms instead of 0 - and the cause is the same
+# instead of 8 ms, the todo bundle 108 ms instead of 0 (on its predecessor
+# opensec-pi-todo, same entry shape) - and the cause is the same
 # resolution order here, which is why the check is ported rather than dropped.
 #
 # ~/.pi/agent/npm/node_modules is deliberately NOT flagged: that one is where the

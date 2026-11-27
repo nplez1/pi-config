@@ -77,7 +77,8 @@ trouble=0
 # as *fallbacks*, so a copy on disk wins. A stray `npm install` in $HOME creates
 # $HOME/node_modules, which sits above ~/.pi/agent and hijacks all four: every
 # extension that imports one then loads a second Pi. Measured here on 2026-10-24 —
-# pi-bolt-subagents 239 ms instead of 8 ms, opensec-pi-todo 108 ms instead of 0,
+# pi-bolt-subagents 239 ms instead of 8 ms, the todo bundle 108 ms instead of 0
+# (measured on its predecessor opensec-pi-todo, same entry shape),
 # ~390 ms of extension load against ~42 ms. `doctor` reports that as "the JIT build
 # would run heavy extensions faster", which is the wrong lead. This costs four
 # stat() calls, so it looks every time.

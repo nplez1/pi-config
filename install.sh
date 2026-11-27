@@ -453,6 +453,41 @@ if (Array.isArray(live.packages) && (seed.packages ?? []).some((e) => sourceOf(e
     return [typeof entry === "string" ? localGoal : { ...entry, source: localGoal }];
   });
 }
+// The todo extension now loads as a prebuilt bundle (plugins/pi-todo-bundle) on
+// both runtimes. Before it, Pi-Bolt loaded npm:opensec-pi-todo and stock pi loaded
+// the TypeScript fork — two copies of the same extension, one of them a
+// third-party build. Live settings are machine-owned, so the seed edit alone
+// would leave an existing machine on the old entry; move it here.
+if ((seed.packages ?? []).some((e) => sourceOf(e) === "plugins/pi-todo-bundle")) {
+  const bundleEntry = "plugins/pi-todo-bundle";
+  if (Array.isArray(live.packages)) {
+    let hasBundle = live.packages.some((e) => sourceOf(e) === bundleEntry);
+    live.packages = live.packages.flatMap((entry) => {
+      if (sourceOf(entry) !== "plugins/pi-todo") return [entry];
+      if (hasBundle) {
+        changes.push(`packages -= ${sourceOf(entry)}`);
+        return [];
+      }
+      hasBundle = true;
+      changes.push(`packages: ${sourceOf(entry)} -> ${bundleEntry}`);
+      return [typeof entry === "string" ? bundleEntry : { ...entry, source: bundleEntry }];
+    });
+  }
+  // The Pi-Bolt overlay's todo entries are now redundant: the bundle is in the
+  // shared list, and both of these named a copy that no longer loads.
+  if (Array.isArray(live.piBolt?.packages)) {
+    live.piBolt.packages = live.piBolt.packages.filter((entry) => {
+      const source = sourceOf(entry);
+      const stale = source === "-plugins/pi-todo" || /^npm:opensec-pi-todo(?:@[^/]+)?$/.test(source ?? "");
+      if (stale) changes.push(`piBolt.packages -= ${source}`);
+      return !stale;
+    });
+  }
+}
+// The seed edit moves every machine that runs this installer. install.ps1 has no
+// equivalent seed sync, so a Windows machine keeps plugins/pi-todo plus
+// npm:opensec-pi-todo — still working, but not on the bundle — until the two
+// entries are edited by hand.
 for (const key of Object.keys(seed)) {
   if (machineOwned.has(key)) continue;
   if (key === "packages") {
@@ -822,8 +857,8 @@ Next steps:
   2. Pick a default model for this machine: `pi`, then /model.
      settings.json is machine-owned, so that choice stays local.
   3. Restart pi; `pi list` should show this repo's packages (Pi-Bolt lists
-     pi-subagents and pi-web-access as pi-bolt-bundles/ entries, and pi-todo
-     as npm:opensec-pi-todo).
+     pi-subagents and pi-web-access as pi-bolt-bundles/ entries, and pi-todo as
+     plugins/pi-todo-bundle — one prebuilt bundle both runtimes load).
   4. `pi` now runs Pi-Bolt (pi-config/pi-bolt/README.md). `pi-real` or
      `PI_REAL=1 pi` reaches the stock launcher; revert with
      pi-config/pi-bolt/pi-swap.sh remove. Credentials are shared.

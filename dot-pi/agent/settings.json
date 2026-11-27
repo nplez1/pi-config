@@ -9,15 +9,13 @@
     "npm:pi-web-access",
     "plugins/pi-codex-goal",
     "npm:pi-mimo-provider",
-    "plugins/pi-todo",
+    "plugins/pi-todo-bundle",
     "plugins/pi-smart-compaction",
     "plugins/pi-vcc",
     "npm:pi-system-one@1.3.4"
   ],
   "piBolt": {
     "packages": [
-      "npm:opensec-pi-todo@2.13.1",
-      "-plugins/pi-todo",
       "-plugins/pi-subagents",
       "pi-bolt-bundles/pi-bolt-subagents",
       "pi-bolt-bundles/pi-bolt-web-access",
