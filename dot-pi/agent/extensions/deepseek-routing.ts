@@ -482,6 +482,10 @@ export default function (pi: ExtensionAPI) {
               cacheRead: cost.cacheRead,
               cacheWrite: CACHE_WRITE_RATE,
             },
+            // Automatic prefix caching, no write cost. Measured on this machine:
+            // hits still land at 2,119 s on the DeepSeek side and 8,693 s on
+            // IsoQuant, and pi-smart-compaction already assumes 2 h here.
+            promptCache: { short: 7200 },
             contextWindow: CONTEXT_WINDOW,
             maxTokens: MAX_TOKENS,
             thinkingLevelMap: THINKING_LEVEL_MAP,

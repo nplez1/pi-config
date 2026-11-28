@@ -154,6 +154,9 @@
             "cacheRead": 0.003,
             "cacheWrite": 0
           },
+          "promptCache": {
+            "short": 86400
+          },
           "thinkingLevelMap": {
             "minimal": null,
             "low": "low",
@@ -170,6 +173,9 @@
             "output": 1.98,
             "cacheRead": 0.022,
             "cacheWrite": 0
+          },
+          "promptCache": {
+            "short": 86400
           },
           "thinkingLevelMap": {
             "minimal": null,

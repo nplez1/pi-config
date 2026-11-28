@@ -60,6 +60,20 @@ function refreshDelayMs(ttlMs: number): number | undefined {
 	return Math.max(1, Math.floor(Math.min(ttlMs * 0.9, ttlMs - 10_000)));
 }
 
+/** Pi's api string for a routed model (`VIRTUAL_MODEL_API` in pi's virtual-models). */
+const VIRTUAL_MODEL_API = "pi-virtual";
+
+/**
+ * A routed selection can land on any of its sides, and a virtual model carries no
+ * `promptCache` of its own. The entry a refresh must keep alive is the one the
+ * answering side wrote, so the lifetime comes from that physical model; the cap is
+ * the shortest lifetime among the sides `deepseek-flash-auto` can route to, because
+ * the side that answers next is not known when the refresh is scheduled. Declaring
+ * longer than a side really lives is the expensive error: the refresh arrives after
+ * the eviction and pays a full prompt instead of a cache read.
+ */
+const ROUTED_TTL_CAP_SECONDS = 7200;
+
 type EventBus = { on(event: string, handler: (data: any) => void): unknown };
 type Keepalive = {
 	timer?: ReturnType<typeof setTimeout>;
@@ -127,7 +141,26 @@ export default function (pi: ExtensionAPI) {
 		);
 	};
 
-	// Same arithmetic as Pi's CacheWarmer.evaluate, from the last assistant usage on this branch.
+	/**
+	 * The physical model whose cache entry the last request wrote. A routed selection
+	 * is not that model: Pi resolves it to a side before the request goes out, and the
+	 * message records that side. Resolving it here matters twice — the virtual model
+	 * declares no lifetime, and it prices every token at zero, so a refresh driven from
+	 * it would either refuse to start ("no miss cost") or spend against the wrong card.
+	 */
+	const physicalModelOf = (ctx: any, selected: any) => {
+		if (selected?.api !== VIRTUAL_MODEL_API) return selected;
+		const branch: any[] = ctx?.sessionManager?.getBranch?.() ?? [];
+		for (let i = branch.length - 1; i >= 0; i--) {
+			const message = branch[i]?.message;
+			if (branch[i]?.type !== "message" || message?.role !== "assistant") continue;
+			if (!message.provider || !message.model) continue;
+			return ctx?.modelRegistry?.find?.(message.provider, message.model) ?? selected;
+		}
+		return selected;
+	};
+
+	/** Same arithmetic as Pi's CacheWarmer.evaluate, from the last assistant usage on this branch. */
 	const estimateCosts = (ctx: any, model: any) => {
 		const branch: any[] = ctx?.sessionManager?.getBranch?.() ?? [];
 		let promptTokens = 0;
@@ -229,21 +262,28 @@ export default function (pi: ExtensionAPI) {
 		const { model, messages, reasoning, sessionId } = lastRequest;
 		if (!model) return logEvent("start_skipped", { reason: "no model" });
 
+		// The entry belongs to the model that answered, not to a routing selection.
+		const target = physicalModelOf(ctx, model);
+
 		// Same replay rule as Pi: an Anthropic request with thinking is only replayable on adaptive thinking.
-		if (reasoning && model.api === "anthropic-messages" && model.compat?.forceAdaptiveThinking !== true) {
-			return logEvent("start_skipped", { reason: "thinking not replayable", model: model.id });
+		if (reasoning && target.api === "anthropic-messages" && target.compat?.forceAdaptiveThinking !== true) {
+			return logEvent("start_skipped", { reason: "thinking not replayable", model: target.id });
 		}
 
 		const retention = process.env.PI_CACHE_RETENTION === "long" ? "long" : "short";
-		const ttlSeconds = model.promptCache?.[retention];
+		const declared = target.promptCache?.[retention];
+		const ttlSeconds =
+			model.api === VIRTUAL_MODEL_API
+				? Math.min(declared ?? ROUTED_TTL_CAP_SECONDS, ROUTED_TTL_CAP_SECONDS)
+				: declared;
 		const delayMs = ttlSeconds === undefined ? undefined : refreshDelayMs(ttlSeconds * 1000);
 		if (delayMs === undefined) {
-			return logEvent("start_skipped", { reason: "no promptCache lifetime", model: model.id, retention });
+			return logEvent("start_skipped", { reason: "no promptCache lifetime", model: target.id, retention });
 		}
 
-		const costs = estimateCosts(ctx, model);
+		const costs = estimateCosts(ctx, target);
 		if (costs.missCost <= 0) {
-			return logEvent("start_skipped", { reason: "no miss cost", model: model.id, promptTokens: costs.promptTokens });
+			return logEvent("start_skipped", { reason: "no miss cost", model: target.id, promptTokens: costs.promptTokens });
 		}
 
 		// A known fire with no subagent pending: decide now whether warming beats the miss.
@@ -262,7 +302,7 @@ export default function (pi: ExtensionAPI) {
 		keepalive = {
 			controller: new AbortController(),
 			ctx,
-			model,
+			model: target,
 			messages,
 			options,
 			delayMs,
@@ -273,9 +313,11 @@ export default function (pi: ExtensionAPI) {
 			missCost: costs.missCost,
 		};
 		logEvent("start", {
-			model: model.id,
-			api: model.api,
+			model: target.id,
+			selection: model.id,
+			api: target.api,
 			retention,
+			ttlSeconds,
 			delayMs,
 			promptTokens: costs.promptTokens,
 			missCost: costs.missCost,

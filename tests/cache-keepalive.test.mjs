@@ -207,3 +207,102 @@ test('/cache-keepalive off stops a running keepalive and is kept for the session
   await reloaded.fire('session_shutdown', {}, reloadCtx);
   await pi.fire('session_shutdown', {}, ctx);
 });
+
+// A routed selection (`deepseek-flash-auto`) is not the model that holds the cache,
+// and it carries neither a lifetime nor a price. Both are read from the side that
+// answered, and the lifetime is capped at the routed floor.
+const router = {
+  id: 'deepseek-flash-auto',
+  provider: 'deepseek',
+  api: 'pi-virtual',
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+};
+
+function routedCtx(sideTtlSeconds) {
+  const side = {
+    id: 'deepseek-flash',
+    provider: 'deepseek',
+    api: 'openai-completions',
+    cost: { input: 0.15, output: 0.6, cacheRead: 0.003, cacheWrite: 0 },
+    promptCache: { short: sideTtlSeconds },
+  };
+  const sent = [];
+  return {
+    sent,
+    side,
+    model: router,
+    thinkingLevel: 'off',
+    ui: { notify() {} },
+    sessionManager: {
+      getSessionId: () => 'session-routed',
+      getEntries: () => [],
+      getBranch: () => [
+        {
+          type: 'message',
+          message: {
+            role: 'assistant',
+            provider: 'deepseek',
+            model: 'deepseek-flash',
+            usage: { input: 1000, cacheRead: 50_000, cacheWrite: 0 },
+          },
+        },
+      ],
+    },
+    modelRegistry: {
+      find(provider, id) {
+        return provider === 'deepseek' && id === 'deepseek-flash' ? side : undefined;
+      },
+      streamSimple(model, _context, options) {
+        sent.push({ model, options });
+        return {
+          result: async () => ({
+            stopReason: 'stop',
+            usage: { input: 0, cacheRead: 51_000, cacheWrite: 0, output: 1, cost: { total: 0.01 } },
+          }),
+        };
+      },
+    },
+  };
+}
+
+test('a routed selection caps its lifetime at the routed floor', async () => {
+  const pi = fakePi();
+  install(pi);
+  const ctx = routedCtx(86_400);
+
+  await pi.fire('session_start', {}, ctx);
+  await pi.fire('context_with_system', { messages: [{ role: 'user', content: 'hi' }] }, ctx);
+  pi.events.emit('subagents:started', { id: 'wf_router', runId: 'wf_router', mode: 'workflow', type: 'workflow' });
+  await pi.fire('agent_settled', { aborted: false }, ctx);
+
+  const start = readLog().findLast((line) => line.event === 'start');
+  assert.ok(start, 'the routed selection should still start a keepalive');
+  assert.equal(start.model, 'deepseek-flash', 'the answering side is the model that is warmed');
+  assert.equal(start.selection, 'deepseek-flash-auto');
+  assert.equal(start.ttlSeconds, 7200, '24h from the side is capped at the routed floor');
+  assert.equal(start.delayMs, 6_480_000);
+
+  pi.events.emit('subagents:completed', { id: 'wf_router', runId: 'wf_router', mode: 'workflow', status: 'completed' });
+  await pi.fire('session_shutdown', {}, ctx);
+});
+
+test('a routed selection refreshes the side that answered, not the router', async () => {
+  const pi = fakePi();
+  install(pi);
+  const ctx = routedCtx(11);
+
+  await pi.fire('session_start', {}, ctx);
+  await pi.fire('context_with_system', { messages: [{ role: 'user', content: 'hi' }] }, ctx);
+  pi.events.emit('subagents:started', { id: 'wf_side', runId: 'wf_side', mode: 'workflow', type: 'workflow' });
+  await pi.fire('agent_settled', { aborted: false }, ctx);
+
+  const start = readLog().findLast((line) => line.event === 'start');
+  assert.equal(start.ttlSeconds, 11, 'a side below the floor keeps its own lifetime');
+
+  await sleep(1_400);
+  assert.equal(ctx.sent.length, 1, 'the refresh should go out on the side lifetime');
+  assert.equal(ctx.sent[0].model, ctx.side, 'the refresh must name the physical side');
+
+  pi.events.emit('subagents:completed', { id: 'wf_side', runId: 'wf_side', mode: 'workflow', status: 'completed' });
+  await pi.fire('session_shutdown', {}, ctx);
+});
