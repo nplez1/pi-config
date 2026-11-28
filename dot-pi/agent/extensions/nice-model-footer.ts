@@ -197,12 +197,15 @@ function routedModelLabel(
  * threshold belongs in the footer, so the rest of that status stays off-screen.
  */
 const SMART_COMPACTION_STATUS = "smart-compaction";
+
+/** Key the merged deepseek extension publishes its tier/route label under. */
+const DEEPSEEK_STATUS = "deepseek";
 function idleThresholdLabel(statuses: ReadonlyMap<string, string>): string | undefined {
 	return statuses.get(SMART_COMPACTION_STATUS)?.match(/idle≥\S+/)?.[0];
 }
 
 /**
- * deepseek-routing publishes "off-peak → DeepInfra" so a bare model selection
+ * deepseek.ts publishes "off-peak → DeepInfra" so a bare model selection
  * still says where the next request goes. Once the routed label names that same
  * provider, only the billing tier is news. A status pointing somewhere the
  * latest response did not go stays whole, because then the two disagree.
@@ -222,7 +225,7 @@ function trimRoutedTarget(status: string, routedProvider: string | undefined): s
 const LOOP_STATUS = "loop";
 
 /** Statuses that render somewhere other than the trailing status row. */
-const STATUSES_RENDERED_ELSEWHERE = new Set(["deepseek-pricing", SMART_COMPACTION_STATUS, LOOP_STATUS]);
+const STATUSES_RENDERED_ELSEWHERE = new Set([DEEPSEEK_STATUS, SMART_COMPACTION_STATUS, LOOP_STATUS]);
 
 /** Footer statuses are single-line by contract; flatten anything an extension lets through. */
 function normalizeStatusText(text: string | undefined): string | undefined {
@@ -445,7 +448,7 @@ export default function (pi: ExtensionAPI) {
 					}
 
 					// ---- deepseek peak/off-peak indicator, after the model name ----
-					const deepseekStatus = footerData.getExtensionStatuses().get("deepseek-pricing");
+					const deepseekStatus = footerData.getExtensionStatuses().get(DEEPSEEK_STATUS);
 					if (deepseekStatus) {
 						rightSide = `${rightSide} • ${trimRoutedTarget(deepseekStatus, routedProvider)}`;
 					}

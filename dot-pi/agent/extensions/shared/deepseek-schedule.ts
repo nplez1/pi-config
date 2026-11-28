@@ -2,9 +2,9 @@
 //
 // Single source of truth for DeepSeek's peak/off-peak billing schedule, its
 // per-tier rate card, and the model id of every provider the peak router swaps
-// between. Imported by deepseek-pricing.ts (billing + footer label) and
-// deepseek-routing.ts (provider choice), so the price shown and the provider
-// actually used can never disagree.
+// between. Imported by deepseek.ts, which both prices a landed turn at its
+// tier and chooses the provider, so the price shown and the provider actually
+// used can never disagree.
 //
 // DeepSeek bills two rate tiers by wall clock (peak = 2x off-peak), from
 // https://api-docs.deepseek.com/quick_start/pricing (re-verified 2026-11-01):

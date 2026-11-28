@@ -598,7 +598,7 @@ adds). That second one is what makes a bare `pi compile` work even when
 That makes the compiled-in set "everything installed, minus that file", which as
 of 2026-10-24 is ten: `orca-prefill`, `orca-agent-status`,
 `pi-picker-patch-guard`, `nice-model-footer`, `model-manager`,
-`orca-titlebar-spinner`, `deepseek-pricing`, `pi-codex-goal`,
+`orca-titlebar-spinner`, `deepseek`, `pi-codex-goal`,
 `pi-smart-compaction`, `pi-system-one` (nine on this machine, which opts out of
 it — see below). Excluded:
 `juicesharp-rpiv-ask-user-question` (11 ms from its files instead).

@@ -1,4 +1,11 @@
-// deepseek-routing.ts
+// deepseek.ts
+//
+// One extension for everything this config knows about DeepSeek V4.1 Flash: how a
+// request is routed across the three providers that sell it, and what it costs
+// once it lands. The two jobs are one file because neither is meaningful without
+// the other — a peak/off-peak rate card only prices the traffic this router sends
+// to DeepSeek direct, and a router that did not know DeepSeek bills two tiers by
+// wall clock would route on a rate that is wrong for half the day.
 //
 // Keeps DeepSeek V4.1 Flash traffic on whichever provider is cheapest right now
 // once its wait is priced in — see "Latency" below.
@@ -153,6 +160,7 @@ import {
   currentTier,
   deepseekCost,
   effectiveCost,
+  isPeak,
   refFor,
   scoreSide,
   sideOf,
@@ -292,7 +300,7 @@ interface LabelContext {
 }
 
 /** Status key shared with nice-model-footer.ts. */
-const STATUS_KEY = "deepseek-pricing";
+const STATUS_KEY = "deepseek";
 
 /** Re-check cadence while a routed model is active (peak windows flip hourly). */
 const REFRESH_MS = 60_000;
@@ -502,7 +510,7 @@ export default function (pi: ExtensionAPI) {
       });
     } catch (error) {
       // Keep the session alive on DeepSeek direct; note it for /reload triage.
-      console.error(`deepseek-routing: could not register deepinfra: ${String(error)}`);
+      console.error(`deepseek: could not register deepinfra: ${String(error)}`);
     }
   }
 
@@ -652,7 +660,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   // ---- footer indicator ---------------------------------------------------
-  // One writer for the "deepseek-pricing" status: this extension knows both the
+  // One writer for the tier/route status: this extension knows both the
   // billing tier and where the router will send the request. Showing the target
   // only for the router keeps a plain deepseek/deepseek-flash selection reading
   // as a bare "peak" / "off-peak".
@@ -755,6 +763,54 @@ export default function (pi: ExtensionAPI) {
     updateLabel(ctx, event.model);
   });
 
+  /**
+   * DeepSeek bills two rate tiers by time of day (peak = 2x off-peak), and pi's
+   * built-in model catalog stores ONE static rate per field, so pi cannot model
+   * this itself. This rewrites usage.cost per message at message_end, using the
+   * message's own timestamp to pick peak vs off-peak rates. Session totals are
+   * summed from stored message costs, so correcting here is what makes the
+   * footer, /session and RPC totals accurate.
+   *
+   * The static off-peak cost in models.json keeps the in-flight streaming
+   * estimate (before message_end fires) and the /model picker display on
+   * realistic numbers; this is the figure that survives into the session.
+   *
+   * DeepInfra and IsoQuant requests are deliberately untouched: those providers
+   * bill a flat rate (DeepInfra with a live discount), so their cost comes from
+   * their provider registrations — DeepInfra's in this file, IsoQuant's in the
+   * machine-local isoquant-provider extension — and is already right when the
+   * message lands. The tier and route shown in the footer are published by
+   * `updateLabel` above, which owns that decision; this handler is only the cost
+   * corrector.
+   */
+  pi.on("message_end", (event) => {
+    const msg = event.message;
+    if (msg.role !== "assistant") return;
+    if (msg.provider !== "deepseek") return;
+    const rates = RATES[msg.model];
+    if (!rates || !msg.usage) return;
+
+    const peak = isPeak(msg.timestamp);
+    const basis = peak ? rates.peak : rates.offPeak;
+    const { input, output, cacheRead, cacheWrite } = msg.usage;
+
+    const cost = {
+      input: (basis.input / 1e6) * input,
+      output: (basis.output / 1e6) * output,
+      cacheRead: (basis.cacheRead / 1e6) * cacheRead,
+      cacheWrite: (CACHE_WRITE_RATE / 1e6) * cacheWrite,
+      total: 0,
+    };
+    cost.total = cost.input + cost.output + cost.cacheRead + cost.cacheWrite;
+
+    return {
+      message: {
+        ...msg,
+        usage: { ...msg.usage, cost },
+      },
+    };
+  });
+
   // Track the prompt size the cards are priced at, so each side's cache penalty
   // follows the context instead of a constant. Only the routed sides matter; a
   // virtual-model or unrelated-provider message says nothing about the prompt
@@ -767,7 +823,7 @@ export default function (pi: ExtensionAPI) {
     if (degeneratedResponse(msg)) {
       degraded.set(side, Date.now() + DEGRADED_COOLDOWN_MS);
       console.error(
-        `deepseek-routing: ${msg.provider} answered with stopReason "${msg.stopReason}" after ` +
+        `deepseek: ${msg.provider} answered with stopReason "${msg.stopReason}" after ` +
           `${Math.round((msg.durationMs ?? 0) / 1000)}s producing ${producedChars(msg.content)} characters; ` +
           `passing over it for ${Math.round(DEGRADED_COOLDOWN_MS / 60_000)} minutes`,
       );
@@ -1010,7 +1066,7 @@ export default function (pi: ExtensionAPI) {
       if (side.provider === DEEPINFRA_FLASH.provider) registerDeepInfra(deepInfraCost);
       else if (side.provider !== ISOQUANT_FLASH.provider) pi.registerProvider(side.provider, {});
     } catch (error) {
-      console.error(`deepseek-routing: could not re-register ${side.provider}: ${String(error)}`);
+      console.error(`deepseek: could not re-register ${side.provider}: ${String(error)}`);
     }
   }
 
@@ -1048,8 +1104,8 @@ export default function (pi: ExtensionAPI) {
     const names = shown.map(({ side }) => `${side.provider}/${side.id}`);
     const lead =
       names.length === 1
-        ? `deepseek-routing: ${names[0]} is not usable. `
-        : `deepseek-routing: none of ${names.join(", ")} is usable. `;
+        ? `deepseek: ${names[0]} is not usable. `
+        : `deepseek: none of ${names.join(", ")} is usable. `;
     return (
       `${lead}${details.join("; ")}.${registry} ` +
       (dead
@@ -1113,7 +1169,7 @@ export default function (pi: ExtensionAPI) {
   function note(message: string): void {
     if (warnedStaleSnapshot) return;
     warnedStaleSnapshot = true;
-    console.error(`deepseek-routing: ${message}`);
+    console.error(`deepseek: ${message}`);
   }
   /** The first of `refs` that is in the catalog and has credentials. */
   function pickConfigured(ctx: RouteContext, refs: (ModelRef | undefined)[]): CatalogModel | undefined {

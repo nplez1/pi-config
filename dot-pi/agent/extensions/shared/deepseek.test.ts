@@ -16,7 +16,17 @@
 //    before deciding. `stubPricing` below drives that.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import register from "../deepseek-routing.ts";
+import register from "../deepseek.ts";
+import { RATES } from "./deepseek-schedule.ts";
+
+/** Which card a landed turn was billed at: one USD per 1M of each token kind. */
+function assertCost(cost: Record<string, number>, basis: { input: number; output: number; cacheRead: number }) {
+  expect(cost.input).toBeCloseTo(basis.input, 10);
+  expect(cost.output).toBeCloseTo(basis.output, 10);
+  expect(cost.cacheRead).toBeCloseTo(basis.cacheRead, 10);
+  expect(cost.cacheWrite).toBe(0);
+  expect(cost.total).toBeCloseTo(basis.input + basis.output + basis.cacheRead, 10);
+}
 
 const DEEPSEEK = { provider: "deepseek", id: "deepseek-flash" };
 const DEEPINFRA = { provider: "deepinfra", id: "deepseek-ai/DeepSeek-V4.1-Flash-1017" };
@@ -448,15 +458,20 @@ function reportPrompt(
   promptTokens: number,
   provider = "deepinfra",
 ): void {
-  const fire = handlers["message_end"]?.[0] as ((event: unknown) => unknown) | undefined;
-  if (!fire) throw new Error("the extension does not listen for message_end");
-  fire({
-    message: {
-      role: "assistant",
-      provider,
-      usage: { input: promptTokens * 0.01, cacheRead: promptTokens * 0.99, output: 500 },
-    },
-  });
+  const fires = handlers["message_end"] as (((event: unknown) => unknown) | undefined)[] | undefined;
+  if (!fires?.length) throw new Error("the extension does not listen for message_end");
+  // pi runs every handler for an event, so the harness must too: this extension
+  // registers one that corrects the day's billing tier and one that tracks the
+  // prompt size, and only the second is what a report is about.
+  for (const fire of fires) {
+    fire?.({
+      message: {
+        role: "assistant",
+        provider,
+        usage: { input: promptTokens * 0.01, cacheRead: promptTokens * 0.99, output: 500 },
+      },
+    });
+  }
 }
 
 describe("router prices the context size the last turn reported", () => {
@@ -787,5 +802,81 @@ describe("a provider that answers with nothing", () => {
       branch: [{ type: "message", message: endedHoursAgo }],
     });
     expect((await route()).model.provider).toBe("deepinfra");
+  });
+});
+
+describe("bills a landed DeepSeek turn at the tier its timestamp falls in", () => {
+  // Wednesdays at 02:00 and 12:00 UTC: inside peak hours and outside them, on a
+  // weekday so neither instant is excused by the weekend rule.
+  const PEAK_AT = Date.UTC(2026, 10, 25, 2, 0);
+  const OFF_PEAK_AT = Date.UTC(2026, 10, 25, 12, 0);
+  const USAGE = { input: 1_000_000, output: 1_000_000, cacheRead: 1_000_000, cacheWrite: 0 };
+
+  /**
+   * Fire every `message_end` handler, as pi does, and return the message the
+   * extension rewrote (the billing handler is the one that returns one).
+   */
+  async function fireMessageEnd(
+    handlers: Record<string, (() => unknown)[]>,
+    message: Record<string, unknown>,
+  ): Promise<Record<string, any> | undefined> {
+    let rewritten: Record<string, any> | undefined;
+    for (const handler of handlers["message_end"] ?? []) {
+      const result = (await (handler as (e: unknown) => unknown)({ message })) as
+        | { message?: Record<string, any> }
+        | undefined;
+      if (result?.message) rewritten = result.message;
+    }
+    return rewritten;
+  }
+
+  test("charges the peak card inside peak hours", async () => {
+    const { handlers } = await harness(healthy);
+    const message = await fireMessageEnd(handlers, {
+      role: "assistant",
+      provider: "deepseek",
+      model: "deepseek-flash",
+      timestamp: PEAK_AT,
+      usage: { ...USAGE },
+    });
+    assertCost(message!.usage.cost, RATES["deepseek-flash"].peak);
+  });
+
+  test("charges the off-peak card outside them, for the same tokens", async () => {
+    const { handlers } = await harness(healthy);
+    const message = await fireMessageEnd(handlers, {
+      role: "assistant",
+      provider: "deepseek",
+      model: "deepseek-flash",
+      timestamp: OFF_PEAK_AT,
+      usage: { ...USAGE },
+    });
+    assertCost(message!.usage.cost, RATES["deepseek-flash"].offPeak);
+  });
+
+  test("leaves the other two providers alone: they bill flat, already correct", async () => {
+    const { handlers } = await harness(healthy);
+    for (const provider of ["deepinfra", "isoquant"]) {
+      const message = await fireMessageEnd(handlers, {
+        role: "assistant",
+        provider,
+        model: "deepseek-v4.1-flash-1017-fast",
+        timestamp: PEAK_AT,
+        usage: { ...USAGE },
+      });
+      expect(message).toBeUndefined();
+    }
+  });
+
+  test("leaves a DeepSeek model it has no card for alone", async () => {
+    const { handlers } = await harness(healthy);
+    const message = await fireMessageEnd(handlers, {
+      role: "assistant",
+      provider: "deepseek",
+      model: "some-unlisted-model",
+      timestamp: PEAK_AT,
+      usage: { ...USAGE },
+    });
+    expect(message).toBeUndefined();
   });
 });
