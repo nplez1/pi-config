@@ -532,6 +532,85 @@ Limit: a session killed mid-tool-call can leave an unpaired tool call in the
 transcript. `/continue` omits it for its own request, but later turns send it
 as pi does today, which some providers reject.
 
+## Malformed tool calls — the reply that ends the run
+
+`extensions/toolcall-rescue.ts`. `/continue` above is the manual cure for a run
+that stopped for no visible reason. This is the automatic one, for the one cause
+that reproduces: a reply whose whole content is a tool call written as **text**.
+
+DeepSeek writes tool calls in its own DSML dialect, wrapping every tag in
+`<` U+FF5C `DSML` U+FF5C. When the model answers with that markup in the reply
+body instead of sending a real tool call, it reaches pi as ordinary assistant
+text with `stopReason: "stop"` and zero tool calls:
+
+```text
+<｜DSML｜invoke name="codemodode" string="true">
+</｜DSML｜parameter>
+</｜DSML｜invoke>
+</｜DSML｜calls>
+```
+
+Pi has no DSML parser — `strings pi-bin | rg -i dsml` returns nothing — so it
+reads a finished reply and settles the run. Nothing executes, nothing errors,
+the transcript looks fine, and a job that was 40 turns in is simply over. All
+three observed failures mangled the tool name too (`codemod`, `codemap`,
+`codemodode` for `codemode`), which is a second turn lost: the model re-emits the
+same misspelling, or picks a different tool. At the boundary `turn_end` fires
+with `outcome: "completed"`, no tool results and no tool calls — the exact shape
+of a run pi believes finished.
+
+**Measured over every session on this machine (2026-11-28): all 1,151 session
+files, 105,658 assistant turns, 13,005 of them carrying reply text.** Three turns
+matched the failure shape — `isoquant` / `deepseek-v4.1-flash-1017-fast`,
+`stopReason: "stop"`, zero tool calls — against 126 sessions that used that
+model. Every one of them ended its turn. One further turn was detected and
+correctly left alone, because it had also issued a real tool call and kept
+going.
+
+The extension makes that boundary recoverable instead of terminal. When the
+reply is an envelope, it appends two entries and asks for one more turn:
+
+| entry | effect |
+|---|---|
+| `context_edit` on the reply | the envelope leaves the model's context; a one-line note says the call is being re-issued |
+| hidden `custom_message` | the recovered call, and the instruction to make it as a real tool call |
+| `continue: true` | pi does not settle; the run carries on |
+
+It cannot simply *run* the recovered call, and that is the reason for the round
+trip: the drafts `turn_end` may append are `custom`, `custom_message`,
+`context_edit` and `compaction` — never a tool call — and `ctx.executeTool`
+exists only on tool execute contexts. So the malformed reply costs one cheap
+turn, not the job.
+
+The corrective message carries what it recovered, because a model that already
+decided is cheaper to resume than to re-plan: the written name, its parameters
+(value clipped at 400 characters), and the closest active tool when the name is
+not one — `codemodode` resolves to `codemode` by edit distance, with the distance
+bounded both absolutely (a third of the written name) and relatively (half the
+longer name, so a two-letter typo cannot "correct" a short tool name into an
+unrelated one). It never repeats the envelope it is correcting: no DSML marker
+or `<invoke>` tag appears in the message, or the model would have the pattern
+handed back to it.
+
+Detection is deliberately conservative, because a false positive edits a good
+reply out of context. It requires an envelope outside a fenced code block (a
+reply that *documents* the format is left alone), an end-of-reply closing tag
+for the plain XML dialect, and DeepSeek's markers alone are enough for DSML —
+nothing else writes that U+FF5C marker, and the observed envelopes are degraded
+enough (`</parameter>` with no opener, `</calls>` with no `function_calls`) that
+demanding a well-formed one would reject the very case this exists for. On this
+machine's 105,658 turns that rule produced three rescues and no false positives.
+
+Bounded, so a model stuck in the pattern cannot keep the session alive forever:
+at most three rescues in a row, then it gives up and says so once in the UI;
+the budget is restored by any turn that makes progress, by a new user message,
+and by a new session. Each rescue raises one warning with the tool name — the
+user sees what happened without the corrective message becoming transcript
+noise. `/toolcall-rescue` reports the session's count and the last call.
+
+Tests: `node --test tests/toolcall-rescue.test.mjs` (25 cases, including the
+replies the three failing sessions actually stored).
+
 ## DeepSeek V4.1 Flash provider routing
 
 DeepSeek bills two tiers by wall clock (peak = 2x off-peak: 01:00-04:00 and
@@ -809,6 +888,37 @@ Commands: `/pi-vcc` compacts now (keeping the last user turn, `keep:N [prompt]`
 to choose), `/pi-vcc-recall <query>` runs the recall search as a command, and
 `/smart-compaction [force]` prints the resume gate's status or fires it.
 
+## Bounded tool output — the bytes that ride along
+
+`extensions/output-cap.ts`. One 12-hour session carried **1.0 MB** of tool output,
+40 % of all calls being inspection. The two largest single results were 46 KB and
+45 KB, and a 27 KB file read stayed in the context for 378 turns — roughly 4M
+token-turns — and was never read again before compaction. Pi has no byte cap, so
+every one of those bytes is re-sent on every request until the context is
+compacted: the most expensive possible way to store a fact nobody looked at.
+
+A result over the cap is cut on a line boundary and the **full text is written to
+a spill file** the model can read back if it really needs it, so nothing is lost —
+only moved out of the context. The note says what to do instead (`rg -n`, `jq`,
+`cut -c1-200`), because the cap is a prompt to ask a narrower question, not a wall.
+
+| case | action |
+|---|---|
+| `bash` or `read` result over the cap | cut on a line boundary, full text spilled to a temp file, note appended |
+| a result already under the cap | untouched |
+| image or non-text blocks | carried through untouched, in their original order |
+| anything a result would lose | never cut to nothing — the head of the first text block always survives |
+
+Only `bash` and `read` are capped: they are the two tools that produce unbounded
+text. Config is re-read per result, so an edit applies on the next call —
+`~/.config/pi-output-cap/config.json` (`PI_OUTPUT_CAP_CONFIG` overrides the path):
+
+```json
+{ "enabled": true, "maxBytes": 8192 }
+```
+
+Tests: `node --test tests/output-cap.test.mjs`.
+
 ## Loop guards — the turns that buy nothing
 
 Three extensions that came out of auditing 785 session files (62.8k assistant
@@ -831,6 +941,7 @@ notifies on completion anyway.
 | `sleep N` with nothing after it, `N > 30` | **blocked**, with a reason naming the bounded-poll and `wait: true` alternatives |
 | `sleep N` in front of a command, `N > 120` | **clamped** to 120s; the command still runs, and the note rides on the tool result |
 | `get_subagent_result` with an `agent_id` and no `wait: true` | **rewritten** to `wait: true` |
+| `cd /x && sleep N`, `set -e; sleep N`, `FOO=1 && sleep N` | **seen through**: the no-op prefix is looked past, so the sleep is judged and clamped like any other |
 | a sleep inside a pipeline or loop body | untouched — there it is part of the program |
 
 The clamp note appears in the result the model reads next, so the habit is
@@ -838,6 +949,16 @@ corrected in context rather than silently. `/loop-guards` reports what fired.
 
 A short `sleep 2` before a health check is legitimate and is left alone. The
 guards target dead time, not delay.
+
+The prefix stripping is what makes the clamp reach reality. Over the 2026-11-24
+release session — 86 minutes of it spent inside `sleep` — `grep -c loop-guards`
+on the transcript returned **0**: all 17 sleeps were shaped
+`cd /Volumes/.../main && sleep 480; git status --porcelain | head -8`, and the
+parser only matched a `sleep` in the very first token. A guard that only sees the
+shape the model rarely writes is a guard that does not run. A wrapper is
+deliberately still not stripped: `timeout 30 sleep 900` and
+`bash -c "sleep 900"` put the sleep inside a program, where the delay is the
+program's business.
 
 ### `extensions/edit-repair.ts` — a failed edit carries its own correction
 
@@ -913,6 +1034,28 @@ then runs at that project root, because `pnpm tc` is root-relative — `runIn:
 and not `src/distribution.ts`. `/verify` prints the active config **and which
 source produced it**; `/verify reload` re-reads after an edit.
 
+**Edits a tool makes on the model's behalf count.** A `codemode` script's
+`tools.write` is a real write, but pi keeps nested calls out of the assistant
+message (they arrive as `tool_result` with `parentToolCallId`, id
+`<parent id>/<n>`), so a turn that only edited through a script looked like a
+turn that edited nothing and the check never ran. Those calls are now recorded as
+they happen and counted at the boundary, at any nesting depth: a scripted edit is
+judged by its own result, so a script that wrote a file and then threw is still
+checked, and a `tools.bash({ command: "pnpm tc" })` inside the script counts as
+the check already having run. Any other tool that reaches tools through
+`ctx.executeTool` is covered for the same reason.
+
+**The output budget scales with the edit, not with one file.** One run at the
+boundary is right, but a script that rewrites 40 files produces a failure list
+that does not fit one file's worth of output: the caps were 100 lines and 8,000
+characters, which is roughly five type errors and would have hidden the rest of a
+wide breakage. They now grow by 20 lines and 400 characters per additional
+changed file, to a ceiling of 400 lines / 24,000 characters — still below what
+the `bash` tool itself returns, so a check that dumps a whole log cannot flood
+the context. The status line and the closing instruction are reserved before the
+body is filled, so truncation can never cut the part that says what happened or
+what to do; whatever it drops is stated in the message.
+
 Refusals that keep it from becoming ambient noise: the check the model already ran
 this turn is not run again; an identical (command, file-set) pair is skipped
 within 10s; an unfinished turn runs nothing; the chain stops at the first failure;
@@ -920,7 +1063,34 @@ within 10s; an unfinished turn runs nothing; the chain stops at the first failur
 next request as it would have anyway.
 
 Tests: `node --test tests/loop-guards.test.mjs tests/edit-repair.test.mjs \
-tests/verify-after-edit.test.mjs` (92 cases, no session needed).
+tests/verify-after-edit.test.mjs` (102 cases, no session needed).
+
+## Message timestamps — when a settled session actually ran
+
+### `extensions/message-timestamps.ts` — `11/27 12:53pm` above each message
+
+The footer's clock describes *now*, which is the one fact that stops being true
+the moment you look away: a session read hours later says nothing about when any
+of it happened. This extension puts a dim stamp above every user and assistant
+message.
+
+The time comes from the message, never from the paint. Pi hands a markdown
+transformer the session entry's ISO timestamp when it repaints a restored
+message, so the stamp is static and survives a restart; a live message has no
+entry timestamp, so `message_start` records one per role and the streamed
+renders reuse it. The year is named only when it is not this one
+(`25/11/27 12:53pm`).
+
+Dim is the palette's dim slot (ANSI 90) in the Markdown source, closed with
+`\x1b[39m`: SGR 2 (faint) is the shorter spelling, but terminals routinely
+ignore it for 24-bit text, so the stamp read as ordinary output. ANSI 90 is
+where every palette puts its own quieter colour, so the stamp follows the
+terminal instead of fighting it — `theme.fg("dim")` is out of reach, because a
+markdown transformer is handed no theme. pi's renderer styles each line
+separately, so the closing 39 recolours the stamp alone and never the message
+below it. Thinking blocks are excluded — pi already labels them.
+
+Tests: `node --test tests/message-timestamps.test.mjs`.
 
 ## `/loop` — one scheduler, two execution homes
 
