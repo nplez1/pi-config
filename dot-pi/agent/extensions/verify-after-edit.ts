@@ -13,6 +13,12 @@
  * the boundary and its result is appended as a message, so the very next request already
  * contains the outcome. Three turns (edit / issue check / read result) become two.
  *
+ * "Edits files" includes edits a tool made on the model's behalf. A codemode script's
+ * `tools.write` is a real write that never appears in the assistant message: pi reports it on
+ * `tool_result` with `parentToolCallId`, so those calls are recorded as they happen and
+ * counted at the boundary. Without that, every `codemode` edit was invisible here and the
+ * check never ran.
+ *
  * Deliberate limits, because a check that runs when it is not wanted is worse than none:
  *
  *   - Opt-in. With no config there are no commands and this file does nothing.
@@ -56,10 +62,47 @@ export function globalConfigPath(): string {
 
 /** An identical (command, files) run inside this window is skipped. */
 export const DEBOUNCE_MS = 10_000;
-/** Output lines kept from the front of a check's output. */
-const MAX_OUTPUT_LINES = 100;
-/** Hard cap on the appended message. */
-const MAX_MESSAGE_CHARS = 8000;
+
+/**
+ * How much of a check's output to keep, scaled to how many files the turn changed.
+ *
+ * These limits were pitched at one file's worth of errors — the ordinary `edit` turn. A codemode
+ * script changes dozens at once, and a failure list that names every broken file does not fit in
+ * 100 lines. So the budget grows per additional file and stops at a ceiling that stays below what
+ * the bash tool itself returns (2000 lines / 50 KB): wide enough to hold a real multi-file failure
+ * list, bounded enough that a check which dumps a whole log cannot flood the context.
+ *
+ * Growth stops at the ceiling rather than scaling without limit because the cost is context, and
+ * beyond a few hundred lines the model fixes the first errors and asks for more anyway.
+ */
+export const MAX_OUTPUT_LINES = 100;
+/** Base cap on the appended message, for a single-file turn. */
+export const MAX_MESSAGE_CHARS = 8000;
+/** Extra lines allowed per additional changed file. */
+const LINES_PER_EXTRA_FILE = 20;
+const MAX_OUTPUT_LINES_CEILING = 400;
+/** Extra characters of message allowed per additional changed file. */
+const CHARS_PER_EXTRA_FILE = 400;
+const MAX_MESSAGE_CHARS_CEILING = 24_000;
+
+export interface OutputBudget {
+  /** Lines kept from each check's output. */
+  lines: number;
+  /** Total characters for the appended message, including the status line and the instruction. */
+  chars: number;
+}
+
+/** The budget for a turn that changed `fileCount` files; one file is the baseline. */
+export function outputBudget(fileCount: number): OutputBudget {
+  // A pathological count must not turn into a pathological budget, so the driver is clamped.
+  const extra = Math.max(0, Math.min(Math.trunc(fileCount) || 1, 200) - 1);
+  return {
+    lines: Math.min(MAX_OUTPUT_LINES + extra * LINES_PER_EXTRA_FILE, MAX_OUTPUT_LINES_CEILING),
+    chars: Math.min(MAX_MESSAGE_CHARS + extra * CHARS_PER_EXTRA_FILE, MAX_MESSAGE_CHARS_CEILING),
+  };
+}
+/** Nested bash commands kept per turn; the edits themselves are never dropped. */
+const MAX_NESTED_COMMANDS = 256;
 
 export interface VerifyConfig {
   commands: string[];
@@ -268,10 +311,91 @@ function toolCalls(message: TurnMessage | undefined): ToolCallBlock[] {
 }
 
 /**
+ * A tool call made by another tool, reported on `tool_result` with `parentToolCallId`.
+ *
+ * `codemode` scripts and any other tool that reaches other tools through `ctx.executeTool`
+ * run `edit`/`write` this way, so those calls never appear in the assistant message: pi
+ * assigns them `<parent id>/<n>` and keeps them out of the transcript. Recording them here is
+ * the only way a script's edits can be seen at the turn boundary.
+ */
+export interface NestedCall {
+  toolName?: string;
+  /** The call's own id: `<parent id>/<n>` for nested calls. */
+  toolCallId?: string;
+  /** The id of the tool call that issued it. */
+  parentToolCallId?: string;
+  input?: Record<string, unknown>;
+  isError?: boolean;
+}
+
+/** The model-issued call a nested id belongs to; `null` when the id is already top level. */
+export function rootToolCallId(toolCallId: string | undefined): string | null {
+  if (!toolCallId) return null;
+  const slash = toolCallId.indexOf("/");
+  return slash > 0 ? toolCallId.slice(0, slash) : null;
+}
+
+/**
+ * Identity of a nested call worth recording, or `null` for one that is not.
+ *
+ * Scripts make far more `read`/`grep`/`searchTools` calls than edits, and a loop can repeat a
+ * write. Keying on (purpose, parent, path or command) records each edit once however many times
+ * it happens, so a script that touches dozens of files reports all of them and one that reads a
+ * thousand files adds nothing. `isError` is part of the key on purpose: a failed write and a
+ * later successful one to the same path are different facts, and only the success counts.
+ */
+export function nestedRecordKey(call: NestedCall): string | null {
+  const parent = call.parentToolCallId ?? rootToolCallId(call.toolCallId) ?? "";
+  if (call.toolName === "edit" || call.toolName === "write") {
+    const path = call.input?.path;
+    if (typeof path !== "string" || path.length === 0) return null;
+    return `${call.toolName}\u0000${parent}\u0000${path}\u0000${call.isError ? "error" : "ok"}`;
+  }
+  if (call.toolName === "bash") {
+    const command = call.input?.command;
+    if (typeof command !== "string" || command.trim().length === 0) return null;
+    return `bash\u0000${parent}\u0000${command}`;
+  }
+  return null;
+}
+
+/** Ids of the model-issued tool calls in this turn. */
+function turnToolCallIds(message: TurnMessage | undefined): Set<string> {
+  return new Set(
+    toolCalls(message)
+      .map((call) => call.id)
+      .filter((id): id is string => typeof id === "string" && id.length > 0),
+  );
+}
+
+/**
+ * Nested calls that belong to a call this turn made.
+ *
+ * Turn-scoped rather than blindly taken: the recorder is reset at `turn_start`, but a nested
+ * call from a tool that outlived its turn must never make a later turn look like it edited
+ * something.
+ */
+export function nestedCallsForTurn(nested: NestedCall[] | undefined, ids: Set<string>): NestedCall[] {
+  if (!nested || nested.length === 0) return [];
+  return nested.filter((call) => {
+    const candidates = [rootToolCallId(call.toolCallId), call.parentToolCallId, rootToolCallId(call.parentToolCallId)];
+    return candidates.some((id): id is string => typeof id === "string" && ids.has(id));
+  });
+}
+
+/**
  * Files this turn actually changed: an `edit`/`write` call whose result is not an error.
  * A failed edit wrote nothing, so checking for it would be checking the previous state.
+ *
+ * `nested` carries the calls a tool made on the model's behalf — a codemode script's
+ * `tools.write` above all, which is otherwise invisible here. A nested edit is judged by its
+ * own result, not its parent's: a script that fails after writing really did change the file.
  */
-export function collectEditedPaths(message: TurnMessage | undefined, toolResults: TurnToolResult[]): string[] {
+export function collectEditedPaths(
+  message: TurnMessage | undefined,
+  toolResults: TurnToolResult[],
+  nested: NestedCall[] = [],
+): string[] {
   const failed = new Set(toolResults.filter((r) => r?.isError).map((r) => r?.toolCallId));
   const paths = new Set<string>();
   for (const call of toolCalls(message)) {
@@ -280,15 +404,29 @@ export function collectEditedPaths(message: TurnMessage | undefined, toolResults
     const path = call.arguments?.path;
     if (typeof path === "string" && path.length > 0) paths.add(path);
   }
+  for (const call of nestedCallsForTurn(nested, turnToolCallIds(message))) {
+    if (call.toolName !== "edit" && call.toolName !== "write") continue;
+    if (call.isError) continue;
+    const path = call.input?.path;
+    if (typeof path === "string" && path.length > 0) paths.add(path);
+  }
   return [...paths];
 }
 
-/** Bash commands the model issued itself this turn, so the check is not run twice. */
-export function collectBashCommands(message: TurnMessage | undefined): string[] {
-  return toolCalls(message)
+/**
+ * Bash commands the model issued itself this turn, so the check is not run twice.
+ *
+ * Nested commands count too: `tools.bash({ command: "pnpm tc" })` inside a codemode script is
+ * the same check, and re-running it would duplicate what the transcript already holds.
+ */
+export function collectBashCommands(message: TurnMessage | undefined, nested: NestedCall[] = []): string[] {
+  const direct = toolCalls(message)
     .filter((call) => call.name === "bash")
-    .map((call) => call.arguments?.command)
-    .filter((command): command is string => typeof command === "string");
+    .map((call) => call.arguments?.command);
+  const scripted = nestedCallsForTurn(nested, turnToolCallIds(message))
+    .filter((call) => call.toolName === "bash")
+    .map((call) => call.input?.command);
+  return [...direct, ...scripted].filter((command): command is string => typeof command === "string");
 }
 
 /** True when the model itself issued this exact check in the turn just ended. */
@@ -331,15 +469,32 @@ export interface RenderedRun {
   durationMs: number;
 }
 
-/** Trim a run's output to something a model can act on without flooding the context. */
-export function trimOutput(text: string): string {
+/**
+ * Trim a run's output to something a model can act on without flooding the context.
+ *
+ * `maxLines` is the caller's budget: one file's worth of errors by default, more when the turn
+ * changed many files (see {@link outputBudget}). Head-truncation is deliberate — the first
+ * failures are the ones to fix first, and a tail would be no less arbitrary.
+ */
+export function trimOutput(text: string, maxLines: number = MAX_OUTPUT_LINES): string {
   const lines = text.replace(/\r\n/g, "\n").replace(/\s+$/, "").split("\n");
-  if (lines.length <= MAX_OUTPUT_LINES) return lines.join("\n");
-  return `${lines.slice(0, MAX_OUTPUT_LINES).join("\n")}\n… [${lines.length - MAX_OUTPUT_LINES} more line(s) omitted — rerun the command directly if you need the rest]`;
+  if (lines.length <= maxLines) return lines.join("\n");
+  return `${lines.slice(0, maxLines).join("\n")}\n… [${lines.length - maxLines} more line(s) omitted — rerun the command directly if you need the rest]`;
+}
+
+/** Cut text to a character budget on a line boundary, saying so when it does. */
+export function clampChars(text: string, maxChars: number): string {
+  if (maxChars <= 0) return "… [verify output truncated]";
+  if (text.length <= maxChars) return text;
+  const note = "\n… [verify output truncated to fit the appended message]";
+  const room = Math.max(0, maxChars - note.length);
+  const cut = text.lastIndexOf("\n", room);
+  return `${(cut > 0 ? text.slice(0, cut) : text.slice(0, room)) + note}`;
 }
 
 /** The message appended at the boundary. */
 export function renderVerifyMessage(files: string[], runs: RenderedRun[], failed: boolean): string {
+  const budget = outputBudget(files.length);
   const head = runs
     .map((run) => {
       const status = run.killed ? "timed out" : run.code === 0 ? "passed" : `exit ${run.code}`;
@@ -347,19 +502,27 @@ export function renderVerifyMessage(files: string[], runs: RenderedRun[], failed
     })
     .join("; ");
   const list = files.length === 1 ? files[0] : `${files.length} files (${files.slice(0, 6).join(", ")}${files.length > 6 ? ", …" : ""})`;
-  const parts = [
-    `[verify-after-edit] The extension ran the project check itself after your edit to ${list}. Do not run it again this turn.`,
-    head,
-  ];
+  const intro = `[verify-after-edit] The extension ran the project check itself after your edit to ${list}. Do not run it again this turn.`;
+  const tail = failed ? "Fix what this reports before moving on." : "";
+
+  // The status line and the closing instruction are reserved first, so a wide edit's output can
+  // never truncate the two parts that say what happened and what to do about it.
+  const blocks: string[] = [head];
+  let room = budget.chars - intro.length - head.length - (tail ? tail.length + 1 : 0) - 2;
   for (const run of runs) {
-    const body = trimOutput([run.stdout, run.stderr].filter((s) => s && s.trim()).join("\n"));
-    if (!body) continue;
-    parts.push(`\n--- ${run.command} ---\n${body}`);
+    const raw = [run.stdout, run.stderr].filter((s) => s && s.trim()).join("\n");
+    if (!raw.trim()) continue;
+    const banner = `\n--- ${run.command} ---`;
+    const allowed = room - banner.length - 1;
+    if (allowed <= 0) {
+      blocks.push(`${banner}\n… [output omitted: the message budget is spent]`);
+      continue;
+    }
+    const body = clampChars(trimOutput(raw, budget.lines), allowed);
+    blocks.push(`${banner}\n${body}`);
+    room -= banner.length + body.length + 2;
   }
-  if (failed) parts.push(`\nFix what this reports before moving on.`);
-  let text = parts.join("\n");
-  if (text.length > MAX_MESSAGE_CHARS) text = `${text.slice(0, MAX_MESSAGE_CHARS)}\n… [verify output truncated]`;
-  return text;
+  return [intro, ...blocks, ...(tail ? [tail] : [])].join("\n");
 }
 
 async function readJson<T>(path: string): Promise<T | null> {
@@ -429,6 +592,17 @@ export default function (pi: ExtensionAPI) {
   let inFlight = false;
   let lastRun: { key: string; at: number } | null = null;
   let warned = false;
+  /**
+   * Calls tools made on the model's behalf this turn, such as a codemode script's writes.
+   *
+   * Split by purpose rather than one capped list: dozens of `tools.write` calls must all reach
+   * the check, so recorded edits collapse to one entry per path and are never evicted, while
+   * scripted `bash` commands — only ever consulted to avoid re-running the check — are capped.
+   * Reads, greps and searches are not recorded at all; they are the bulk of a busy script.
+   */
+  let nestedEdits: NestedCall[] = [];
+  let nestedCommands: NestedCall[] = [];
+  let nestedSeen = new Set<string>();
 
   const load = async (cwd: string) => {
     const globalFile = await readJson<VerifyConfigFile>(globalConfigPath());
@@ -454,14 +628,54 @@ export default function (pi: ExtensionAPI) {
     inFlight = false;
     lastRun = null;
     warned = false;
+    nestedEdits = [];
+    nestedCommands = [];
+    nestedSeen = new Set();
     await load(ctx.cwd);
+  });
+
+  pi.on("turn_start", async () => {
+    nestedEdits = [];
+    nestedCommands = [];
+    nestedSeen = new Set();
+  });
+
+  // A nested `edit`/`write` never reaches the assistant message, so it is recorded as it
+  // happens. Model-issued calls are not recorded: `turn_end` already sees them.
+  pi.on("tool_result", async (event) => {
+    if (!event.parentToolCallId) return undefined;
+    const record: NestedCall = {
+      toolName: event.toolName,
+      toolCallId: event.toolCallId,
+      parentToolCallId: event.parentToolCallId,
+      input: (event.input ?? undefined) as Record<string, unknown> | undefined,
+      isError: event.isError,
+    };
+    // One entry per (purpose, parent, path or command): a script that writes the same file in a
+    // loop, or retries a command, must not grow the list or the message.
+    const key = nestedRecordKey(record);
+    if (key === null || nestedSeen.has(key)) return undefined;
+    nestedSeen.add(key);
+    if (record.toolName === "bash") {
+      if (nestedCommands.length >= MAX_NESTED_COMMANDS) nestedCommands.shift();
+      nestedCommands.push(record);
+    } else {
+      nestedEdits.push(record);
+    }
+    return undefined;
   });
 
   pi.on("turn_end", async (event, ctx) => {
     if (event.outcome !== "completed") return undefined;
     if (inFlight) return undefined;
 
-    const edited = collectEditedPaths(event.message as TurnMessage, event.toolResults as TurnToolResult[]);
+    const message = event.message as TurnMessage;
+    // Taken once: a later handler in this same turn must not see these again.
+    const nested = [...nestedEdits, ...nestedCommands];
+    nestedEdits = [];
+    nestedCommands = [];
+    nestedSeen = new Set();
+    const edited = collectEditedPaths(message, event.toolResults as TurnToolResult[], nested);
     if (edited.length === 0) return undefined;
 
     if (loadedFor !== ctx.cwd) await load(ctx.cwd);
@@ -476,7 +690,7 @@ export default function (pi: ExtensionAPI) {
     const relevant = filterPaths(edited, config);
     if (relevant.length === 0) return undefined;
 
-    const commands = commandsToRun(config.commands, collectBashCommands(event.message as TurnMessage));
+    const commands = commandsToRun(config.commands, collectBashCommands(message, nested));
     // Every configured command was already run by the model in this turn: the result it
     // needs is already in the transcript, so appending another would be noise.
     if (commands.length === 0) return undefined;

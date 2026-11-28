@@ -25,10 +25,15 @@ const {
   describeSource,
   collectEditedPaths,
   collectBashCommands,
+  rootToolCallId,
+  nestedCallsForTurn,
+  nestedRecordKey,
   alreadyRan,
   commandsToRun,
   filterPaths,
   trimOutput,
+  clampChars,
+  outputBudget,
   renderVerifyMessage,
   missingRequirements,
   DEBOUNCE_MS,
@@ -201,6 +206,77 @@ test('collectBashCommands: gathers the commands the model issued', () => {
     { name: 'read', arguments: { path: 'x' } },
   ]);
   assert.deepEqual(collectBashCommands(message), ['pnpm tc']);
+});
+
+// ── edits a tool made on the model's behalf (codemode and friends) ─────────
+
+// Pi reports a nested call as `<parent id>/<n>`, at any depth, and keeps it out of the transcript.
+const nestedWrite = (parentId, path, extra = {}) => ({
+  toolName: 'write',
+  toolCallId: `${parentId}/1`,
+  parentToolCallId: parentId,
+  input: { path },
+  isError: false,
+  ...extra,
+});
+
+test('rootToolCallId: only a nested id names a parent', () => {
+  assert.equal(rootToolCallId('call_abc/1'), 'call_abc');
+  assert.equal(rootToolCallId('call_abc/1/2'), 'call_abc', 'depth collapses to the model-issued call');
+  assert.equal(rootToolCallId('call_abc'), null, 'a model-issued call has no parent');
+  assert.equal(rootToolCallId(undefined), null);
+});
+
+test('nestedCallsForTurn: only calls this turn made', () => {
+  const ids = new Set(['call_a']);
+  assert.deepEqual(nestedCallsForTurn([nestedWrite('call_a', 'x.ts')], ids).length, 1);
+  assert.deepEqual(nestedCallsForTurn([nestedWrite('call_old', 'x.ts')], ids), [], 'a stale parent is ignored');
+  // Two levels down (`call_a/1/2`) still belongs to `call_a`, so the parent field is not needed.
+  const deep = { toolName: 'write', toolCallId: 'call_a/1/2', input: { path: 'y.ts' }, isError: false };
+  assert.deepEqual(nestedCallsForTurn([deep], ids).length, 1);
+  assert.deepEqual(nestedCallsForTurn([], ids), []);
+  assert.deepEqual(nestedCallsForTurn(undefined, ids), []);
+});
+
+test('collectEditedPaths: a codemode write is an edit, even though the message shows only the script', () => {
+  const message = turnMessage([{ id: 'call_a', name: 'codemode', arguments: { code: 'await tools.write(…)' } }]);
+  const nested = [nestedWrite('call_a', 'src/a.ts'), nestedWrite('call_a', 'src/b.ts')];
+  assert.deepEqual(collectEditedPaths(message, [{ toolCallId: 'call_a', isError: false }], nested).sort(), [
+    'src/a.ts',
+    'src/b.ts',
+  ]);
+});
+
+test('collectEditedPaths: a nested edit is judged by its own result, not the script\'s', () => {
+  // The script wrote the file and then threw. Calls made before a failure are not undone.
+  const message = turnMessage([{ id: 'call_a', name: 'codemode', arguments: { code: '…' } }]);
+  const nested = [nestedWrite('call_a', 'src/written.ts')];
+  assert.deepEqual(collectEditedPaths(message, [{ toolCallId: 'call_a', isError: true }], nested), ['src/written.ts']);
+  // A nested edit that itself failed wrote nothing.
+  const failed = [nestedWrite('call_a', 'src/never.ts', { isError: true })];
+  assert.deepEqual(collectEditedPaths(message, [{ toolCallId: 'call_a', isError: false }], failed), []);
+});
+
+test('collectEditedPaths: a nested edit from another turn does not count', () => {
+  const message = turnMessage([{ id: 'call_now', name: 'codemode', arguments: { code: '…' } }]);
+  assert.deepEqual(collectEditedPaths(message, [], [nestedWrite('call_previous', 'src/old.ts')]), []);
+});
+
+test('collectEditedPaths: a direct and a scripted edit to the same file are reported once', () => {
+  const message = turnMessage([
+    { id: 'call_a', name: 'edit', arguments: { path: 'src/a.ts' } },
+    { id: 'call_b', name: 'codemode', arguments: { code: '…' } },
+  ]);
+  assert.deepEqual(collectEditedPaths(message, [], [nestedWrite('call_b', 'src/a.ts')]), ['src/a.ts']);
+});
+
+test('collectBashCommands: a check run from inside a script is not run again', () => {
+  const message = turnMessage([{ id: 'call_a', name: 'codemode', arguments: { code: '…' } }]);
+  const nested = [
+    { toolName: 'bash', toolCallId: 'call_a/1', parentToolCallId: 'call_a', input: { command: 'pnpm tc' }, isError: false },
+    { toolName: 'bash', toolCallId: 'call_old/1', parentToolCallId: 'call_old', input: { command: 'pnpm lint' } },
+  ];
+  assert.deepEqual(collectBashCommands(message, nested), ['pnpm tc']);
 });
 
 test('alreadyRan / commandsToRun: a check the model just ran is not run again', () => {
@@ -475,4 +551,322 @@ test('handler: an edit to an ignored path runs nothing', async () => {
   p.ctx.cwd = dir;
   await p.handlers.session_start[0]({ reason: 'startup' }, p.ctx);
   assert.equal(await p.handlers.turn_end[0](editedTurn(), p.ctx), undefined);
+});
+
+// ── codemode: edits made by a tool the model called ────────────────────────
+
+/** Drive the extension the way pi does: nested results first, then the parent's. */
+async function runScriptedTurn(p, { parentId = 'call_a', paths, scriptBash, parentError = false }) {
+  await p.handlers.turn_start?.[0]?.({ turnIndex: 1 }, p.ctx);
+  let n = 0;
+  for (const path of paths) {
+    n += 1;
+    await p.handlers.tool_result[0](
+      {
+        type: 'tool_result',
+        toolName: 'write',
+        toolCallId: `${parentId}/${n}`,
+        parentToolCallId: parentId,
+        input: { path, content: 'x' },
+        content: [],
+        isError: false,
+      },
+      p.ctx,
+    );
+  }
+  if (scriptBash) {
+    n += 1;
+    await p.handlers.tool_result[0](
+      {
+        type: 'tool_result',
+        toolName: 'bash',
+        toolCallId: `${parentId}/${n}`,
+        parentToolCallId: parentId,
+        input: { command: scriptBash },
+        content: [],
+        isError: false,
+      },
+      p.ctx,
+    );
+  }
+  return p.handlers.turn_end[0](
+    {
+      type: 'turn_end',
+      turnIndex: 1,
+      outcome: 'completed',
+      entries: [],
+      message: turnMessage([{ id: parentId, name: 'codemode', arguments: { code: '…' } }]),
+      toolResults: [{ toolCallId: parentId, isError: parentError }],
+    },
+    p.ctx,
+  );
+}
+
+async function projectWith(verifyJson) {
+  const dir = await mkdtemp(join(tmpdir(), 'verify-project-'));
+  await mkdir(join(dir, '.pi'), { recursive: true });
+  await writeFile(join(dir, '.pi', 'verify.json'), JSON.stringify(verifyJson));
+  return dir;
+}
+
+test('handler: a codemode-only turn runs the check', async () => {
+  const dir = await projectWith({ commands: ['pnpm tc'] });
+  const calls = [];
+  const p = fakePi({
+    exec: async (_command, args, options) => {
+      calls.push({ command: args[1], cwd: options.cwd });
+      return { stdout: 'all good', stderr: '', code: 0, killed: false, truncated: false };
+    },
+  });
+  p.ctx.cwd = dir;
+  await p.handlers.session_start[0]({ reason: 'startup' }, p.ctx);
+
+  const out = await runScriptedTurn(p, { paths: ['src/a.ts'] });
+  assert.equal(calls.length, 1, 'a scripted write is a write');
+  assert.equal(calls[0].command, 'pnpm tc');
+  assert.equal(calls[0].cwd, dir);
+  assert.match(out.entries[0].content, /src\/a\.ts/);
+  assert.match(out.entries[0].content, /all good/);
+});
+
+test('handler: a script that failed after writing still gets checked', async () => {
+  const dir = await projectWith({ commands: ['pnpm tc'] });
+  const p = fakePi();
+  p.ctx.cwd = dir;
+  await p.handlers.session_start[0]({ reason: 'startup' }, p.ctx);
+
+  const out = await runScriptedTurn(p, { paths: ['src/a.ts'], parentError: true });
+  assert.ok(out, 'the write landed even though the script threw');
+});
+
+test('handler: a check the script already ran is not duplicated', async () => {
+  const dir = await projectWith({ commands: ['pnpm tc'] });
+  const p = fakePi({ exec: () => assert.fail('must not duplicate the scripted check') });
+  p.ctx.cwd = dir;
+  await p.handlers.session_start[0]({ reason: 'startup' }, p.ctx);
+
+  assert.equal(await runScriptedTurn(p, { paths: ['src/a.ts'], scriptBash: 'pnpm tc' }), undefined);
+});
+
+test('handler: nested calls are not carried into the next turn', async () => {
+  const dir = await projectWith({ commands: ['pnpm tc'] });
+  let runs = 0;
+  const p = fakePi({
+    exec: async () => {
+      runs += 1;
+      return { stdout: '', stderr: '', code: 0, killed: false, truncated: false };
+    },
+  });
+  p.ctx.cwd = dir;
+  await p.handlers.session_start[0]({ reason: 'startup' }, p.ctx);
+
+  await runScriptedTurn(p, { paths: ['src/a.ts'] });
+  assert.equal(runs, 1);
+  // The next turn calls a tool that writes nothing; the previous turn's script must not fire it.
+  await p.handlers.turn_start?.[0]?.({ turnIndex: 2 }, p.ctx);
+  const quiet = await p.handlers.turn_end[0](
+    {
+      type: 'turn_end',
+      outcome: 'completed',
+      entries: [],
+      message: turnMessage([{ id: 'call_b', name: 'codemode', arguments: { code: '…' } }]),
+      toolResults: [{ toolCallId: 'call_b', isError: false }],
+    },
+    p.ctx,
+  );
+  assert.equal(quiet, undefined);
+  assert.equal(runs, 1);
+});
+
+test('handler: a script that writes dozens of files triggers one run, not dozens', async () => {
+  const dir = await projectWith({ commands: ['pnpm tc'] });
+  const paths = Array.from({ length: 40 }, (_, i) => `src/file-${i}.ts`);
+  const runs = [];
+  const p = fakePi({
+    exec: async (_command, args) => {
+      runs.push(args[1]);
+      return { stdout: '', stderr: '', code: 0, killed: false, truncated: false };
+    },
+  });
+  p.ctx.cwd = dir;
+  await p.handlers.session_start[0]({ reason: 'startup' }, p.ctx);
+
+  const out = await runScriptedTurn(p, { paths });
+  assert.equal(runs.length, 1, 'the check is a turn-boundary event, not a per-file one');
+  assert.match(out.entries[0].content, /40 files/, 'the file set is reported, not enumerated');
+  assert.match(out.entries[0].content, /src\/file-0\.ts/, 'the first few are named');
+  assert.match(out.entries[0].content, /…/);
+});
+
+/** Feed arbitrary nested results, then close the turn — the shape pi produces for a script. */
+async function feedScript(p, records, { parentId = 'call_a', parentError = false } = {}) {
+  await p.handlers.turn_start?.[0]?.({ turnIndex: 1 }, p.ctx);
+  for (const record of records) {
+    await p.handlers.tool_result[0](
+      { type: 'tool_result', content: [], isError: false, toolCallId: `${parentId}/x`, parentToolCallId: parentId, ...record },
+      p.ctx,
+    );
+  }
+  return p.handlers.turn_end[0](
+    {
+      type: 'turn_end',
+      turnIndex: 1,
+      outcome: 'completed',
+      entries: [],
+      message: turnMessage([{ id: parentId, name: 'codemode', arguments: { code: '…' } }]),
+      toolResults: [{ toolCallId: parentId, isError: parentError }],
+    },
+    p.ctx,
+  );
+}
+
+test('handler: a script that reads hundreds of files does not hide its one edit', async () => {
+  const dir = await projectWith({ commands: ['pnpm tc'] });
+  let runs = 0;
+  const p = fakePi({
+    exec: async () => {
+      runs += 1;
+      return { stdout: '', stderr: '', code: 0, killed: false, truncated: false };
+    },
+  });
+  p.ctx.cwd = dir;
+  await p.handlers.session_start[0]({ reason: 'startup' }, p.ctx);
+
+  const reads = Array.from({ length: 300 }, (_, i) => ({
+    toolName: 'read',
+    toolCallId: `call_a/r${i}`,
+    input: { path: `src/f${i}.ts` },
+  }));
+  const write = { toolName: 'write', toolCallId: 'call_a/w1', input: { path: 'src/edited.ts' } };
+  const out = await feedScript(p, [...reads, write]);
+
+  assert.equal(runs, 1);
+  assert.match(out.entries[0].content, /src\/edited\.ts/, 'the edit survives a noisy script');
+});
+
+test('handler: hundreds of scripted edits are all reported, none evicted', async () => {
+  const dir = await projectWith({ commands: ['pnpm tc'] });
+  let runs = 0;
+  const p = fakePi({
+    exec: async () => {
+      runs += 1;
+      return { stdout: '', stderr: '', code: 0, killed: false, truncated: false };
+    },
+  });
+  p.ctx.cwd = dir;
+  await p.handlers.session_start[0]({ reason: 'startup' }, p.ctx);
+
+  const writes = Array.from({ length: 300 }, (_, i) => ({
+    toolName: 'write',
+    toolCallId: `call_a/w${i}`,
+    input: { path: `src/f${i}.ts` },
+  }));
+  const out = await feedScript(p, writes);
+  assert.equal(runs, 1);
+  assert.match(out.entries[0].content, /300 files/, 'a bounded list must not silently shrink the file set');
+});
+
+test('handler: a script rewriting one file reports one file', async () => {
+  const dir = await projectWith({ commands: ['pnpm tc'] });
+  const p = fakePi();
+  p.ctx.cwd = dir;
+  await p.handlers.session_start[0]({ reason: 'startup' }, p.ctx);
+
+  const writes = Array.from({ length: 50 }, (_, i) => ({
+    toolName: 'write',
+    toolCallId: `call_a/w${i}`,
+    input: { path: 'src/a.ts' },
+  }));
+  const out = await feedScript(p, writes);
+  assert.match(out.entries[0].content, /after your edit to src\/a\.ts/);
+  assert.doesNotMatch(out.entries[0].content, /50 files/);
+});
+
+test('handler: a failed scripted write does not hide a later successful one', async () => {
+  const dir = await projectWith({ commands: ['pnpm tc'] });
+  const p = fakePi();
+  p.ctx.cwd = dir;
+  await p.handlers.session_start[0]({ reason: 'startup' }, p.ctx);
+
+  const out = await feedScript(p, [
+    { toolName: 'write', toolCallId: 'call_a/w0', input: { path: 'src/a.ts' }, isError: true },
+    { toolName: 'write', toolCallId: 'call_a/w1', input: { path: 'src/a.ts' } },
+  ]);
+  assert.match(out.entries[0].content, /src\/a\.ts/);
+});
+
+test('nestedRecordKey: records edits and bash only, keyed to collapse repeats', () => {
+  const write = (path, extra = {}) => ({ toolName: 'write', toolCallId: 'p/1', parentToolCallId: 'p', input: { path }, ...extra });
+  assert.equal(nestedRecordKey(write('a.ts')), nestedRecordKey(write('a.ts')), 'same path and parent collapses');
+  assert.notEqual(nestedRecordKey(write('a.ts')), nestedRecordKey(write('b.ts')));
+  assert.notEqual(nestedRecordKey(write('a.ts')), nestedRecordKey(write('a.ts', { isError: true })));
+  assert.notEqual(
+    nestedRecordKey(write('a.ts')),
+    nestedRecordKey({ toolName: 'edit', toolCallId: 'p/2', parentToolCallId: 'p', input: { path: 'a.ts' } }),
+  );
+  assert.equal(nestedRecordKey({ toolName: 'read', toolCallId: 'p/3', parentToolCallId: 'p', input: { path: 'a.ts' } }), null);
+  assert.equal(
+    nestedRecordKey({ toolName: 'bash', toolCallId: 'p/4', parentToolCallId: 'p', input: { command: 'pnpm tc' } }),
+    'bash\u0000p\u0000pnpm tc',
+  );
+  assert.equal(nestedRecordKey({ toolName: 'bash', input: { command: '  ' } }), null);
+  assert.equal(nestedRecordKey({ toolName: 'write', input: {} }), null);
+});
+
+// ── output budget: one file's limit is not a dozen files' limit ────────────
+
+const failingRun = (lines, command = 'pnpm tc') => ({
+  command,
+  code: 1,
+  killed: false,
+  stdout: Array.from({ length: lines }, (_, i) => `src/f${i}.ts(1,1): error TS2322`).join('\n'),
+  stderr: '',
+  durationMs: 1000,
+});
+
+test('outputBudget: the baseline is one file, and growth is bounded', () => {
+  assert.deepEqual(outputBudget(1), { lines: 100, chars: 8000 });
+  assert.deepEqual(outputBudget(0), outputBudget(1), 'a missing count is not a bigger budget');
+  assert.ok(outputBudget(10).lines > outputBudget(1).lines);
+  assert.ok(outputBudget(10).chars > outputBudget(1).chars);
+  assert.ok(outputBudget(40).lines > outputBudget(10).lines);
+  // A pathological file count must not buy an unbounded message.
+  assert.ok(outputBudget(10_000).lines <= 400);
+  assert.ok(outputBudget(10_000).chars <= 24_000);
+  assert.deepEqual(outputBudget(1000), outputBudget(200), 'the driver is clamped');
+});
+
+test('renderVerifyMessage: a wide edit keeps the failure list a single file would lose', () => {
+  const many = Array.from({ length: 20 }, (_, i) => `src/w${i}.ts`);
+  const one = renderVerifyMessage(['a.ts'], [failingRun(300)], true);
+  const wide = renderVerifyMessage(many, [failingRun(300)], true);
+  // 300 lines does not fit the single-file budget, but does fit twenty files' worth.
+  assert.match(one, /more line\(s\) omitted/);
+  assert.doesNotMatch(wide, /more line\(s\) omitted/);
+  assert.match(wide, /src\/f299\.ts/, 'the last failure is still there');
+  assert.ok(wide.length > one.length);
+});
+
+test('renderVerifyMessage: the instruction survives even when output is enormous', () => {
+  const files = Array.from({ length: 40 }, (_, i) => `src/f${i}.ts`);
+  const text = renderVerifyMessage(files, [failingRun(5000)], true);
+  assert.match(text, /exit 1/, 'the status line is reserved, never truncated away');
+  assert.match(text, /Fix what this reports before moving on\.?$/, 'the closing instruction is never cut');
+  assert.ok(text.length <= 24_000, `ceiling must hold, got ${text.length}`);
+  assert.match(text, /omitted|truncated/, 'says what it dropped');
+});
+
+test('renderVerifyMessage: a message under budget is untouched', () => {
+  const text = renderVerifyMessage(['a.ts'], [failingRun(3)], true);
+  assert.doesNotMatch(text, /truncated/);
+});
+
+test('clampChars: cuts on a line boundary and says so', () => {
+  const body = Array.from({ length: 50 }, (_, i) => `line ${i}`).join('\n');
+  const out = clampChars(body, 60);
+  assert.ok(out.length <= 60, `got ${out.length}`);
+  assert.match(out, /truncated/);
+  assert.ok(!out.includes('line 49'));
+  assert.equal(clampChars('short', 100), 'short');
+  assert.match(clampChars('anything', 0), /truncated/);
 });
