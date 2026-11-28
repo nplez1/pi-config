@@ -34,22 +34,62 @@ const bashCall = (command, id = 'call_1') => ({ type: 'tool_call', toolName: 'ba
 // ── parsing ────────────────────────────────────────────────────────────────
 
 test('parseLeadingSleep: forms seen in real transcripts', () => {
-  assert.deepEqual(parseLeadingSleep('sleep 900; echo checked'), { seconds: 900, rest: 'echo checked' });
-  assert.deepEqual(parseLeadingSleep('sleep 295; cd /tmp && ls'), { seconds: 295, rest: 'cd /tmp && ls' });
-  assert.deepEqual(parseLeadingSleep('sleep 210\nTOKEN="x"'), { seconds: 210, rest: 'TOKEN="x"' });
-  assert.deepEqual(parseLeadingSleep('sleep 420;cd /x'), { seconds: 420, rest: 'cd /x' });
-  assert.deepEqual(parseLeadingSleep('sleep 5m; pnpm tc'), { seconds: 300, rest: 'pnpm tc' });
-  assert.deepEqual(parseLeadingSleep('sleep 1.5; x'), { seconds: 1.5, rest: 'x' });
-  assert.deepEqual(parseLeadingSleep('sleep 900'), { seconds: 900, rest: '' });
+  assert.deepEqual(parseLeadingSleep('sleep 900; echo checked'), { seconds: 900, rest: 'echo checked', prefix: '' });
+  assert.deepEqual(parseLeadingSleep('sleep 295; cd /tmp && ls'), { seconds: 295, rest: 'cd /tmp && ls', prefix: '' });
+  assert.deepEqual(parseLeadingSleep('sleep 210\nTOKEN="x"'), { seconds: 210, rest: 'TOKEN="x"', prefix: '' });
+  assert.deepEqual(parseLeadingSleep('sleep 420;cd /x'), { seconds: 420, rest: 'cd /x', prefix: '' });
+  assert.deepEqual(parseLeadingSleep('sleep 5m; pnpm tc'), { seconds: 300, rest: 'pnpm tc', prefix: '' });
+  assert.deepEqual(parseLeadingSleep('sleep 1.5; x'), { seconds: 1.5, rest: 'x', prefix: '' });
+  assert.deepEqual(parseLeadingSleep('sleep 900'), { seconds: 900, rest: '', prefix: '' });
+});
+
+test('parseLeadingSleep: a sleep behind no-op prefixes is still the leading statement', () => {
+  // The 2026-11-24 release session: 17 of 17 sleeps looked like this and the guard never fired.
+  assert.deepEqual(parseLeadingSleep('cd /Volumes/Storage/Code/orca/main && sleep 480; git status --porcelain | head -8'), {
+    seconds: 480,
+    rest: 'git status --porcelain | head -8',
+    prefix: 'cd /Volumes/Storage/Code/orca/main && ',
+  });
+  assert.deepEqual(parseLeadingSleep('cd /tmp; sleep 60'), { seconds: 60, rest: '', prefix: 'cd /tmp; ' });
+  assert.deepEqual(parseLeadingSleep('set -e; sleep 90; pnpm tc'), { seconds: 90, rest: 'pnpm tc', prefix: 'set -e; ' });
+  assert.deepEqual(parseLeadingSleep('ORCA_QUEUE=off && sleep 45; pnpm test'), {
+    seconds: 45,
+    rest: 'pnpm test',
+    prefix: 'ORCA_QUEUE=off && ',
+  });
+  assert.deepEqual(parseLeadingSleep('export A=1 && sleep 30'), { seconds: 30, rest: '', prefix: 'export A=1 && ' });
+  assert.deepEqual(parseLeadingSleep('true && sleep 30'), { seconds: 30, rest: '', prefix: 'true && ' });
+});
+
+test('parseLeadingSleep: two prefixes chain, and the prefix is reproduced verbatim', () => {
+  assert.deepEqual(parseLeadingSleep('cd /repo && set -e; sleep 300; git status'), {
+    seconds: 300,
+    rest: 'git status',
+    prefix: 'cd /repo && set -e; ',
+  });
+  assert.deepEqual(parseLeadingSleep('cd "/a b" && A=1 B=2 && sleep 300; ls'), {
+    seconds: 300,
+    rest: 'ls',
+    prefix: 'cd "/a b" && A=1 B=2 && ',
+  });
 });
 
 test('parseLeadingSleep: leaves embedded sleeps alone', () => {
   // Not the leading statement: part of a program, not a stand-in for a wait.
   assert.equal(parseLeadingSleep('for i in $(seq 3); do sleep 2; done'), null);
-  assert.equal(parseLeadingSleep('cd /tmp && sleep 900'), null);
+  assert.equal(parseLeadingSleep('cd /tmp && ls && sleep 900'), null);
+  assert.equal(parseLeadingSleep('cd /tmp && for i in 1 2; do sleep 2; done'), null);
   assert.equal(parseLeadingSleep('pnpm tc; sleep 5'), null);
   assert.equal(parseLeadingSleep('echo sleep 900'), null);
   assert.equal(parseLeadingSleep(''), null);
+});
+
+test('parseLeadingSleep: a wrapped sleep is a program, not a wait', () => {
+  // Unwrapping these would rewrite the inside of something that owns its own timing.
+  assert.equal(parseLeadingSleep('timeout 60 sleep 900'), null);
+  assert.equal(parseLeadingSleep('bash -c "sleep 900"'), null);
+  assert.equal(parseLeadingSleep('cd /repo && timeout 60 sleep 900'), null);
+  assert.equal(parseLeadingSleep('FOO=1 sleep 900'), null);
 });
 
 // ── verdicts ───────────────────────────────────────────────────────────────
@@ -85,6 +125,33 @@ test('guardSleep: sub-120s sleep in front of work is not clamped', () => {
   assert.deepEqual(guardSleep('sleep 90; pnpm tc'), { action: 'allow' });
 });
 
+test('guardSleep: a prefixed sleep is clamped and the prefix still runs', () => {
+  const v = guardSleep('cd /Volumes/Storage/Code/orca/main && sleep 480; git status --porcelain | head -8');
+  assert.equal(v.action, 'rewrite');
+  assert.equal(
+    v.command,
+    `cd /Volumes/Storage/Code/orca/main && sleep ${MAX_SLEEP_SECONDS}; git status --porcelain | head -8`,
+  );
+  assert.match(v.note, /clamped/);
+});
+
+test('guardSleep: two prefixes are reproduced in order around the clamp', () => {
+  const v = guardSleep('cd /repo && set -e; sleep 300; pnpm tc');
+  assert.equal(v.action, 'rewrite');
+  assert.equal(v.command, `cd /repo && set -e; sleep ${MAX_SLEEP_SECONDS}; pnpm tc`);
+});
+
+test('guardSleep: a prefixed bare sleep is blocked like an unprefixed one', () => {
+  const v = guardSleep('cd /repo && sleep 480');
+  assert.equal(v.action, 'block');
+  assert.match(v.reason, /nothing follows it/);
+});
+
+test('guardSleep: a wrapped sleep is left alone', () => {
+  assert.deepEqual(guardSleep('cd /repo && timeout 900 sleep 900'), { action: 'allow' });
+  assert.deepEqual(guardSleep('bash -c "sleep 900"'), { action: 'allow' });
+});
+
 // ── subagent polling ───────────────────────────────────────────────────────
 
 test('shouldForceSubagentWait: a poll for a named agent is forced to wait', () => {
@@ -108,6 +175,15 @@ test('tool_call: a clamped command reaches execution clamped', () => {
   const event = p.call('tool_call', bashCall('sleep 900; pnpm tc'));
   assert.equal(event.input.command, `sleep ${MAX_SLEEP_SECONDS}; pnpm tc`);
   assert.equal(event.block, undefined);
+});
+
+test('tool_call: the measured `cd … && sleep N; …` shape is clamped in place', () => {
+  const p = fakePi();
+  const event = p.call('tool_call', bashCall('cd /Volumes/Storage/Code/orca/main && sleep 480; git status --porcelain | head -8'));
+  assert.equal(
+    event.input.command,
+    `cd /Volumes/Storage/Code/orca/main && sleep ${MAX_SLEEP_SECONDS}; git status --porcelain | head -8`,
+  );
 });
 
 test('tool_call: a bare sleep is blocked before execution', () => {

@@ -8,6 +8,12 @@
  *     turn that re-read ~212k prompt tokens to discover nothing changed. 122 of them
  *     were in the recent (November) window alone, so this is current behaviour, not
  *     an artefact of old models.
+ *   - The guard that was meant to catch them caught none: over the 2026-11-24 release
+ *     session (86 minutes of it spent inside `sleep`), `grep -c loop-guards` on the
+ *     transcript returned 0. All 17 sleeps were shaped
+ *     `cd /Volumes/.../main && sleep 480; git status --porcelain | head -8`, and the
+ *     parser only matched a `sleep` in the very first token. A guard that only sees
+ *     the shape the model rarely writes is a guard that does not run.
  *   - 352 `get_subagent_result` calls, of which 184 came back "still running" and 143
  *     were bare `{}` polls. Pi notifies on completion, so a non-waiting poll is a turn
  *     spent asking a question whose answer arrives by itself.
@@ -37,18 +43,56 @@ export interface SleepParse {
   seconds: number;
   /** What runs after the sleep, without its separator. Empty for a bare sleep. */
   rest: string;
+  /**
+   * Everything before `sleep`, verbatim and including its separator, so a rewrite can put
+   * the command back exactly where it was. Empty when `sleep` is the first token.
+   */
+  prefix: string;
 }
 
 /**
- * Parse a command whose first statement is `sleep`. Returns null when `sleep` is not
- * the leading statement, so a sleep buried in a pipeline or a loop body is untouched:
- * there the sleep is part of the program, not a stand-in for a wait.
+ * Statements that position the shell without changing what runs next. Each pattern keeps
+ * its own separator, and they may chain in any order (`cd /x && set -e; A=1 && sleep 60`).
+ * A wrapper is deliberately absent: `timeout 30 sleep 900` and `bash -c "sleep 900"` put
+ * the sleep inside a program, where the delay is the program's business, not a stand-in
+ * for a wait.
+ */
+const NOOP_PREFIXES: RegExp[] = [
+  // cd <path> &&  /  cd <path>;
+  /^[ \t]*cd[ \t]+(?:"[^"]*"|'[^']*'|[^\s;&|]+)[ \t]*(?:&&|;|\n)[ \t]*/,
+  // a leading `true &&`
+  /^[ \t]*true[ \t]*(?:&&|;|\n)[ \t]*/,
+  // set -e;  /  set -euo pipefail;
+  /^[ \t]*set[ \t]+-[A-Za-z]+[ \t]*(?:&&|;|\n)[ \t]*/,
+  // FOO=1 &&  /  export A=1 B=2;  /  ORCA_QUEUE=off &&
+  /^[ \t]*(?:(?:export[ \t]+)?[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|[^\s;&|"']*)[ \t]*)+(?:&&|;|\n)[ \t]*/,
+];
+
+/** Split a command into the no-op prefixes it opens with and the statement that follows. */
+function stripNoopPrefixes(command: string): { prefix: string; body: string } {
+  let prefix = "";
+  let body = command;
+  for (;;) {
+    const match = NOOP_PREFIXES.map((pattern) => pattern.exec(body)).find((m) => m !== null && m[0].length > 0);
+    if (!match) break;
+    prefix += match[0];
+    body = body.slice(match[0].length);
+  }
+  return { prefix, body };
+}
+
+/**
+ * Parse a command whose first statement is `sleep`, behind any chain of no-op prefixes.
+ * Returns null when `sleep` is not the leading statement, so a sleep buried in a pipeline,
+ * a loop body or a `timeout`/`bash -c` wrapper is untouched: there the sleep is part of the
+ * program, not a stand-in for a wait.
  *
  * GNU/macOS `sleep` accept an `s`/`m`/`h` suffix; commands are usually separated by
  * `;` or `&&`, but models also emit a newline (seen in the transcripts), so both count.
  */
 export function parseLeadingSleep(command: string): SleepParse | null {
-  const match = /^[ \t]*sleep[ \t]+(\d+(?:\.\d+)?)([smhSMH]?)[ \t]*([\s\S]*)$/.exec(command);
+  const { prefix, body } = stripNoopPrefixes(command);
+  const match = /^[ \t]*sleep[ \t]+(\d+(?:\.\d+)?)([smhSMH]?)[ \t]*([\s\S]*)$/.exec(body);
   if (!match) return null;
   const unit = match[2].toLowerCase();
   const multiplier = unit === "m" ? 60 : unit === "h" ? 3600 : 1;
@@ -56,7 +100,7 @@ export function parseLeadingSleep(command: string): SleepParse | null {
   if (!Number.isFinite(seconds)) return null;
   // Strip the separator that introduced whatever follows: `;`, `&&`, or a newline.
   const rest = match[3].replace(/^(?:[ \t]*(?:&&|;|\|\|)[ \t]*|[ \t]*\n[ \t]*)/, "");
-  return { seconds, rest: rest.trim() };
+  return { seconds, rest: rest.trim(), prefix };
 }
 
 export type SleepVerdict =
@@ -76,7 +120,7 @@ export type SleepVerdict =
 export function guardSleep(command: string): SleepVerdict {
   const parsed = parseLeadingSleep(command);
   if (!parsed) return { action: "allow" };
-  const { seconds, rest } = parsed;
+  const { seconds, rest, prefix } = parsed;
   if (!Number.isFinite(seconds) || seconds <= 0) return { action: "allow" };
 
   if (rest.length === 0) {
@@ -95,7 +139,7 @@ export function guardSleep(command: string): SleepVerdict {
   if (seconds <= MAX_SLEEP_SECONDS) return { action: "allow" };
   return {
     action: "rewrite",
-    command: `sleep ${MAX_SLEEP_SECONDS}; ${rest}`,
+    command: `${prefix}sleep ${MAX_SLEEP_SECONDS}; ${rest}`,
     note:
       `loop-guards clamped \`sleep ${formatSeconds(seconds)}\` to ${MAX_SLEEP_SECONDS}s. ` +
       `The command after it still ran, immediately after the clamp. ` +
