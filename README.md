@@ -615,7 +615,7 @@ replies the three failing sessions actually stored).
 
 DeepSeek bills two tiers by wall clock (peak = 2x off-peak: 01:00-04:00 and
 06:00-10:00 UTC, Mon-Fri). The same checkpoint (DeepSeek-V4.1-Flash-1017) is
-resold flat by two other providers, so `extensions/deepseek-routing.ts`
+resold flat by two other providers, so `extensions/deepseek.ts`
 registers a virtual model, **`deepseek/deepseek-flash-auto`**, that sends each
 request to whichever of the three is cheaper at that moment:
 
@@ -794,7 +794,7 @@ re-checks credentials on what `route()` returns, so the worst case is pi's own
 accurate error rather than a dead turn.
 
 The schedule and rate card live in
-`extensions/shared/deepseek-schedule.ts`, shared with `deepseek-pricing.ts` so
+`extensions/shared/deepseek-schedule.ts`, shared with the router's own billing so
 the footer tier and the provider choice cannot disagree. `PI_DEEPSEEK_TIER=peak`
 (or `off-peak`) forces a tier without editing code, for testing outside the UTC
 windows.
@@ -811,7 +811,20 @@ file **plus** the machine-local `~/.pi/agent/extensions/isoquant-provider.ts`
 (which registers the provider and its card — it is kept out of this repo because
 no other machine has an IsoQuant account). With the key but no extension the
 side never enters the catalog, so the router behaves exactly as it does on a
-two-provider machine.
+two-provider machine. The one thing the extension does **not** carry is the
+cache lifetime: that is a global fact about the provider, so it lives in
+`models.json` (`isoquant.modelOverrides.*.promptCache`) where every machine's
+`cache-keepalive` and `pi-smart-compaction` read it.
+
+**What a landed turn costs.** pi's catalog stores one static rate per field, so
+it cannot model a tier that doubles by wall clock. The same extension therefore
+rewrites `usage.cost` at `message_end`, choosing peak or off-peak from the
+message's own timestamp — and session totals are summed from stored message
+costs, so this is what makes the footer, `/session` and RPC totals accurate.
+`models.json` carries DeepSeek's *off-peak* card for the two readers that run
+before a message lands: the in-flight streaming estimate and the `/model`
+picker. DeepInfra and IsoQuant turns are left untouched — they bill flat, so
+their provider registrations already price them.
 
 Known gap: DeepSeek's docs also make Chinese public holidays off-peak all day;
 `DEEPSEEK_HOLIDAYS` in the shared module is empty, so a holiday is treated as a
